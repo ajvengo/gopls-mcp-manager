@@ -10,13 +10,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// How long one client message gets to reach an upstream and handshake it, its
+// retry included; see send. It contains ensure's readiness wait, so it is
+// derived from it: raising that wait alone would fail every cold worktree's
+// first call. The remainder is the handshake's, and generous because §8 keeps
+// a server that listens and answers nothing alive.
+const sendBudget = readyTimeout + 20*time.Second
+
+// initID is the id every replayed initialize is sent under. One value for all
+// of them: an id only has to be unique on the connection it is used on, and a
+// connection sees exactly one handshake — the lane that owns it dials, hands it
+// this, and never handshakes it again. A literal string cannot fail MakeID.
+var initID, _ = jsonrpc.MakeID("gopls-mcp-manager-init")
 
 // bridge multiplexes one stdio MCP client across per-worktree gopls servers.
 //
@@ -43,8 +59,8 @@ func bridge(ctx context.Context, m *manager, home string) error {
 
 	r := newRouter(ctx, m, home)
 
-	// Only the reader is waited for, because r.conns is its state and
-	// closeUpstreams must not race it. The writer is left where it stands: the
+	// Only the reader is waited for, because r.lanes is its state and
+	// closeLanes must not race it. The writer is left where it stands: the
 	// stdio transport's Close closes stdin and no-ops on stdout, so a Write
 	// already inside a full stdout pipe never unblocks, and waiting for it would
 	// hang the exit on a client that stopped reading us.
@@ -59,48 +75,60 @@ func bridge(ctx context.Context, m *manager, home string) error {
 	cancel()
 	_ = stdio.Close()
 	<-readerDone
-	r.closeUpstreams()
+	r.closeLanes()
 	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, mcp.ErrConnectionClosed) {
 		return nil
 	}
 	return err
 }
 
-// Router state is owned by the readFromClient goroutine, except for
-// awaitingUpstream under mu, which the per-upstream reader goroutines also
-// touch.
+// Routing state is owned by the readFromClient goroutine; each upstream belongs
+// to its own lane; the in-flight map is shared under mu, because the
+// per-upstream reader goroutines touch it too.
 type router struct {
 	ctx       context.Context
 	m         *manager
 	home      string
-	conns     map[string]mcp.Connection
+	lanes     map[string]*lane  // worktree -> its upstream, see lane
 	worktrees map[string]string // containing directory -> worktree, see worktreeOf
-	dial      func(string) (mcp.Connection, error)
-
-	// How long one client message gets to handshake an upstream, its retry
-	// included; see handshake.
-	handshakeTimeout time.Duration
+	paths     map[string]string // path argument, verbatim -> worktree, see worktreeOf
+	// ctx bounds the dial, and only the dial: the connection it hands back is
+	// read under this same context for the rest of its life, so the caller
+	// cancels it on expiry rather than passing a deadline down. See dialBounded.
+	dial func(context.Context, string) (mcp.Connection, error)
 
 	mu sync.Mutex
-	// Client requests we forwarded and whose answer an upstream still owes, so
-	// that a dying gopls fails its callers instead of leaving them hanging.
+	// Client requests still in flight, so that a dying gopls fails its callers
+	// instead of leaving them hanging. Holding an id is also what confers the
+	// right to answer it: see claim.
 	awaitingUpstream map[jsonrpc.ID]owed
 
 	out  chan jsonrpc.Message
 	errs chan error
 
-	initialize *jsonrpc.Request // replayed to every upstream opened later
-	sticky     string           // worktree of the last path-bearing call
-	initSeq    int
+	// Replayed to every upstream opened later. Written by readFromClient and
+	// read by every lane's handshake, so it carries its own synchronisation —
+	// and is read at handshake time rather than captured when the lane is
+	// built. A lane opened by a tool call that arrived before initialize does
+	// not wait for one: handshake fails that call outright, and it is a later
+	// attempt, if any, that finds the pointer filled.
+	initialize atomic.Pointer[jsonrpc.Request]
+	sticky     string // worktree of the last path-bearing call
 }
 
-// owed is an upstream that still owes an answer, and the worktree it serves.
+// owed is a request in flight: the worktree it was routed to, and the upstream
+// that has taken it, once one has.
 //
-// Ownership is matched on the connection, never on the worktree: send()
-// replaces a dead connection with a live one under the same worktree, and
-// matching by name would let the dead one's reader fail calls the reconnect had
-// already placed successfully. The worktree rides along because a cancellation
-// has to name one (R7) and owe() is the only place that knows it.
+// The worktree is known strictly earlier than the connection — route picks a
+// destination before any lane has one to name — so conn is nil for a call still
+// queued. A cancellation arriving in that window still has to find where its
+// call went (R7), which is why one record covers both stages rather than the
+// route appearing only once an upstream owes an answer.
+//
+// conn is compared by connection, never by worktree: send() replaces a dead
+// connection with a live one under the same worktree, and matching by name
+// would let the dead one's reader fail calls the reconnect had already placed
+// successfully.
 type owed struct {
 	conn     mcp.Connection
 	worktree string
@@ -111,17 +139,140 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 		ctx:              ctx,
 		m:                m,
 		home:             home,
-		conns:            make(map[string]mcp.Connection),
+		lanes:            make(map[string]*lane),
 		worktrees:        make(map[string]string),
+		paths:            make(map[string]string),
 		awaitingUpstream: make(map[jsonrpc.ID]owed),
 		out:              make(chan jsonrpc.Message, 64),
 		errs:             make(chan error, 4),
-		// Generous: ensure has already waited for the endpoint to serve a
-		// request, but §8 keeps a server that listens and answers nothing.
-		handshakeTimeout: 30 * time.Second,
 	}
 	r.dial = r.dialGopls
 	return r
+}
+
+// laneQueue is how far one worktree may run ahead before the reader waits for
+// it. Deep enough that a client pipelining calls at a cold worktree still gets
+// them all taken while it starts; a full queue is the one case where a slow
+// worktree can still hold the reader up, and it takes 64 outstanding calls to
+// the same tree to reach.
+const laneQueue = 64
+
+// lane is one worktree's upstream and the goroutine that owns it.
+//
+// A lane per worktree keeps the cost of a cold start — an flock wait, a gopls
+// spawn, a whole handshake — on the worktree that pays it: the reader picks a
+// target and hands the request over, and each upstream is dialled, handshaken,
+// retried and replaced by the single goroutine that owns it. Sharing the
+// reader's goroutine would block every other worktree behind that start.
+//
+// Order within a worktree is the channel's. Between worktrees there never was
+// any: the client's ids are what pair answers with calls.
+type lane struct {
+	r        *router
+	worktree string
+	reqs     chan *jsonrpc.Request
+
+	// ctx is this lane's own child of the session context, and the parent every
+	// per-request budget in send is derived from. One child per lane rather than
+	// two per request: WithTimeout registers itself on its parent under that
+	// parent's own mutex, so deriving each budget straight from the session
+	// context put every lane on one process-wide lock twice a message — on the
+	// register and again on the cancel — which is contention that grows with
+	// exactly the concurrency the lanes were introduced to buy.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// conn belongs to the goroutine running this lane, which is what replaces the
+	// lock a shared connection map would have needed. It is nil before the first
+	// dial and again whenever a write drops one.
+	conn mcp.Connection
+}
+
+func newLane(r *router, worktree string) *lane {
+	ctx, cancel := context.WithCancel(r.ctx)
+	return &lane{
+		r:        r,
+		worktree: worktree,
+		reqs:     make(chan *jsonrpc.Request, laneQueue),
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+}
+
+// laneFor returns worktree's lane, opening one on first use. Called only from
+// readFromClient, which owns r.lanes.
+func (r *router) laneFor(worktree string) *lane {
+	l, ok := r.lanes[worktree]
+	if !ok {
+		l = newLane(r, worktree)
+		r.lanes[worktree] = l
+		go l.run()
+	}
+	return l
+}
+
+func (l *lane) run() {
+	// Releases this lane's registration on the session context. The connections
+	// it dialled keep contexts of their own, rooted at the session rather than
+	// here, so this ends the lane's budgets and nothing else — see dialBounded.
+	defer l.cancel()
+draining:
+	for req := range l.reqs {
+		// Whatever is left in the queue when the session ends is not worth an
+		// upstream: dialling would run ensure, spawning a whole gopls for a client
+		// that has already gone away, and the answer would have nowhere to go.
+		//
+		// Asked through Done rather than Err: Err takes the session context's own
+		// mutex, which every lane would then share once a message — the very
+		// contention lane.ctx exists to keep off the session context. The label is
+		// what makes this a break out of the loop rather than out of the select.
+		select {
+		case <-l.r.ctx.Done():
+			break draining
+		default:
+		}
+		l.send(req)
+	}
+	if l.conn != nil {
+		_ = l.conn.Close()
+	}
+}
+
+// route hands req to the lane that should answer it, giving up once the session
+// is over so that a stopped lane cannot strand the reader.
+func (r *router) route(req *jsonrpc.Request) {
+	worktree, err := r.target(req)
+	if err != nil {
+		// Refused here because no lane owns a message whose destination is what
+		// could not be decided. A notification is dropped: no id to answer.
+		r.refuse(req, jsonrpc.CodeInvalidParams, "%s", err)
+		return
+	}
+	// Recorded here, not where the lane writes it: a cancellation arriving while
+	// the call is still queued must find it owed, or cancelTarget would send it
+	// home naming an id home never issued. Both messages pass through here in
+	// the client's own order, so here the answer always exists.
+	r.track(req.ID, nil, worktree)
+	l := r.laneFor(worktree)
+	select {
+	case l.reqs <- req:
+	case <-r.ctx.Done():
+	}
+}
+
+// closeLanes ends every lane and lets it close its own connection.
+//
+// Only ever after readFromClient has stopped: it owns r.lanes and is the only
+// sender on l.reqs, so closing these channels is safe because that goroutine is
+// provably gone. bridge waits for readerDone first, and is the only caller.
+//
+// Not waited for: a lane inside m.ensure is parked on an flock and a readiness
+// poll that take no context, so waiting would hang the exit on another
+// process's cold start.
+func (r *router) closeLanes() {
+	for _, l := range r.lanes {
+		close(l.reqs)
+	}
 }
 
 func (r *router) writeToClient(stdio mcp.Connection) {
@@ -153,28 +304,58 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 			// would only make one dial and handshake to be told so.
 			continue
 		}
-		initial := req.Method == "initialize"
-		if initial {
+		if req.Method == "initialize" {
 			req.Params = withRootsCapability(req.Params)
-			r.initialize = req
+			r.initialize.Store(req)
+		} else if r.initialize.Load() == nil {
+			// A request the client sent before its own initialize, which the
+			// protocol does not allow it to send at all. Refused here rather
+			// than by the lane that would run it, because this is the only
+			// place that sees the client's own order: a lane sees its queue,
+			// where the offending request and the initialize behind it are two
+			// iterations of one loop, and the first would dial, find the
+			// pointer already filled by the time it looked, and spend the
+			// private handshake on that connection. Answering the offending
+			// message is all this does — the connection that would then be owed
+			// a second initialize refuses it from its own state (see upstream),
+			// so the invariant does not rest on winning that race.
+			r.refuse(req, jsonrpc.CodeInvalidRequest, "%s arrived before the client sent initialize", req.Method)
+			continue
 		}
-		r.send(r.target(req), msg, req.ID, initial)
+		r.route(req)
 	}
+}
+
+// refuse answers req with an error, on the goroutine that read it rather than
+// by any lane. Both callers refuse for the same kind of reason: the message
+// cannot be handed to an upstream at all — either no lane could be chosen for
+// it, or none may run it yet — so there is no lane whose job this could be.
+//
+// Notifications are dropped instead of refused: a notification has no id to
+// answer, and inventing a response for one would be a message the client has
+// nothing to match against.
+func (r *router) refuse(req *jsonrpc.Request, code int64, format string, args ...any) {
+	if !req.ID.IsValid() {
+		return
+	}
+	r.fail(req.ID, code, format, args...)
 }
 
 // withRootsCapability makes every upstream ask this bridge for its roots. Some
 // MCP clients omit the optional capability; without it gopls installs no file
 // watcher and newly-created Go files remain invisible until its daemon restarts.
 // Parameters we cannot rewrite — invalid ones, or ones that will not marshal
-// back — are forwarded untouched and left for gopls to reject.
+// back — are forwarded untouched and left for gopls to reject. The client's own
+// spelling of each key is the one rewritten; see jsonKey for why.
 func withRootsCapability(params json.RawMessage) json.RawMessage {
 	var initialize map[string]json.RawMessage
 	if err := json.Unmarshal(params, &initialize); err != nil || initialize == nil {
 		return params
 	}
 
+	capabilitiesKey := jsonKey(initialize, "capabilities")
 	var capabilities map[string]json.RawMessage
-	if raw := initialize["capabilities"]; !absentJSON(raw) {
+	if raw := initialize[capabilitiesKey]; !absentJSON(raw) {
 		if err := json.Unmarshal(raw, &capabilities); err != nil || capabilities == nil {
 			return params
 		}
@@ -182,15 +363,15 @@ func withRootsCapability(params json.RawMessage) json.RawMessage {
 	if capabilities == nil {
 		capabilities = make(map[string]json.RawMessage)
 	}
-	if absentJSON(capabilities["roots"]) {
-		capabilities["roots"] = json.RawMessage(`{}`)
+	if rootsKey := jsonKey(capabilities, "roots"); absentJSON(capabilities[rootsKey]) {
+		capabilities[rootsKey] = json.RawMessage(`{}`)
 	}
 
 	rawCapabilities, err := json.Marshal(capabilities)
 	if err != nil {
 		return params
 	}
-	initialize["capabilities"] = rawCapabilities
+	initialize[capabilitiesKey] = rawCapabilities
 
 	rewritten, err := json.Marshal(initialize)
 	if err != nil {
@@ -199,29 +380,55 @@ func withRootsCapability(params json.RawMessage) json.RawMessage {
 	return rewritten
 }
 
+// jsonKey is the key in object that a Go decoder would read as name: the exact
+// spelling when it is there, and otherwise a case-insensitive match, since
+// encoding/json falls back to one. Writing our own spelling beside a client's
+// would leave two keys mapping to one field, and which of them gopls took would
+// come down to the order they marshalled in — so the capability we add for it
+// could silently not be the one it read.
+func jsonKey(object map[string]json.RawMessage, name string) string {
+	if _, exact := object[name]; exact {
+		return name
+	}
+	for key := range object {
+		if strings.EqualFold(key, name) {
+			return key
+		}
+	}
+	return name
+}
+
 // absentJSON reports whether a client left this value out, spelled either way:
 // the key missing entirely, or present and null.
 func absentJSON(raw json.RawMessage) bool {
 	return len(raw) == 0 || strings.TrimSpace(string(raw)) == "null"
 }
 
-// target picks the worktree that should answer req.
-func (r *router) target(req *jsonrpc.Request) string {
+// target picks the worktree that should answer req, or reports why no single
+// one can — see toolCallWorktrees.
+func (r *router) target(req *jsonrpc.Request) (string, error) {
 	switch req.Method {
 	case "tools/call":
-		if worktree := r.toolCallWorktree(req.Params); worktree != "" {
-			r.sticky = worktree
-			return worktree
+		worktrees := r.toolCallWorktrees(req.Params)
+		if len(worktrees) > 1 {
+			// Sticky is deliberately left alone: this call picked no worktree,
+			// so the one before it is still the best guess for the one after.
+			return "", fmt.Errorf("call names paths in %d worktrees (%s); one gopls answers for one tree, so split the call",
+				len(worktrees), strings.Join(worktrees, ", "))
+		}
+		if len(worktrees) == 1 {
+			r.sticky = worktrees[0]
+			return worktrees[0], nil
 		}
 		if r.sticky != "" {
-			return r.sticky
+			return r.sticky, nil
 		}
 	case "notifications/cancelled":
 		if worktree := r.cancelTarget(req.Params); worktree != "" {
-			return worktree
+			return worktree, nil
 		}
 	}
-	return r.home
+	return r.home, nil
 }
 
 // cancelTarget reports the worktree whose upstream owes the request this
@@ -234,106 +441,150 @@ func (r *router) cancelTarget(params json.RawMessage) string {
 	}
 	// Ids arrive off the wire as the same nil/float64/string that json.Unmarshal
 	// produces here, and both sides go through MakeID, so one rebuilt from the
-	// notification compares equal to the one the owed list was keyed by.
+	// notification compares equal to the one the route was recorded under.
 	id, err := jsonrpc.MakeID(cancelled.RequestID)
 	if err != nil {
 		return ""
 	}
 	r.mu.Lock()
-	worktree := r.awaitingUpstream[id].worktree
-	r.mu.Unlock()
-	// Only a worktree we still hold a connection to. send() dials what it has
-	// none for, and dialling runs ensure — an flock wait, a gopls spawn and a
-	// full handshake, all on the goroutine reading the client — to hand a brand
-	// new process a cancellation for a call it never received. An owed id whose
-	// connection is already gone therefore reports nothing, like an unowed one:
-	// the reader that lost it fails the call anyway (F2).
-	if _, connected := r.conns[worktree]; !connected {
-		return ""
-	}
-	return worktree
+	defer r.mu.Unlock()
+	// An id nobody owes yields "", which is already how this reports "no answer".
+	// Whether that worktree still has an upstream to tell is deliberately not
+	// asked: the lane owns its connection and is the only party whose answer
+	// cannot already be stale by the time it is acted on, so it decides — see
+	// send.
+	return r.awaitingUpstream[id].worktree
 }
 
-func (r *router) send(worktree string, msg jsonrpc.Message, id jsonrpc.ID, initial bool) {
+func (l *lane) send(req *jsonrpc.Request) {
+	// Only the first home connection receives the client's own initialize; see
+	// upstream. Derived here rather than passed in, so that the id and the
+	// message it is sent with cannot disagree.
+	id, initial := req.ID, req.Method == "initialize"
 	// One budget for both attempts, because the retry redials: a per-attempt
-	// deadline would let a wedged upstream stall the client twice over. An
-	// absolute deadline rather than a context, so that the common path — an
-	// upstream already connected, nothing to hand it to — allocates no timer.
-	deadline := time.Now().Add(r.handshakeTimeout)
+	// deadline would let a wedged upstream stall the client twice over.
+	//
+	// The write needs bounding because the SSE transport delivers a message as
+	// an HTTP POST on a client with no timeout. Only the delivery is bounded;
+	// how long gopls then takes to answer stays its own business. A server that
+	// takes the POST and never completes it is what this exists for — §8 keeps
+	// exactly such a server alive — and under r.ctx alone it would park this
+	// lane for the rest of the session.
+	ctx, cancel := context.WithTimeout(l.ctx, sendBudget)
+	defer cancel()
 	var err error
 	for range 2 {
+		// A message nobody awaits an answer to never opens a connection:
+		// dialling would run ensure — flock, spawn, handshake — to hand a brand
+		// new process a notification about work it never did. Dropping it
+		// strands nothing; R7's cancellation names a call the reader has already
+		// failed (F2). Asked on the id rather than the method, so no later
+		// notification becomes a second special case, and asked every attempt,
+		// because the retry arrives having just dropped its connection.
+		if l.conn == nil && !id.IsValid() {
+			return
+		}
 		var conn mcp.Connection
-		conn, err = r.upstream(deadline, worktree, initial)
-		if err == nil {
-			// Recorded before the write, not after: a local gopls can answer
-			// before Write returns, and a registration landing after its
-			// response was already deleted would outlive the call and produce
-			// a second, contradictory reply to the same id later on.
-			r.owe(id, owed{conn: conn, worktree: worktree})
-			if err = conn.Write(r.ctx, msg); err == nil {
-				// Cached only once the connection has taken a write: a dial
-				// handing back an already-dead upstream then fails above, on
-				// this goroutine, and the retry is reached. A reader started
-				// before the write would race it for the id instead, leaving
-				// scheduling order to decide whether the client saw a
-				// transparent retry or an error.
-				r.cache(worktree, conn)
-				return
-			}
-			// A failed write and conn's own reader seeing the upstream die are
-			// the same event racing, and whoever claims the id owns the reply.
-			claimed := r.claim(id)
-			delete(r.conns, worktree)
-			_ = conn.Close()
-			if !claimed {
-				// Its reader answered this call already. Retrying would reply
-				// again to an id the client has closed — a reply it ignores,
-				// so the retry would look fine while the client kept the error.
-				return
-			}
+		conn, err = l.upstream(ctx, initial)
+		if err != nil {
+			continue
+		}
+		// Recorded before the write, not after: a local gopls can answer
+		// before Write returns, and a registration landing after its response
+		// was already deleted would outlive the call and produce a second,
+		// contradictory reply to the same id later on.
+		l.r.track(id, conn, l.worktree)
+		if err = conn.Write(ctx, req); err == nil {
+			// Cached only once the connection has taken a write: a dial
+			// handing back an already-dead upstream then fails above, on this
+			// goroutine, and the retry is reached. A reader started before the
+			// write would race it for the id instead, leaving scheduling order
+			// to decide whether the client saw a transparent retry or an error.
+			l.cache(conn)
+			return
+		}
+		// A failed write and conn's own reader seeing the upstream die are the
+		// same event racing, and whoever claims the id owns the reply.
+		claimed := l.r.claim(id)
+		// Forgotten unconditionally: a write can only fail on the connection the
+		// lane just used, so l.conn is either conn itself or already nil.
+		l.conn = nil
+		_ = conn.Close()
+		if !claimed {
+			// Its reader answered this call already. Retrying would reply again
+			// to an id the client has closed — a reply it ignores, so the retry
+			// would look fine while the client kept the error.
+			return
 		}
 	}
 	if !id.IsValid() {
 		return // a notification has nowhere to report a failure to
 	}
-	r.fail(id, "gopls for %s: %v", worktree, err)
+	l.r.fail(id, jsonrpc.CodeInternalError, "gopls for %s: %v", l.worktree, err)
 }
 
-// owe records that an upstream owes an answer to id. Ids the client did not ask
-// an answer for are not tracked.
-func (r *router) owe(id jsonrpc.ID, upstream owed) {
+// track records a request as being in flight to worktree, and with conn once an
+// upstream has taken it — a nil conn is a call routed but not yet written. Ids
+// the client did not ask an answer for are not tracked.
+//
+// A retry passes through here twice: the write that failed lost the record to
+// claim, and the call it is placing is live again.
+func (r *router) track(id jsonrpc.ID, conn mcp.Connection, worktree string) {
 	if !id.IsValid() {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.awaitingUpstream[id] = upstream
+	r.awaitingUpstream[id] = owed{conn: conn, worktree: worktree}
 }
 
-// claim takes id off the owed list, reporting whether this caller is the one
-// that got it. Exactly one party may answer a call, and taking the id off the
-// list is what confers that right — see also failInFlight, which claims in
-// bulk. A notification is nobody's to answer, so claiming its absent id
-// succeeds; a request id already off the list has been answered by somebody
-// else, and claiming it fails.
+// claim ends id's flight, reporting whether this caller is the party that got
+// to answer it. Exactly one may, and taking the id off the awaited list is what
+// confers that right — see also failInFlight, which claims in bulk. A
+// notification is nobody's to answer, so claiming its absent id succeeds; an id
+// already off the list has been answered by somebody else, and claiming it
+// fails.
+//
+// A call no upstream has taken yet is nobody's to answer either, so it loses:
+// only the party that took the record away from a connection owing a reply has
+// won a race against that connection's reader.
 func (r *router) claim(id jsonrpc.ID) bool {
 	if !id.IsValid() {
 		return true
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, won := r.awaitingUpstream[id]
+	won := r.awaitingUpstream[id].conn != nil
 	delete(r.awaitingUpstream, id)
 	return won
 }
 
-// fail answers id with an internal error: the only way the bridge can report a
-// problem for a call the client is still waiting on.
-func (r *router) fail(id jsonrpc.ID, format string, args ...any) {
-	r.forward(&jsonrpc.Response{ID: id, Error: &jsonrpc.Error{
-		Code:    jsonrpc.CodeInternalError,
+// fail answers id with an error: the only way the bridge can report a problem
+// for a call the client is still waiting on.
+//
+// Answering ends the call, so its route goes too — a cancellation arriving now
+// belongs at home, not at a lane that has stopped waiting for it. Done here
+// rather than at each caller because it holds for all of them, and the two that
+// have nothing to drop lose nothing by saying so: refuseBeforeInitialize never
+// tracked its id, and failInFlight took its own off the list to get here. This
+// is the plain delete, not a claim — every caller has already established that
+// the reply below is theirs to send.
+func (r *router) fail(id jsonrpc.ID, code int64, format string, args ...any) {
+	r.mu.Lock()
+	delete(r.awaitingUpstream, id)
+	r.mu.Unlock()
+	r.forward(errorResponse(id, code, format, args...))
+}
+
+// errorResponse builds the one error shape this bridge sends, in both
+// directions: fail forwards it to the client, answeredUpstream writes it back to
+// a gopls. Shared so the two cannot drift into answering the same way in
+// different words.
+func errorResponse(id jsonrpc.ID, code int64, format string, args ...any) *jsonrpc.Response {
+	return &jsonrpc.Response{ID: id, Error: &jsonrpc.Error{
+		Code:    code,
 		Message: fmt.Sprintf(format, args...),
-	}})
+	}}
 }
 
 // forward hands a message to the client, giving up once the session is over so
@@ -345,34 +596,47 @@ func (r *router) forward(msg jsonrpc.Message) {
 	}
 }
 
-// cache records conn as worktree's upstream and starts the goroutine that reads
-// it. Both happen here and nowhere else, so that an entry in r.conns is never a
-// connection nobody reads — one would swallow that upstream's answers, and its
-// death, for the rest of the session. Idempotent: the common path re-offers a
-// connection that is already cached.
-func (r *router) cache(worktree string, conn mcp.Connection) {
-	if r.conns[worktree] == conn {
+// cache adopts conn as this lane's upstream and starts the goroutine that reads
+// it. Both happen here and nowhere else, so that a lane's connection is never
+// one nobody reads — that would swallow the upstream's answers, and its death,
+// for the rest of the session. Idempotent: the common path re-offers a
+// connection the lane already holds.
+func (l *lane) cache(conn mcp.Connection) {
+	if l.conn == conn {
 		return
 	}
-	r.conns[worktree] = conn
-	go r.readFromUpstream(conn, worktree)
+	l.conn = conn
+	go l.r.readFromUpstream(conn, l.worktree)
 }
 
-// upstream returns the connection for worktree, dialling and handshaking one if
-// there is none. deadline bounds the handshake, and is shared with the caller's
-// other attempt: see send. Dialling is not covered — see §10. A connection it
-// dialled is not cached here — see cache.
-func (r *router) upstream(deadline time.Time, worktree string, initial bool) (mcp.Connection, error) {
-	if conn, ok := r.conns[worktree]; ok {
-		return conn, nil
+// upstream returns this lane's connection, dialling and handshaking one if it
+// has none. ctx is the budget for the whole call, shared with the caller's
+// other attempt: see send. A connection it dialled is not adopted here — see
+// cache.
+//
+// A connection is initialized exactly once, and this is where that holds: it is
+// answered from the state of the connection, not from the order the client's
+// messages happened to arrive in. Either branch below hands back an upstream
+// that has had its one initialize — the private replay for every message but
+// the client's own, and the caller's own write for that one.
+func (l *lane) upstream(ctx context.Context, initial bool) (mcp.Connection, error) {
+	if l.conn != nil {
+		if initial {
+			// Cached means handshaken, so the client's initialize would be this
+			// connection's second — which gopls answers with the error that ends
+			// the session. One diagnosable error beats a dead upstream, and this
+			// does not depend on the reader having seen the disorder.
+			return nil, errors.New("the client's initialize reached an upstream that already has one")
+		}
+		return l.conn, nil
 	}
 	// The first attempt can burn the whole budget in the handshake. Dialling
-	// again would then spend an unbounded flock wait, and possibly a process
-	// spawn, on a handshake guaranteed to expire on its first write.
-	if !time.Now().Before(deadline) {
-		return nil, context.DeadlineExceeded
+	// again would spend an unbounded flock wait, and possibly a spawn, on a
+	// handshake guaranteed to expire on its first write.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	conn, err := r.dial(worktree)
+	conn, err := l.dialBounded(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -380,9 +644,7 @@ func (r *router) upstream(deadline time.Time, worktree string, initial bool) (mc
 	// Every later connection, including a restarted home daemon, is initialized
 	// behind the client's back because the client handshakes only once.
 	if !initial {
-		ctx, cancel := context.WithDeadline(r.ctx, deadline)
-		defer cancel()
-		if err := r.handshake(ctx, conn, worktree); err != nil {
+		if err := l.handshake(ctx, conn); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
@@ -390,12 +652,61 @@ func (r *router) upstream(deadline time.Time, worktree string, initial bool) (mc
 	return conn, nil
 }
 
-func (r *router) dialGopls(worktree string) (mcp.Connection, error) {
+// dialBounded dials this lane's upstream, giving up when budget is done.
+//
+// The connection cannot be dialled under budget itself: the SSE transport reads
+// its stream under the dial's context for the connection's whole life, so a
+// deadline there would cut a healthy upstream loose on expiry (H5). Hence a
+// cancellable context of its own, cancelled only by a watchdog that is disarmed
+// the moment the dial returns.
+//
+// This bounds the connect, not the whole of dialGopls: ensure's flock and
+// readiness poll take no context and stay unbounded (§10).
+func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
+	ctx, cancel := context.WithCancel(l.r.ctx)
+	watchdog := context.AfterFunc(budget, cancel)
+	conn, err := l.r.dial(ctx, l.worktree)
+	if !watchdog() {
+		// The watchdog won: ctx is cancelled, so a connection handed back here
+		// is already unreadable — its stream lives under that same context.
+		if err == nil {
+			_ = conn.Close()
+		}
+		// budget is provably done, so this names why: a deadline of send's own
+		// making, or the session going away underneath it.
+		return nil, budget.Err()
+	}
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	// Not cancelled here: this context is the connection's for as long as it
+	// lives. It is handed to the connection instead, which releases it when it
+	// is closed.
+	return &boundedConn{Connection: conn, release: cancel}, nil
+}
+
+// boundedConn ties dialBounded's context to the life of its connection, so
+// closing the connection releases it. It cannot be released when the dial
+// returns — the SSE stream reads under it throughout — but every site that
+// gives a connection up closes it. Left to the session context instead, the
+// children accumulate: a wedged upstream redials on every call.
+type boundedConn struct {
+	mcp.Connection
+	release context.CancelFunc
+}
+
+func (c *boundedConn) Close() error {
+	defer c.release()
+	return c.Connection.Close()
+}
+
+func (r *router) dialGopls(ctx context.Context, worktree string) (mcp.Connection, error) {
 	port, err := r.m.ensure(worktree)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := (&mcp.SSEClientTransport{Endpoint: "http://" + mcpAddress(port)}).Connect(r.ctx)
+	conn, err := (&mcp.SSEClientTransport{Endpoint: mcpURL(port)}).Connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connect to shared gopls MCP: %w", err)
 	}
@@ -404,21 +715,20 @@ func (r *router) dialGopls(worktree string) (mcp.Connection, error) {
 
 // handshake replays the client's initialize under a private id and swallows the
 // reply, so the client sees exactly one initialize result — the home server's.
-// ctx bounds it: this runs on the readFromClient goroutine, so an upstream that
-// answers nothing would otherwise block every later client message too. The
-// connection itself keeps r.ctx, because the SSE transport reads its stream
-// under the context it was dialled with and a deadline there would cut the
-// upstream loose the moment it expired.
-func (r *router) handshake(ctx context.Context, conn mcp.Connection, worktree string) error {
-	if r.initialize == nil {
+// ctx bounds it: this runs on the lane's goroutine, so an upstream that answers
+// nothing would otherwise block every later call to that worktree too. It bounds
+// nothing but the handshake — the connection keeps the context it was dialled
+// with, which outlives this one on purpose; see dialBounded.
+func (l *lane) handshake(ctx context.Context, conn mcp.Connection) error {
+	initialize := l.r.initialize.Load()
+	if initialize == nil {
+		// The other half of upstream's rule: a connection gets exactly one
+		// initialize, and there is none to replay yet. The reader already
+		// refuses such a request, so this holds the requirement regardless of
+		// who let the call through.
 		return errors.New("tool call arrived before the client sent initialize")
 	}
-	r.initSeq++
-	id, err := jsonrpc.MakeID(fmt.Sprintf("gopls-mcp-manager-init-%d", r.initSeq))
-	if err != nil {
-		return err
-	}
-	if err := conn.Write(ctx, &jsonrpc.Request{ID: id, Method: r.initialize.Method, Params: r.initialize.Params}); err != nil {
+	if err := conn.Write(ctx, &jsonrpc.Request{ID: initID, Method: initialize.Method, Params: initialize.Params}); err != nil {
 		return err
 	}
 	for {
@@ -426,7 +736,7 @@ func (r *router) handshake(ctx context.Context, conn mcp.Connection, worktree st
 		if err != nil {
 			return err
 		}
-		if resp, ok := msg.(*jsonrpc.Response); ok && resp.ID == id {
+		if resp, ok := msg.(*jsonrpc.Response); ok && resp.ID == initID {
 			if resp.Error != nil {
 				return resp.Error
 			}
@@ -435,10 +745,10 @@ func (r *router) handshake(ctx context.Context, conn mcp.Connection, worktree st
 		// gopls asks for its roots the moment it has seen the capability in
 		// initialize — which is inside this window, before the reader that
 		// normally fields the question is even running.
-		if r.answeredUpstream(ctx, conn, worktree, msg) {
+		if l.r.answeredUpstream(ctx, conn, l.worktree, msg) {
 			continue
 		}
-		r.forward(msg) // anything else it volunteered is the client's
+		l.r.forward(msg) // anything else it volunteered is the client's
 	}
 	return conn.Write(ctx, &jsonrpc.Request{Method: "notifications/initialized"})
 }
@@ -468,9 +778,14 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 // failInFlight answers every request still owed by conn with an error. The
 // calls in flight when a gopls dies get no retry — nothing else will ever
 // produce their ids — so left alone they strand a client that has no timeout.
+//
+// One worktree names them all: a connection belongs to one lane, and a lane to
+// one worktree, so every id matched here was tracked under the caller's own.
 func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error) {
-	r.mu.Lock()
+	// A slice, not a map: nothing looks these up, they are collected under the
+	// lock and then walked once.
 	var stranded []jsonrpc.ID
+	r.mu.Lock()
 	for id, owner := range r.awaitingUpstream {
 		if owner.conn == conn {
 			stranded = append(stranded, id)
@@ -480,7 +795,7 @@ func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error)
 	r.mu.Unlock()
 
 	for _, id := range stranded {
-		r.fail(id, "gopls for %s went away mid-call: %v", worktree, cause)
+		r.fail(id, jsonrpc.CodeInternalError, "gopls for %s went away mid-call: %v", worktree, cause)
 	}
 }
 
@@ -488,15 +803,13 @@ func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error)
 // it to the client, and reports whether it did.
 //
 // Every read loop that can see one has to call this: a roots/list slipping
-// through to the client comes back naming the tree the session opened in, which
-// is the whole failure this bridge exists to prevent. Anything else is refused
-// outright — the client would answer it addressed to nobody in particular, and
+// through to the client comes back naming the tree the session opened in, the
+// whole failure this bridge exists to prevent. Anything else is refused —
 // an upstream holding an unanswerable question waits forever, so a definite
-// error is the kinder reply. gopls asks for nothing else today.
-// ctx is the caller's own budget for talking to conn: the handshake answers
-// roots inside its deadline (S2 — gopls asks the moment it sees the capability,
-// so this is the normal path, not an exotic one), while a running reader has
-// only the session to bound it.
+// error is the kinder reply.
+//
+// ctx is the caller's budget for talking to conn: the handshake answers roots
+// inside its deadline (S2), a running reader has only the session.
 func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, worktree string, msg jsonrpc.Message) bool {
 	req, ok := msg.(*jsonrpc.Request)
 	if !ok || !req.ID.IsValid() {
@@ -506,10 +819,8 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 		r.answerRoots(ctx, conn, worktree, req.ID)
 		return true
 	}
-	_ = conn.Write(ctx, &jsonrpc.Response{ID: req.ID, Error: &jsonrpc.Error{
-		Code:    jsonrpc.CodeMethodNotFound,
-		Message: fmt.Sprintf("gopls-mcp-manager does not relay %q to the client", req.Method),
-	}})
+	_ = conn.Write(ctx, errorResponse(req.ID, jsonrpc.CodeMethodNotFound,
+		"gopls-mcp-manager does not relay %q to the client", req.Method))
 	return true
 }
 
@@ -532,22 +843,27 @@ func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree 
 		URI:  (&url.URL{Scheme: "file", Path: worktree}).String(),
 		Name: filepath.Base(worktree),
 	}}})
-	// A write failure needs no recovery, and must not touch r.conns: that map
-	// belongs to the readFromClient goroutine. An upstream that never hears its
-	// roots just keeps the file set it started with — today's behaviour — and the
-	// next call for it redials anyway.
+	// A write failure needs no recovery, and must not touch the lane holding
+	// this connection: that state belongs to the lane's own goroutine, and this
+	// runs on whichever one is reading the upstream. Left alone, the upstream
+	// keeps the file set it started with — today's behaviour — and the next call
+	// for it redials anyway.
 	_ = conn.Write(ctx, &jsonrpc.Response{ID: id, Result: result})
 }
 
-func (r *router) closeUpstreams() {
-	for _, conn := range r.conns {
-		_ = conn.Close()
-	}
-}
-
-// toolCallWorktree reports the worktree owning the first path argument of a
-// tools/call, or "" when the call names no path we can resolve.
-func (r *router) toolCallWorktree(params json.RawMessage) string {
+// toolCallWorktrees reports the worktrees owning the path arguments of a
+// tools/call, in the order the arguments name them and without repeats. A call
+// naming no path we can resolve reports none.
+//
+// Every path is resolved rather than just the first, because more than one
+// answer is not a tie to be broken: tools like go_diagnostics take a files
+// array, no single gopls knows a tree it was not started for, and routing such
+// a call by its first path answers about that worktree while saying nothing at
+// all about the files in the other — an omission the client cannot see, since
+// what comes back is a well-formed result for the files it did cover. Both are
+// reported so that route can refuse it instead. The extra work is a memo lookup
+// per path on the hit that already covers the routing path (see worktreeOf).
+func (r *router) toolCallWorktrees(params json.RawMessage) []string {
 	var call struct {
 		Arguments struct {
 			File  string   `json:"file"`
@@ -556,22 +872,37 @@ func (r *router) toolCallWorktree(params json.RawMessage) string {
 		} `json:"arguments"`
 	}
 	if err := json.Unmarshal(params, &call); err != nil {
-		return ""
+		return nil
 	}
-	paths := append([]string{call.Arguments.File, call.Arguments.Dir}, call.Arguments.Files...)
-	for _, path := range paths {
-		// An absent argument is no evidence, and a relative one is worse: it
-		// would resolve against this process's own cwd — the home worktree —
-		// and beat the sticky routing that was right, for every worktree but
-		// home. gopls's schemas ask for absolute paths.
-		if !filepath.IsAbs(path) {
-			continue
-		}
-		if worktree := r.worktreeOf(path); worktree != "" {
-			return worktree
-		}
+	// The scalar arguments are ranged over as an array rather than concatenated
+	// with Files into one slice: this runs on the goroutine that routes every
+	// worktree's calls, and the combined slice was a heap allocation on every
+	// tools/call — including the overwhelmingly common one naming a single file.
+	var found []string
+	for _, path := range [...]string{call.Arguments.File, call.Arguments.Dir} {
+		found = r.appendWorktreeOf(found, path)
 	}
-	return ""
+	for _, path := range call.Arguments.Files {
+		found = r.appendWorktreeOf(found, path)
+	}
+	return found
+}
+
+// appendWorktreeOf adds the worktree owning path to found, unless the path is
+// no evidence or names a worktree already there.
+func (r *router) appendWorktreeOf(found []string, path string) []string {
+	// An absent argument is no evidence, and a relative one is worse: it would
+	// resolve against this process's own cwd — the home worktree — and beat the
+	// sticky routing that was right, for every worktree but home. gopls's
+	// schemas ask for absolute paths.
+	if !filepath.IsAbs(path) {
+		return found
+	}
+	worktree := r.worktreeOf(path)
+	if worktree == "" || slices.Contains(found, worktree) {
+		return found
+	}
+	return append(found, worktree)
 }
 
 // worktreeOf resolves one path argument, memoizing the answer under the
@@ -581,25 +912,30 @@ func (r *router) toolCallWorktree(params json.RawMessage) string {
 // successes are cached, so a path that becomes resolvable later still gets its
 // own lookup; a worktree removed mid-session keeps answering until the routed
 // gopls reports the path itself.
+//
+// The verbatim path is memoized in front of that, because reaching the
+// directory memo is not free: containingDir lstats every component of the
+// argument, and a profile put two thirds of the routing path there — time the
+// reader goroutine spends routing nobody else's call. Kept as a second map so
+// that the directory memo's entry count stays exactly the number of git forks
+// the session has paid for.
 func (r *router) worktreeOf(path string) string {
-	// The key only; worktreePath gets the path itself and reduces it the same
-	// way, from the same argument. Handing it the reduced form instead would
-	// reduce twice, and a second pass over a directory that does not exist
-	// climbs to its parent — resolving a path against a tree it never named.
-	//
-	// ponytail: the key costs a stat(2) even when it hits, since containingDir
-	// is what tells a file from a directory. One syscall against the ~13ms git
-	// call it saves; carry a second map from path to key if a hot loop ever
-	// makes it show.
-	dir := containingDir(path)
-	if worktree, ok := r.worktrees[dir]; ok {
+	if worktree, ok := r.paths[path]; ok {
 		return worktree
 	}
-	worktree, err := worktreePath(path)
-	if err != nil {
-		return ""
+	dir := containingDir(path)
+	worktree, ok := r.worktrees[dir]
+	if !ok {
+		var err error
+		if worktree, err = worktreeOfDir(r.ctx, dir); err != nil {
+			return ""
+		}
+		r.worktrees[dir] = worktree
 	}
-	r.worktrees[dir] = worktree
+	// ponytail: unbounded, like the directory memo it fronts — an entry is two
+	// strings and a session names the files it is working on, not the tree. Cap
+	// it if some caller ever walks a repository through here.
+	r.paths[path] = worktree
 	return worktree
 }
 
@@ -608,10 +944,21 @@ func (r *router) worktreeOf(path string) string {
 // handed and cannot see is a file far more often than a directory.
 //
 // Cleaned either way, because this is a memo key: a dir argument spelled with a
-// trailing separator, or with a "." in it, names the same directory as one
-// without and must not fork git a second time for the answer already stored.
-// filepath.Dir cleans on its own, so only the directory branch needs saying.
+// trailing separator names the same directory as one without, and must not fork
+// git twice. filepath.Dir cleans on its own.
+//
+// Symlinks are resolved first, because the reduction is lexical: a link to a
+// file in another worktree is not a directory, so its parent would be the
+// link's own and the named tree would never be asked. Resolving also makes the
+// key physical, which lets two spellings of one tree share an entry (R4, R5).
+//
+// A failure leaves input alone: EvalSymlinks needs every component to exist,
+// and a path that does not exist yet must still resolve through its parent
+// (R2) — a file created moments ago is the ordinary case.
 func containingDir(input string) string {
+	if resolved, err := filepath.EvalSymlinks(input); err == nil {
+		input = resolved
+	}
 	if info, err := os.Stat(input); err == nil && info.IsDir() {
 		return filepath.Clean(input)
 	}
@@ -622,26 +969,50 @@ func containingDir(input string) string {
 // it. A path that does not exist, or is in no repository, resolves to an error:
 // callers routing a tool call treat that as "no evidence, keep the current
 // server", which then reports its own error for the path.
-func worktreePath(input string) (string, error) {
-	// Kept here even though worktreeOf computes the same directory for its memo
-	// key, and not hoisted into the callers: every argument this is reached with
-	// is shaped like a file, and a caller that forgot to reduce one would get
-	// "Not a directory" from git — which reads as "no evidence" and misroutes to
-	// home rather than reporting anything.
-	input = containingDir(input)
+//
+// The reduction to a directory happens here and in worktreeOf, which needs it
+// for its memo key anyway — never twice on one argument: a second pass over a
+// directory that does not exist climbs to its parent, resolving a path against
+// a tree the caller never named. worktreeOfDir is what makes that unsayable.
+func worktreePath(ctx context.Context, input string) (string, error) {
+	return worktreeOfDir(ctx, containingDir(input))
+}
+
+// worktreeOfDir resolves a directory — never a file — to the root of the
+// worktree holding it.
+//
+// The context is the caller's own — the session's on the routing path — so that
+// a git parked on a dead mount is cancelled when the session ends rather than
+// outliving it: this runs on the goroutine that reads the client, and a hang
+// here is a teardown that waits out the timeout below with nothing left to
+// serve. The timeout stays on top of it, because the caller's context may have
+// no deadline at all.
+func worktreeOfDir(ctx context.Context, dir string) (string, error) {
 	// Bounded, because this runs on the goroutine that reads the client: a git
 	// that never returns — a stalled network filesystem is enough — would wedge
 	// the session with neither side timing out, which is the failure H5 bounds
 	// for the handshake. Generous, since rev-parse reads no tree: only a hang
 	// should ever reach it.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// git -C resolves its own cwd physically, so the toplevel it prints already
-	// has the symlinks taken out of it — and a relative input resolves against
+	// has the symlinks taken out of it — and a relative dir resolves against
 	// this process's cwd, which is what the "." default means.
-	out, err := exec.CommandContext(ctx, "git", "-C", input, "rev-parse", "--show-toplevel").Output()
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse --show-toplevel: %w", err)
 	}
-	return filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	worktree, err := filepath.EvalSymlinks(strings.TrimSpace(string(out)))
+	if err != nil {
+		return "", err
+	}
+	// Refused at the one place a worktree is minted, so no port is allocated and
+	// no gopls spawned for a path the map cannot hold: a Unix path is arbitrary
+	// bytes, but the map file is JSON, and json.Marshal replaces invalid UTF-8
+	// with U+FFFD rather than failing (§10). writeMap refuses it too — this is
+	// what keeps it from ever getting that far.
+	if !utf8.ValidString(worktree) {
+		return "", fmt.Errorf("worktree path is not valid UTF-8: %q", worktree)
+	}
+	return worktree, nil
 }

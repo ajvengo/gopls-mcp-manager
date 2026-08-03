@@ -52,8 +52,12 @@ removed. The worktree the bridge starts in is its **home**.
 
 Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
 
-- **First argument that resolves to a worktree wins.** That worktree's gopls
-  answers the call, and becomes *sticky*.
+- **Every path argument is resolved, and they must agree.** If they all name one
+  worktree, its gopls answers the call and becomes *sticky*. If they name two or
+  more, the call is refused rather than routed: no single gopls knows a tree it
+  was not started for, so answering from one of them would silently say nothing
+  at all about the files in the other — and the client would see a well-formed
+  result for the files it did cover.
 - **Relative paths are ignored.** They would resolve against the manager's own
   working directory — the home worktree — and so would misroute every call
   outside home. gopls' own schemas ask for absolute paths.
@@ -91,23 +95,31 @@ directory holding the path, since every file in one has the same answer.
   Exactly one party may answer a call: whoever takes its id off the pending
   list owns the reply, so a write that loses that race to the dying
   connection's own reader is not retried behind the answer already sent.
-- **The handshake is bounded** — 30 s per client message, retry included. It
-  runs on the goroutine reading the client, so an upstream that accepts the
-  connection and then answers nothing would otherwise stall every later
-  message for the rest of the session, with neither side timing out. That
+- **Each worktree gets its own lane** — a queue and the one goroutine that owns
+  its gopls connection. The goroutine reading the client only picks a
+  destination and hands the message over, so starting a cold worktree (a lock
+  wait, a `gopls` spawn, a handshake) costs that worktree's calls and nobody
+  else's.
+- **The handshake is bounded** — the readiness budget plus 20 s (30 s today) per
+  client message, retry included. It
+  runs on the lane's goroutine, so an upstream that accepts the connection and
+  then answers nothing would otherwise stall every later call to that worktree
+  for the rest of the session, with neither side timing out. That
   upstream is not hypothetical: a probe timeout is deliberately treated as
-  "alive" (see below), so such a server is handed straight back. Neither the
-  dial nor the call itself is covered: `flock` has no context form, and a gopls
-  that accepts a call and then goes quiet without dying leaves its caller
-  waiting — the failure path fires on a connection dying, not on one falling
-  silent.
+  "alive" (see below), so such a server is handed straight back. The same
+  budget covers the connect and the delivery of the call, so a wedged upstream
+  fails each call and leaves its lane usable. What it does not cover: the
+  `flock` inside a cold start, which has no context form, and the answer
+  itself — a gopls that accepts a call and then goes quiet without dying leaves
+  its caller waiting, because the failure path fires on a connection dying, not
+  on one falling silent.
 - Only the stdio client going away stops the bridge.
 
 ## State on disk
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…}` |
+| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…}` |
 | `~/.local/share/gopls-ports.map.lock` | flock held around every read-modify-write |
 | `~/.local/share/gopls-mcp-logs/<hash>.log` | stdout+stderr of the gopls for that worktree |
 
@@ -164,7 +176,7 @@ CI runs tests, lint and a `linux/amd64` build on the latest 1.26 patch release.
 
 The bridge tests run under `testing/synctest`, whose clock only moves once every
 goroutine in the bubble has blocked. Timeouts there are therefore free and exact:
-a test can wait out the shipped 30 s handshake budget in no time at all, and a
+a test can wait out the shipped handshake budget in no time at all, and a
 write told to lose a race loses it on every run rather than on almost every run.
 A test stays outside a bubble when it does something that clock cannot account
 for — a child process, a real listener, or a real timeout it means to measure.
