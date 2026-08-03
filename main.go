@@ -45,7 +45,13 @@ func run() error {
 	if len(os.Args) > 2 {
 		worktreeArg = os.Args[2]
 	}
-	worktree, err := worktreePath(worktreeArg)
+	// Installed before the first thing that can block, not just around the
+	// session: resolving the worktree shells out to git, and a git on a dead
+	// mount would otherwise sit out its own timeout with ^C doing nothing.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	worktree, err := worktreePath(ctx, worktreeArg)
 	if err != nil {
 		return err
 	}
@@ -60,7 +66,5 @@ func run() error {
 		return nil
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	return bridge(ctx, m, worktree)
 }

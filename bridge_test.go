@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -22,8 +24,13 @@ type fakeConn struct {
 	reads  chan jsonrpc.Message
 	writes chan jsonrpc.Message
 
-	// writeErr fails every write.
-	writeErr error
+	// onWrite replaces the default write, and is the one seam these tests need
+	// from a connection: every upstream they stub differs from a plain one in
+	// what writing to it does — it fails, it answers out of the write itself, it
+	// dies first — and in nothing else. nil is the default, which queues the
+	// message on writes. A hook that wants the default for the messages it does
+	// not care about calls queue.
+	onWrite func(ctx context.Context, msg jsonrpc.Message) error
 }
 
 func (c *fakeConn) Read(ctx context.Context) (jsonrpc.Message, error) {
@@ -41,22 +48,172 @@ func (c *fakeConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 }
 
 func (c *fakeConn) Write(ctx context.Context, msg jsonrpc.Message) error {
-	if c.writeErr != nil {
-		return c.writeErr
+	if c.onWrite != nil {
+		return c.onWrite(ctx, msg)
 	}
+	return c.queue(ctx, msg)
+}
+
+// queue is the default write: hand the message over and let a test read it back.
+func (c *fakeConn) queue(ctx context.Context, msg jsonrpc.Message) error {
 	select {
 	case c.writes <- msg:
 		return nil
 	case <-ctx.Done():
 		// A real Connection honours its context, and the retried handshake in
-		// TestHandshakeGivesUpOnAnUpstreamThatNeverAnswers hangs against one
+		// TestAWedgedUpstreamFailsItsCallWithinOneBudget hangs against one
 		// that does not: by then the shared deadline has already expired.
 		return ctx.Err()
 	}
 }
 
+// failingConn fails every write, which is what a lane still holding a
+// connection to a gopls that has gone away runs into.
+func failingConn() *fakeConn {
+	return &fakeConn{onWrite: func(context.Context, jsonrpc.Message) error { return io.EOF }}
+}
+
 func (c *fakeConn) Close() error      { return nil }
 func (c *fakeConn) SessionID() string { return "" }
+
+// newFakeConn is the shape most of these tests want: reads handed over one at a
+// time, and room for a single write so that a send need not be raced to be
+// taken.
+func newFakeConn() *fakeConn {
+	return &fakeConn{reads: make(chan jsonrpc.Message), writes: make(chan jsonrpc.Message, 1)}
+}
+
+// newHandshakingConn answers the private handshake out of its own write, so
+// that a test wanting a lane on a connected upstream needs no goroutine
+// scripting one. Everything the handshake does not swallow is queued as on a
+// plain fakeConn, which is what lets a test still await the call it placed.
+//
+// The buffered read is what keeps that answer from blocking on a handshake that
+// is not reading yet — it writes before it reads. The writes are buffered for
+// the same reason, deep enough for the whole tail of one handshaked call: the
+// initialized notification, then the call itself.
+func newHandshakingConn() *fakeConn {
+	c := &fakeConn{
+		reads:  make(chan jsonrpc.Message, 1),
+		writes: make(chan jsonrpc.Message, 2),
+	}
+	c.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
+		if req, ok := msg.(*jsonrpc.Request); ok && req.Method == "initialize" {
+			c.reads <- &jsonrpc.Response{ID: req.ID, Result: json.RawMessage(`{}`)}
+			return nil
+		}
+		return c.queue(ctx, msg)
+	}
+	return c
+}
+
+// newTestRouter is a router over the test's own context, with no manager: every
+// test below either stubs r.dial or never reaches one. The home worktree is a
+// path no test resolves, so routing decisions stay the ones the test makes.
+//
+// testing.TB rather than *testing.T so the benchmarks build their router the
+// same way; they pass a real directory as home, which is the only thing they
+// need that differs.
+func newTestRouter(tb testing.TB, home string) *router {
+	tb.Helper()
+	return newRouter(tb.Context(), nil, home)
+}
+
+// testHome is the fallback worktree for the tests that do not care what it is.
+const testHome = "/tmp/home"
+
+// testWorktree is the destination every test that needs one routes to: a path
+// no test resolves either, so naming it is what picks the lane, not what is on
+// disk. Distinct from newTestRouter's home, which is the fallback.
+const testWorktree = "/tmp/wt"
+
+// clientInitializeParams stands in for the real client's initialize params. It
+// carries the roots capability on purpose: that capability is what makes gopls
+// ask roots/list at all, so a replay that dropped the params would leave every
+// secondary upstream never asking, and S1-S3 unreachable in production.
+const clientInitializeParams = `{"capabilities":{"roots":{"listChanged":true}}}`
+
+// handshakeReady gives the router the client initialize every private handshake
+// replays. Without one, upstream() refuses to open any connection but the first.
+func handshakeReady(r *router) {
+	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: json.RawMessage(clientInitializeParams)})
+}
+
+// sendCall puts a tools/call on l under a fresh id and hands the id back, which
+// is what every caller then asserts on.
+func sendCall(t *testing.T, l *lane, name string) jsonrpc.ID {
+	t.Helper()
+	id := mustID(t, name)
+	l.send(&jsonrpc.Request{ID: id, Method: "tools/call"})
+	return id
+}
+
+// connectedLane registers worktree's lane already holding conn, which is the
+// state a successful dial leaves it in.
+//
+// No goroutine runs it: these tests call send themselves, so that a call and
+// the assertions about it stay on one goroutine. A test that routes through
+// readFromClient instead starts one with go l.run().
+func connectedLane(r *router, worktree string, conn mcp.Connection) *lane {
+	l := newLane(r, worktree)
+	l.conn = conn
+	r.lanes[worktree] = l
+	return l
+}
+
+// parkedDial makes every dial hang until the test is over, which is what an
+// flock held by another process's cold start looks like from here.
+//
+// Parked on the test's own context rather than the dial's: dialBounded cancels
+// that one at sendBudget, which would unpark the dial mid-bubble.
+func parkedDial(t *testing.T, r *router) {
+	t.Helper()
+	r.dial = func(context.Context, string) (mcp.Connection, error) {
+		<-t.Context().Done()
+		return nil, io.EOF
+	}
+}
+
+// fixedDial hands every lane the same connection, for the tests whose subject
+// is what the bridge does with an upstream rather than how it came by one.
+func fixedDial(r *router, conn mcp.Connection) {
+	r.dial = func(context.Context, string) (mcp.Connection, error) { return conn, nil }
+}
+
+// forbidDial fails the test if a lane reaches for a connection at all, naming
+// what that would mean. For the tests whose whole property is that it does not.
+func forbidDial(t *testing.T, r *router, whatWouldBeWrong string) {
+	t.Helper()
+	r.dial = func(context.Context, string) (mcp.Connection, error) {
+		t.Error(whatWouldBeWrong)
+		return nil, io.EOF
+	}
+}
+
+// startClient runs the reader over a channel the test sends its client messages
+// on, and shuts the reader and every lane it opened down with the test. The
+// order matters and is the reason this is shared: closing the reads is what ends
+// readFromClient, and only then may closeLanes touch r.lanes, which that
+// goroutine owns.
+func startClient(t *testing.T, r *router, depth int) chan<- jsonrpc.Message {
+	t.Helper()
+	reads := make(chan jsonrpc.Message, depth)
+	go r.readFromClient(&fakeConn{reads: reads})
+	t.Cleanup(func() {
+		close(reads)
+		r.closeLanes()
+	})
+	return reads
+}
+
+// mustWriteFile puts content on disk, for the tests and benchmarks that need a
+// real file for git or EvalSymlinks to walk.
+func mustWriteFile(tb testing.TB, path, content string) {
+	tb.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		tb.Fatal(err)
+	}
+}
 
 // bubble runs fn under synctest's clock, which only moves once every goroutine
 // in it has blocked. Two things these tests want follow from that: a wait for
@@ -211,6 +368,17 @@ func wantResponse(t *testing.T, msg jsonrpc.Message, id jsonrpc.ID) *jsonrpc.Res
 	return resp
 }
 
+// wantWireError insists resp carries a JSON-RPC error under code, and hands it
+// back so callers can go on to assert on the message itself.
+func wantWireError(t *testing.T, resp *jsonrpc.Response, code int64) *jsonrpc.Error {
+	t.Helper()
+	var wire *jsonrpc.Error
+	if !errors.As(resp.Error, &wire) || wire.Code != code {
+		t.Fatalf("error = %v, want one with code %d", resp.Error, code)
+	}
+	return wire
+}
+
 // wantOneRoot reads a roots/list answer, which names exactly one root — the
 // tree the upstream that asked belongs to, and never any other. Callers assert
 // on the root itself; that there is only the one is the shared part.
@@ -226,11 +394,14 @@ func wantOneRoot(t *testing.T, resp *jsonrpc.Response) *mcp.Root {
 	return got.Roots[0]
 }
 
-func mustID(t *testing.T, raw string) jsonrpc.ID {
-	t.Helper()
+// mustID takes any of the nil/float64/string an id arrives off the wire as, so
+// that a numeric id in a test is built the same way as a name — and by the same
+// call the benchmarks use.
+func mustID(tb testing.TB, raw any) jsonrpc.ID {
+	tb.Helper()
 	id, err := jsonrpc.MakeID(raw)
 	if err != nil {
-		t.Fatalf("MakeID(%q): %v", raw, err)
+		tb.Fatalf("MakeID(%v): %v", raw, err)
 	}
 	return id
 }
@@ -261,20 +432,69 @@ func TestWithRootsCapability(t *testing.T) {
 	}
 }
 
+// The client's own initialize has to reach a connection that has not had one,
+// and refusing on the reader is what keeps that true. Let through, this call
+// would wake the home lane, which dials and — finding the initialize queued
+// behind it already stored — spends the private handshake on that connection.
+// The client's own initialize would then be written to an upstream that has
+// already been initialized, and the error gopls answers with would be forwarded
+// as the initialize result, ending the session before it began.
+//
+// Asserted on the dial rather than on that outcome, because the outcome needs
+// the lane to lose a race it usually wins: no dial at all is the property, and
+// it holds whoever wins.
+//
+// A notification has no id to answer, so inventing a response for one would be
+// a message the client has nothing to match against. Dropped instead — and the
+// lane still must not wake, which is the half a cancellation could not test:
+// that one is refused a dial anyway (R7), so it would pass with the refusal
+// deleted. The notification below is one that would otherwise open a connection.
+func TestAMessageBeforeInitializeNeverWakesALane(t *testing.T) {
+	t.Parallel()
+	id := mustID(t, "call-before-initialize")
+	tests := []struct {
+		name string
+		msg  *jsonrpc.Request
+		want func(t *testing.T, r *router)
+	}{
+		{"request is refused", &jsonrpc.Request{ID: id, Method: "tools/call"}, func(t *testing.T, r *router) {
+			wantClientError(t, r, id, "a tools/call before initialize was left unanswered")
+		}},
+		{"notification is dropped", &jsonrpc.Request{Method: "notifications/initialized"}, func(t *testing.T, r *router) {
+			wantClientQuiet(t, r, "a notification sent before initialize was answered")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bubble(t, func(t *testing.T) {
+				r := newTestRouter(t, testHome)
+				forbidDial(t, r, "a lane opened a connection for a message that arrived before initialize")
+				clientReads := startClient(t, r, 1)
+
+				clientReads <- test.msg
+
+				test.want(t, r)
+				synctest.Wait()
+			})
+		})
+	}
+}
+
 func TestRootlessInitializeIsForwardedWithWorkingRoots(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const home = "/tmp/home"
-		clientReads := make(chan jsonrpc.Message, 1)
+		r := newTestRouter(t, testHome)
 		upstreamReads := make(chan jsonrpc.Message, 1)
 		upstream := &fakeConn{reads: upstreamReads, writes: make(chan jsonrpc.Message, 2)}
-		r := newRouter(t.Context(), nil, home)
-		r.conns[home] = upstream
-		go r.readFromClient(&fakeConn{reads: clientReads})
-		go r.readFromUpstream(upstream, home)
-		t.Cleanup(func() {
-			close(clientReads)
-			close(upstreamReads)
-		})
+		// Dialled rather than handed over pre-connected, because that is the only
+		// way home gets a connection while the client's initialize is what opens
+		// it: a lane already holding one refuses that message under H2a. laneFor
+		// runs the lane and cache starts its reader, so neither is started here.
+		fixedDial(r, upstream)
+		// Registered before startClient so it runs after it: cleanups are LIFO,
+		// and the upstream's reader must not be cut loose before the lanes it
+		// belongs to have been closed.
+		t.Cleanup(func() { close(upstreamReads) })
+		clientReads := startClient(t, r, 1)
 
 		clientReads <- &jsonrpc.Request{
 			ID:     mustID(t, "initialize-rootless"),
@@ -295,6 +515,41 @@ func TestRootlessInitializeIsForwardedWithWorkingRoots(t *testing.T) {
 	})
 }
 
+// A cold worktree used to be dialled on the goroutine that reads the client, so
+// every other worktree's calls queued behind its flock wait, gopls spawn and
+// handshake — up to the whole handshake budget. Each worktree has a lane of its
+// own now, and a call to one that is already connected must land while a cold
+// one is still stuck in its dial.
+func TestAColdWorktreeDoesNotHoldUpAnother(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		r := newTestRouter(t, testHome)
+		home := r.home
+		warm := newFakeConn()
+
+		handshakeReady(r)
+		parkedDial(t, r)
+		// Routing by path would have to resolve one through git, which a bubble
+		// cannot account for. A sticky worktree sends a path-less call to the same
+		// place, which is all this needs.
+		r.sticky = "/tmp/cold"
+		go connectedLane(r, home, warm).run()
+		// LIFO, so this runs after the lanes are closed — see the note above.
+		t.Cleanup(func() { close(warm.reads) })
+		clientReads := startClient(t, r, 2)
+
+		clientReads <- &jsonrpc.Request{
+			ID:     mustID(t, "call-into-the-cold"),
+			Method: "tools/call",
+			Params: json.RawMessage(`{"arguments":{"query":"Foo"}}`),
+		}
+		clientReads <- &jsonrpc.Request{ID: mustID(t, "list"), Method: "tools/list"}
+
+		if _, err := recvRequest(warm.writes, "tools/list"); err != nil {
+			t.Fatalf("%v — want the tools/list that followed the cold call, while the cold worktree is still dialling", err)
+		}
+	})
+}
+
 // No bubble: readFromUpstream runs to completion on this goroutine, so there is
 // nothing for a clock to wait on.
 func TestHomeUpstreamEOFDoesNotCloseClient(t *testing.T) {
@@ -302,7 +557,7 @@ func TestHomeUpstreamEOFDoesNotCloseClient(t *testing.T) {
 
 	reads := make(chan jsonrpc.Message)
 	close(reads)
-	r := newRouter(t.Context(), nil, "/tmp/home")
+	r := newTestRouter(t, testHome)
 	r.readFromUpstream(&fakeConn{reads: reads}, r.home)
 
 	select {
@@ -314,25 +569,30 @@ func TestHomeUpstreamEOFDoesNotCloseClient(t *testing.T) {
 
 func TestSendReconnectsAndInitializesRestartedHome(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		home := "/tmp/home"
 		fresh := &fakeConn{
 			// Buffered, so that handing over the handshake's answer below cannot
 			// block on the router picking it up.
 			reads:  make(chan jsonrpc.Message, 1),
 			writes: make(chan jsonrpc.Message),
 		}
-		r := newRouter(t.Context(), nil, home)
-		r.conns[home] = &fakeConn{writeErr: io.EOF}
-		r.initialize = &jsonrpc.Request{Method: "initialize", Params: json.RawMessage(`{}`)}
-		r.dial = func(string) (mcp.Connection, error) { return fresh, nil }
+		r := newTestRouter(t, testHome)
+		l := connectedLane(r, r.home, failingConn())
+		handshakeReady(r)
+		fixedDial(r, fresh)
 
 		done := inBackground(func() error {
 			initialize, err := recvRequest(fresh.writes, "initialize")
 			if err != nil {
 				return err
 			}
-			if !initialize.ID.IsValid() {
-				return fmt.Errorf("reconnect opened with %#v, want a private initialize id", initialize)
+			// The id is the private one and the params are the client's own:
+			// asserting only that some id is valid would leave both the fixed
+			// id H2 relies on and the replayed capabilities ungated.
+			if initialize.ID != initID {
+				return fmt.Errorf("reconnect opened with id %v, want the private %v", initialize.ID, initID)
+			}
+			if string(initialize.Params) != clientInitializeParams {
+				return fmt.Errorf("replayed initialize params = %s, want the client's %s", initialize.Params, clientInitializeParams)
 			}
 			fresh.reads <- &jsonrpc.Response{ID: initialize.ID, Result: json.RawMessage(`{}`)}
 			if _, err := recvRequest(fresh.writes, "notifications/initialized"); err != nil {
@@ -345,8 +605,7 @@ func TestSendReconnectsAndInitializesRestartedHome(t *testing.T) {
 		// still in flight, and closing it here would — correctly — fail that call.
 		t.Cleanup(func() { close(fresh.reads) })
 
-		id := mustID(t, "call-7")
-		r.send(home, &jsonrpc.Request{ID: id, Method: "tools/call"}, id, false)
+		sendCall(t, l, "call-7")
 		if err := mustRecv(t, done, "the reconnect assertions to finish"); err != nil {
 			t.Fatal(err)
 		}
@@ -357,27 +616,24 @@ func TestSendReconnectsAndInitializesRestartedHome(t *testing.T) {
 
 func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		home := "/tmp/home"
-		fresh := &fakeConn{
-			reads:  make(chan jsonrpc.Message),
-			writes: make(chan jsonrpc.Message, 1),
-		}
+		fresh := newFakeConn()
 		failedReads := make(chan jsonrpc.Message)
 		close(failedReads)
 		dials := 0
-		r := newRouter(t.Context(), nil, home)
-		r.dial = func(string) (mcp.Connection, error) {
+		r := newTestRouter(t, testHome)
+		home := r.home
+		r.dial = func(context.Context, string) (mcp.Connection, error) {
 			dials++
 			if dials == 1 {
-				return &yieldingConn{fakeConn{reads: failedReads}}, nil
+				return yieldingConn(failedReads), nil
 			}
 			return fresh, nil
 		}
 		id := mustID(t, "client-initialize")
 		initialize := &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)}
-		r.initialize = initialize
+		r.initialize.Store(initialize)
 
-		r.send(home, initialize, id, true)
+		newLane(r, home).send(initialize)
 		// The retry is the whole point: with a reader racing the write for the id,
 		// send() finds the call already answered and this write never comes.
 		got := mustRecv(t, fresh.writes, "the retried initialize on a second connection").(*jsonrpc.Request)
@@ -395,65 +651,144 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 	})
 }
 
+// The rule that a connection is initialized exactly once is the connection's
+// own, not a consequence of the order the reader happened to see: a client's
+// initialize reaching a lane that already holds a handshaken upstream is
+// refused there, without the second initialize ever being written.
+//
+// The reader refuses the disorder that produces this — H1a — so reaching it
+// takes a lane driven directly. That is the point: were the guard only on the
+// reader, a lane whose connection was opened by anything else would hand gopls
+// the duplicate and lose the session.
+func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		r := newTestRouter(t, testHome)
+		handshakeReady(r)
+		// Cached means handshaken, which is the state a successful dial leaves.
+		held := newFakeConn()
+		l := connectedLane(r, r.home, held)
+
+		id := mustID(t, "client-initialize")
+		l.send(&jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)})
+
+		wantClientError(t, r, id, "a second initialize was left unanswered")
+		select {
+		case msg := <-held.writes:
+			t.Fatalf("upstream got a second initialize %#v, want nothing written to it", msg)
+		default:
+		}
+	})
+}
+
 // yieldingConn is an upstream that is already gone, and whose write is certain
 // to lose the race it is in: it lets every other goroutine in the bubble block
 // first, so a reader started before the write — the regression
 // TestSendRetriesInitialInitializeWithoutPrivateHandshake pins — always claims
 // the id. Left to a real race, that reader wins about once in ten thousand runs.
-type yieldingConn struct{ fakeConn }
-
-func (c *yieldingConn) Write(context.Context, jsonrpc.Message) error {
-	synctest.Wait()
-	return io.EOF
+func yieldingConn(reads chan jsonrpc.Message) *fakeConn {
+	return &fakeConn{reads: reads, onWrite: func(context.Context, jsonrpc.Message) error {
+		synctest.Wait()
+		return io.EOF
+	}}
 }
 
-// The handshake runs on the goroutine that reads the client, so an upstream
-// that accepts the connection and never answers must not be waited on forever:
-// it would stall every later client message too, and neither side times out.
-// recordAlive keeps exactly such a server alive, so ensure hands one back.
-func TestHandshakeGivesUpOnAnUpstreamThatNeverAnswers(t *testing.T) {
+// A wedged upstream must not be waited on forever, whichever half of opening it
+// hangs. Both run on the lane's goroutine, so either would stall every later
+// call to that worktree with neither side timing out — and §8 keeps exactly
+// such a server alive, so ensure hands its port back.
+//
+// The rows are the two halves: an upstream that accepts the connection and then
+// answers nothing is what H5 bounds; one whose SSE connect never returns a first
+// event never reaches H5 at all. The budget is one for both attempts either way,
+// which is what the elapsed time and the dial count together say.
+func TestAWedgedUpstreamFailsItsCallWithinOneBudget(t *testing.T) {
+	tests := []struct {
+		name string
+		dial func(context.Context) (mcp.Connection, error)
+	}{
+		{"an upstream that never answers", func(context.Context) (mcp.Connection, error) {
+			return newFakeConn(), nil
+		}},
+		{"a connect that never completes", func(ctx context.Context) (mcp.Connection, error) {
+			<-ctx.Done() // what Connect does while it waits for the endpoint event
+			return nil, ctx.Err()
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bubble(t, func(t *testing.T) {
+				r := newTestRouter(t, testHome)
+				handshakeReady(r)
+				dials := 0
+				r.dial = func(ctx context.Context, _ string) (mcp.Connection, error) {
+					dials++
+					return test.dial(ctx)
+				}
+
+				start := time.Now()
+				id := sendCall(t, newLane(r, testWorktree), "call-into-the-void")
+
+				wantClientError(t, r, id, "a wedged upstream blocked the lane instead of failing the call")
+				// The shipped budget, not a shortened one — under this clock it costs
+				// the same nothing — and spent exactly once. The elapsed time is what
+				// says the two attempts shared one deadline rather than getting a full
+				// one each.
+				if elapsed := time.Since(start); elapsed != sendBudget {
+					t.Errorf("gave up after %s, want the whole %s budget spent once", elapsed, sendBudget)
+				}
+				// The budget is spent, so the retry must not dial again: that costs an
+				// unbounded flock wait to reach a handshake that expires on its first
+				// write.
+				if dials != 1 {
+					t.Errorf("dial count = %d, want no retry once the deadline has passed", dials)
+				}
+			})
+		})
+	}
+}
+
+// The bound must not outlive the dial. A connection reads its SSE stream under
+// the context it was dialled with for the whole of its life, so a plain
+// deadline context here would cut a healthy upstream loose the moment the
+// budget expired — the failure H5 describes, caused by the fix for it.
+// Asserted on a connection that is still in use, which is the only place the
+// property means anything: measured on one the lane had already closed and
+// given up, it would hold just as well with the context leaked, and that is the
+// case boundedConn exists to stop.
+// The other half of the same rule is that it must not outlive the connection
+// either: a wedged upstream fails its handshake on every attempt, so its lane
+// redials on every call — and a dial context surviving the connection it was
+// made for would leave one live child on the session context per call, for as
+// long as the client stays. Both halves are asserted here in order, on the one
+// connection, because that is the order they happen in.
+func TestADialContextLivesExactlyAsLongAsItsConnection(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
-		wedged := &fakeConn{reads: make(chan jsonrpc.Message), writes: make(chan jsonrpc.Message, 1)}
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		r.initialize = &jsonrpc.Request{Method: "initialize", Params: json.RawMessage(`{}`)}
-		dials := 0
-		r.dial = func(string) (mcp.Connection, error) {
-			dials++
-			return wedged, nil
+		r := newTestRouter(t, testHome)
+		handshakeReady(r)
+		var dialled context.Context
+		r.dial = func(ctx context.Context, _ string) (mcp.Connection, error) {
+			dialled = ctx
+			return newHandshakingConn(), nil
+		}
+		l := newLane(r, testWorktree)
+		sendCall(t, l, "call-that-outlives-its-budget")
+
+		// Long past the deadline the dial was given, and the connection is still
+		// the lane's: a context carrying that deadline would be done by now.
+		time.Sleep(2 * sendBudget)
+		if err := dialled.Err(); err != nil {
+			t.Errorf("the dialled context is %v after the budget expired, want a context still good for the stream", err)
 		}
 
-		id := mustID(t, "call-into-the-void")
-		start := time.Now()
-		r.send(worktree, &jsonrpc.Request{ID: id, Method: "tools/call"}, id, false)
-
-		wantClientError(t, r, id, "a wedged upstream blocked the handshake instead of failing the call")
-		// The shipped budget, not a shortened one — under this clock it costs the
-		// same nothing — and spent exactly once. The elapsed time is what says the
-		// two attempts shared one deadline rather than getting a full one each.
-		if elapsed := time.Since(start); elapsed != r.handshakeTimeout {
-			t.Errorf("gave up after %s, want the whole %s budget spent once", elapsed, r.handshakeTimeout)
+		// The close every site that gives a connection up performs, and that
+		// lane.run performs on its way out.
+		if err := l.conn.Close(); err != nil {
+			t.Fatal(err)
 		}
-		// The budget is spent, so the retry must not dial again: that costs an
-		// unbounded flock wait to reach a handshake that expires on its first write.
-		if dials != 1 {
-			t.Errorf("dial count = %d, want no retry once the deadline has passed", dials)
+		if dialled.Err() == nil {
+			t.Error("the dialled context is still live after its connection was closed, want it released with the connection")
 		}
 	})
-}
-
-// dyingConn loses the race a real upstream loses when it dies mid-write: its
-// reader sees the death and fails the in-flight call before Write reports it.
-type dyingConn struct {
-	fakeConn
-	r        *router
-	worktree string
-}
-
-func (c *dyingConn) Write(context.Context, jsonrpc.Message) error {
-	close(c.reads)
-	c.r.readFromUpstream(c, c.worktree)
-	return io.EOF
 }
 
 // The reader has already answered this id, so the retry must not run: the
@@ -461,17 +796,20 @@ func (c *dyingConn) Write(context.Context, jsonrpc.Message) error {
 // fine here while the client held the error.
 func TestSendLeavesACallItsDyingUpstreamAlreadyFailed(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		conn := &dyingConn{fakeConn: fakeConn{reads: make(chan jsonrpc.Message)}, r: r, worktree: worktree}
-		r.conns[worktree] = conn
-		r.dial = func(string) (mcp.Connection, error) {
-			t.Error("send retried a call its upstream had already failed")
-			return nil, io.EOF
+		r := newTestRouter(t, testHome)
+		// The upstream loses the race a real one loses when it dies mid-write:
+		// its reader sees the death and fails the in-flight call before the
+		// write reports it.
+		conn := &fakeConn{reads: make(chan jsonrpc.Message)}
+		conn.onWrite = func(context.Context, jsonrpc.Message) error {
+			close(conn.reads)
+			r.readFromUpstream(conn, testWorktree)
+			return io.EOF
 		}
+		l := connectedLane(r, testWorktree, conn)
+		forbidDial(t, r, "send retried a call its upstream had already failed")
 
-		id := mustID(t, "raced-call")
-		r.send(worktree, &jsonrpc.Request{ID: id, Method: "tools/call"}, id, false)
+		id := sendCall(t, l, "raced-call")
 
 		wantClientError(t, r, id, "the dying upstream's reader left the call unanswered")
 		wantClientQuiet(t, r, "one call was answered twice")
@@ -482,18 +820,16 @@ func TestSendLeavesACallItsDyingUpstreamAlreadyFailed(t *testing.T) {
 // will ever produce their ids, so a client without a timeout would hang.
 func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
-		reads := make(chan jsonrpc.Message)
-		conn := &fakeConn{reads: reads, writes: make(chan jsonrpc.Message, 1)}
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		r.conns[worktree] = conn // already connected: no dial or handshake to satisfy
+		conn := newFakeConn()
+		r := newTestRouter(t, testHome)
+		// Already connected: no dial or handshake to satisfy.
+		l := connectedLane(r, testWorktree, conn)
 
-		id := mustID(t, "call-in-flight")
-		r.send(worktree, &jsonrpc.Request{ID: id, Method: "tools/call"}, id, false)
+		id := sendCall(t, l, "call-in-flight")
 		mustRecv(t, conn.writes, "the call to reach the upstream, so an answer is owed")
 
-		close(reads) // the gopls dies before answering
-		r.readFromUpstream(conn, worktree)
+		close(conn.reads) // the gopls dies before answering
+		r.readFromUpstream(conn, testWorktree)
 
 		wantClientError(t, r, id, "upstream died and the in-flight call was left unanswered")
 	})
@@ -505,15 +841,14 @@ func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 // is enough — so its answer arrives for a call the client has already closed.
 func TestUpstreamAnswerToAnAlreadyFailedCallIsDropped(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
 		id := mustID(t, "already-failed")
 		reads := make(chan jsonrpc.Message, 1)
 		// Nothing owes this id: send() claimed it and answered the client already.
 		reads <- &jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}
 		close(reads)
 
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		r.readFromUpstream(&fakeConn{reads: reads}, worktree)
+		r := newTestRouter(t, testHome)
+		r.readFromUpstream(&fakeConn{reads: reads}, testWorktree)
 
 		wantClientQuiet(t, r, "a call the bridge had already answered was answered a second time")
 	})
@@ -523,19 +858,17 @@ func TestUpstreamAnswerToAnAlreadyFailedCallIsDropped(t *testing.T) {
 // replaced one's reader must not fail the calls the live one already accepted.
 func TestStaleUpstreamDeathSparesTheReconnectedCall(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
-		live := &fakeConn{reads: make(chan jsonrpc.Message), writes: make(chan jsonrpc.Message, 1)}
+		live := newFakeConn()
 		defer close(live.reads)
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		r.conns[worktree] = live
+		r := newTestRouter(t, testHome)
+		l := connectedLane(r, testWorktree, live)
 
-		id := mustID(t, "call-after-reconnect")
-		r.send(worktree, &jsonrpc.Request{ID: id, Method: "tools/call"}, id, false)
+		sendCall(t, l, "call-after-reconnect")
 		mustRecv(t, live.writes, "the live connection to take the call it now owes")
 
 		replaced := make(chan jsonrpc.Message)
 		close(replaced)
-		r.readFromUpstream(&fakeConn{reads: replaced}, worktree)
+		r.readFromUpstream(&fakeConn{reads: replaced}, testWorktree)
 
 		wantClientQuiet(t, r, "the replaced connection failed a call owned by the live one")
 	})
@@ -551,38 +884,14 @@ func TestUnroutableUpstreamRequestIsRefusedNotForwarded(t *testing.T) {
 		reads <- &jsonrpc.Request{ID: id, Method: "sampling/createMessage"}
 		conn := &fakeConn{reads: reads, writes: make(chan jsonrpc.Message, 1)}
 
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		go r.readFromUpstream(conn, "/tmp/wt")
+		r := newTestRouter(t, testHome)
+		go r.readFromUpstream(conn, testWorktree)
 
 		resp := wantResponse(t, mustRecv(t, conn.writes, "the refusal sent back to the upstream"), id)
-		var wire *jsonrpc.Error
-		if !errors.As(resp.Error, &wire) || wire.Code != jsonrpc.CodeMethodNotFound {
-			t.Errorf("refusal was %#v, want a method-not-found error", resp.Error)
-		}
+		_ = wantWireError(t, resp, jsonrpc.CodeMethodNotFound)
 		close(reads)
 		wantClientQuiet(t, r, "the client was asked something it cannot be given an answer for")
 	})
-}
-
-// instantConn answers every write before the write returns, the way a gopls on
-// the same machine can, and does not return until the router has finished
-// accounting for that answer.
-//
-// It holds a *testing.T, which inBackground forbids its own callers, because
-// its Write only ever runs on the goroutine that called send — the one
-// goroutine where failing the test is allowed.
-type instantConn struct {
-	fakeConn
-	t  *testing.T
-	r  *router
-	id jsonrpc.ID
-}
-
-func (c *instantConn) Write(context.Context, jsonrpc.Message) error {
-	c.reads <- &jsonrpc.Response{ID: c.id, Result: json.RawMessage(`{}`)}
-	// The reader has now forgotten the call, before send() records it.
-	mustRecv(c.t, c.r.out, "the answer the reader forwarded during this write")
-	return nil
 }
 
 // A call answered that quickly must leave nothing owed. Recorded after the
@@ -590,11 +899,21 @@ func (c *instantConn) Write(context.Context, jsonrpc.Message) error {
 // into a second, contradictory reply to an id the client has already closed.
 func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
 		id := mustID(t, "answered-during-write")
-		r := newRouter(t.Context(), nil, "/tmp/home")
-		conn := &instantConn{fakeConn: fakeConn{reads: make(chan jsonrpc.Message, 1)}, t: t, r: r, id: id}
-		r.conns[worktree] = conn
+		r := newTestRouter(t, testHome)
+		// The upstream answers before its write returns, the way a gopls on the
+		// same machine can, and does not return until the router has finished
+		// accounting for that answer. Touching t here is allowed only because
+		// this hook runs on the goroutine that called send — the one goroutine
+		// where failing the test is safe; see inBackground.
+		conn := &fakeConn{reads: make(chan jsonrpc.Message, 1)}
+		conn.onWrite = func(context.Context, jsonrpc.Message) error {
+			conn.reads <- &jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}
+			// The reader has now forgotten the call, before send() records it.
+			mustRecv(t, r.out, "the answer the reader forwarded during this write")
+			return nil
+		}
+		l := connectedLane(r, testWorktree, conn)
 
 		// Not inBackground: this goroutine has no verdict to report, only an end,
 		// and routing it through an error channel would leave a branch that cannot
@@ -602,10 +921,12 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			r.readFromUpstream(conn, worktree)
+			r.readFromUpstream(conn, testWorktree)
 		}()
 
-		r.send(worktree, &jsonrpc.Request{ID: id, Method: "tools/call"}, id, false)
+		// Not sendCall: instantConn was built around this exact id, and minting a
+		// second one from the same string would only hide that.
+		l.send(&jsonrpc.Request{ID: id, Method: "tools/call"})
 		close(conn.reads) // the upstream dies once the call is long since answered
 		mustRecv(t, done, "the upstream reader to finish")
 
@@ -620,13 +941,12 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 // files for the rest of the session.
 func TestRootsAskedDuringHandshakeIsAnsweredLocally(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		const worktree = "/tmp/wt"
 		ctx := t.Context()
 		upstream, gopls := upstreamPair(t)
 
-		r := newRouter(ctx, nil, "/tmp/home")
-		r.initialize = &jsonrpc.Request{Method: "initialize", Params: json.RawMessage(`{}`)}
-		r.dial = func(string) (mcp.Connection, error) { return upstream, nil }
+		r := newTestRouter(t, testHome)
+		handshakeReady(r)
+		fixedDial(r, upstream)
 
 		rootsID := mustID(t, "roots-mid-handshake")
 		done := inBackground(func() error {
@@ -657,7 +977,7 @@ func TestRootsAskedDuringHandshakeIsAnsweredLocally(t *testing.T) {
 			return nil
 		})
 
-		if _, err := r.upstream(time.Now().Add(time.Minute), worktree, false); err != nil {
+		if _, err := newLane(r, testWorktree).upstream(t.Context(), false); err != nil {
 			t.Fatalf("handshake: %v", err)
 		}
 		if err := mustRecv(t, done, "the fake gopls to finish the handshake"); err != nil {
@@ -678,7 +998,7 @@ func TestUpstreamRootsAnsweredWithItsOwnWorktree(t *testing.T) {
 		upstream, gopls := upstreamPair(t)
 
 		id := mustID(t, "roots-1")
-		r := newRouter(ctx, nil, "/tmp/home")
+		r := newTestRouter(t, testHome)
 		go r.readFromUpstream(upstream, worktree)
 
 		if err := gopls.Write(ctx, &jsonrpc.Request{ID: id, Method: "roots/list"}); err != nil {
@@ -706,174 +1026,322 @@ func TestUpstreamRootsAnsweredWithItsOwnWorktree(t *testing.T) {
 // answers by misrouting to home. It must reduce exactly once, though: a path
 // under a directory that does not exist yet must not climb to the grandparent
 // and resolve against a tree the caller never named.
-func TestWorktreePathReducesToADirectoryExactlyOnce(t *testing.T) {
-	t.Parallel()
-	root, _ := newLinkedWorktree(t)
-	file := filepath.Join(root, "main.go")
-	if err := os.WriteFile(file, []byte("package main\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := worktreePath(file)
-	if err != nil {
-		t.Fatalf("worktreePath(%q): %v", file, err)
-	}
-	if got != root {
-		t.Errorf("worktreePath(%q) = %q, want %q", file, got, root)
-	}
-
-	absent := filepath.Join(root, "absent", "x.go")
-	if got, err := worktreePath(absent); err == nil {
-		t.Errorf("worktreePath(%q) = %q, want no answer for a path under a missing directory", absent, got)
-	}
-}
-
-func TestWorktreePathSeparatesLinkedWorktreesAndSharesNestedDirectories(t *testing.T) {
+//
+// One repository pair for every row: newLinkedWorktree forks git three times,
+// and none of these rows can see another's paths.
+func TestWorktreePathResolvesEachPathToItsOwnWorktree(t *testing.T) {
 	t.Parallel()
 	root, linked := newLinkedWorktree(t)
 
-	rootNested := filepath.Join(root, "nested")
-	linkedNested := filepath.Join(linked, "nested")
+	file := filepath.Join(root, "main.go")
+	target := filepath.Join(linked, "target.go")
+	for path, content := range map[string]string{file: "package main\n", target: "package linked\n"} {
+		mustWriteFile(t, path, content)
+	}
+	rootNested, linkedNested := filepath.Join(root, "nested"), filepath.Join(linked, "nested")
 	for _, dir := range []string{rootNested, linkedNested} {
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	rootPath, err := worktreePath(rootNested)
-	if err != nil {
-		t.Fatal(err)
-	}
-	linkedPath, err := worktreePath(linkedNested)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rootPath != root {
-		t.Fatalf("worktreePath(%q) = %q, want %q", rootNested, rootPath, root)
-	}
-	if linkedPath != linked {
-		t.Fatalf("worktreePath(%q) = %q, want %q", linkedNested, linkedPath, linked)
-	}
-	if rootPath == linkedPath {
-		t.Fatalf("linked worktrees share identity %q", rootPath)
-	}
-}
-
-func TestToolCallRoutesToTheWorktreeOwningItsPath(t *testing.T) {
-	t.Parallel()
-	_, linked := newLinkedWorktree(t)
-	file := filepath.Join(linked, "main.go")
-	if err := os.WriteFile(file, []byte("package main\n"), 0o600); err != nil {
+	// A link pointing into the other worktree: the reduction to a directory is
+	// lexical, so without resolving first the link's own parent is what git
+	// would be asked about, and here the two disagree.
+	link := filepath.Join(root, "link.go")
+	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
 
 	tests := []struct {
-		name      string
-		arguments string
-		want      string
+		name string
+		path string
+		want string // "" wants an error instead
 	}{
-		// The routing that matters: a file in the linked worktree must not be
-		// answered by the gopls of the checkout the bridge was started in.
-		{"file argument", `{"file":` + strconv.Quote(file) + `}`, linked},
-		{"files argument", `{"files":[` + strconv.Quote(file) + `]}`, linked},
-		{"dir argument", `{"dir":` + strconv.Quote(linked) + `}`, linked},
-		// No path, or an unresolvable one: the caller keeps its current server.
-		{"no path argument", `{"query":"Foo"}`, ""},
-		{"unresolvable path", `{"file":"/nonexistent/x.go"}`, ""},
-		// A relative path would resolve against the bridge's own cwd and then
-		// stick in the memo, misrouting every later call naming it.
-		{"relative path", `{"file":"internal/foo.go"}`, ""},
+		{"a file in the root", file, root},
+		{"a directory in the root", rootNested, root},
+		{"the same directory in the linked worktree", linkedNested, linked},
+		{"a symlink to a file in the linked worktree", link, linked},
+		// R2: a file that does not exist yet still resolves through its parent,
+		// and is not made unresolvable by the symlink pass — EvalSymlinks
+		// refuses a path whose every component does not exist.
+		{"a file not created yet", filepath.Join(root, "not-created-yet.go"), root},
+		{"a file under a missing directory", filepath.Join(root, "absent", "x.go"), ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			r := newRouter(t.Context(), nil, "")
-			got := r.toolCallWorktree(json.RawMessage(`{"arguments":` + test.arguments + `}`))
+			got, err := worktreePath(t.Context(), test.path)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("worktreePath(%q) = %q, want no answer", test.path, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("worktreePath(%q): %v", test.path, err)
+			}
 			if got != test.want {
-				t.Fatalf("toolCallWorktree(%s) = %q, want %q", test.arguments, got, test.want)
+				t.Fatalf("worktreePath(%q) = %q, want %q", test.path, got, test.want)
 			}
 		})
 	}
 }
 
-// Every path in a directory has the same worktree, and resolving one costs a
-// ~13ms fork. A memo keyed by the path would pay that again for every file the
-// session names in a directory it has already resolved.
-func TestWorktreeOfMemoizesByDirectory(t *testing.T) {
+func TestToolCallRoutesToTheWorktreeOwningItsPath(t *testing.T) {
 	t.Parallel()
-	_, linked := newLinkedWorktree(t)
-	r := newRouter(t.Context(), nil, "")
+	root, linked := newLinkedWorktree(t)
+	file := filepath.Join(linked, "main.go")
+	mustWriteFile(t, file, "package main\n")
+	rootFile := filepath.Join(root, "main.go")
+	mustWriteFile(t, rootFile, "package main\n")
 
-	// Neither file exists, which is also the answer to "what does it key on for
-	// a file gopls is about to create": the directory holding it. The third is
-	// that same directory as a dir argument, spelled the way a client may well
-	// send one — a key of its own would fork git again for an answer already in
-	// the memo.
-	for _, path := range []string{
-		filepath.Join(linked, "a.go"),
-		filepath.Join(linked, "b.go"),
-		linked + string(filepath.Separator),
-	} {
-		if got := r.worktreeOf(path); got != linked {
-			t.Fatalf("worktreeOf(%q) = %q, want %q", path, got, linked)
+	tests := []struct {
+		name      string
+		arguments string
+		want      []string
+	}{
+		// The routing that matters: a file in the linked worktree must not be
+		// answered by the gopls of the checkout the bridge was started in.
+		{name: "file argument", arguments: `{"file":` + strconv.Quote(file) + `}`, want: []string{linked}},
+		{name: "files argument", arguments: `{"files":[` + strconv.Quote(file) + `]}`, want: []string{linked}},
+		{name: "dir argument", arguments: `{"dir":` + strconv.Quote(linked) + `}`, want: []string{linked}},
+		// One worktree named twice is still one destination: the call is
+		// answerable, and reporting a repeat would refuse it for no reason.
+		{name: "one worktree named twice", arguments: `{"files":[` + strconv.Quote(file) + `,` + strconv.Quote(filepath.Join(linked, "other.go")) + `]}`, want: []string{linked}},
+		// Both are reported so that route can refuse the call. Answering from
+		// the first would say nothing at all about the file in the second, and
+		// the client cannot see the omission.
+		{name: "paths in two worktrees", arguments: `{"files":[` + strconv.Quote(file) + `,` + strconv.Quote(rootFile) + `]}`, want: []string{linked, root}},
+		// No path, or an unresolvable one: the caller keeps its current server.
+		{name: "no path argument", arguments: `{"query":"Foo"}`},
+		{name: "unresolvable path", arguments: `{"file":"/nonexistent/x.go"}`},
+		// A relative path would resolve against the bridge's own cwd and then
+		// stick in the memo, misrouting every later call naming it.
+		{name: "relative path", arguments: `{"file":"internal/foo.go"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newTestRouter(t, testHome)
+			got := r.toolCallWorktrees(json.RawMessage(`{"arguments":` + test.arguments + `}`))
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("toolCallWorktrees(%s) = %q, want %q", test.arguments, got, test.want)
+			}
+		})
+	}
+}
+
+// A tools/call spanning two worktrees is refused rather than answered from one
+// of them: no single gopls knows both trees, and a result covering only the
+// files it happened to route by is an omission the client cannot see.
+func TestToolCallSpanningTwoWorktreesIsRefused(t *testing.T) {
+	t.Parallel()
+	root, linked := newLinkedWorktree(t)
+	for _, dir := range []string{root, linked} {
+		mustWriteFile(t, filepath.Join(dir, "main.go"), "package main\n")
+	}
+
+	r := newTestRouter(t, testHome)
+	handshakeReady(r)
+	id := mustID(t, "spanning-call")
+	arguments := `{"files":[` + strconv.Quote(filepath.Join(linked, "main.go")) + `,` + strconv.Quote(filepath.Join(root, "main.go")) + `]}`
+	r.route(&jsonrpc.Request{ID: id, Method: "tools/call", Params: json.RawMessage(`{"arguments":` + arguments + `}`)})
+
+	// Refused on the reader's own goroutine, so the response is already queued
+	// and no lane was ever asked for.
+	select {
+	case msg := <-r.out:
+		wire := wantWireError(t, wantResponse(t, msg, id), jsonrpc.CodeInvalidParams)
+		if !strings.Contains(wire.Message, root) || !strings.Contains(wire.Message, linked) {
+			t.Fatalf("error %q names neither worktree, want both", wire.Message)
 		}
+	default:
+		t.Fatal("spanning call was routed instead of refused")
 	}
-	if len(r.worktrees) != 1 {
-		t.Fatalf("memo holds %d entries for one directory: %v", len(r.worktrees), r.worktrees)
+	if len(r.lanes) != 0 {
+		t.Fatalf("refused call opened %d lane(s), want none", len(r.lanes))
 	}
 }
 
-// worktreeOf must hand worktreePath the path itself, not the directory it keyed
-// the memo by. Reduced a second time, a path under a directory that does not
-// exist yet climbs to the grandparent — so a file in an uncreated subdirectory
-// would resolve against the enclosing repository, which is evidence the call
-// never offered and R2 says is not evidence at all.
-func TestWorktreeOfDoesNotResolveThroughAMissingDirectory(t *testing.T) {
+// What worktreeOf answers, and what it costs to answer it: each row queries a
+// list of paths in order and then states how many directory entries the memo
+// should hold, which is exactly the number of git forks the session paid for.
+//
+// One repository pair for every row, because none of them writes: newLinkedWorktree
+// forks git three times, and a pair per row would pay that over again to
+// re-create the same two trees. Each row still gets a router of its own — the
+// memo counts are the assertion, so they must not carry across.
+func TestWorktreeOfResolvesAndMemoizes(t *testing.T) {
 	t.Parallel()
-	root, _ := newLinkedWorktree(t)
-	r := newRouter(t.Context(), nil, "")
+	root, linked := newLinkedWorktree(t)
 
-	absent := filepath.Join(root, "absent", "x.go")
-	if got := r.worktreeOf(absent); got != "" {
-		t.Fatalf("worktreeOf(%q) = %q, want no evidence", absent, got)
+	tests := []struct {
+		name string
+		// paths are queried in order; repeats are deliberate, and want holds the
+		// answer expected for each in the same order.
+		paths    []string
+		want     []string
+		wantMemo int // directory-memo entries afterwards
+	}{
+		{
+			// Every path in a directory has the same worktree, and resolving one
+			// costs a ~13ms fork. A memo keyed by the path would pay that again
+			// for every file the session names in a directory already resolved.
+			// Neither file exists, which is also the answer to "what does it key
+			// on for a file gopls is about to create": the directory holding it.
+			// The third is that same directory as a dir argument, spelled the way
+			// a client may well send one — a key of its own would fork git again
+			// for an answer already in the memo.
+			name: "one directory, three spellings, one fork",
+			paths: []string{
+				filepath.Join(linked, "a.go"),
+				filepath.Join(linked, "b.go"),
+				linked + string(filepath.Separator),
+			},
+			want:     []string{linked, linked, linked},
+			wantMemo: 1,
+		},
+		{
+			// The verbatim-path memo in front of the directory one answers without
+			// walking the argument at all, so it is the one that could hand a file
+			// the worktree of a file it was merely asked about near. Two trees of
+			// one repository is where that would show: they share a git directory
+			// and differ only in the path. Twice each and interleaved, so that the
+			// second pass — served from the memo — has to answer what the first did.
+			name: "two worktrees stay apart across a memo hit",
+			paths: []string{
+				filepath.Join(root, "a.go"), filepath.Join(linked, "a.go"),
+				filepath.Join(root, "a.go"), filepath.Join(linked, "a.go"),
+			},
+			want: []string{root, linked, root, linked},
+			// One per worktree, and not one per query: the repeats were memo hits.
+			wantMemo: 2,
+		},
+		{
+			// A path is reduced to a directory exactly once, so a file in a
+			// subdirectory that does not exist yet resolves to nothing rather than
+			// climbing to the grandparent — which would answer with the enclosing
+			// repository, evidence the call never offered and R2 says is not
+			// evidence at all. Nothing is memoized, because nothing resolved.
+			name:     "a missing directory is no evidence",
+			paths:    []string{filepath.Join(root, "absent", "x.go")},
+			want:     []string{""},
+			wantMemo: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newTestRouter(t, testHome)
+			for i, path := range test.paths {
+				if got := r.worktreeOf(path); got != test.want[i] {
+					t.Fatalf("worktreeOf(%q) = %q, want %q", path, got, test.want[i])
+				}
+			}
+			if len(r.worktrees) != test.wantMemo {
+				t.Fatalf("memo holds %d directory entries, want %d: %v", len(r.worktrees), test.wantMemo, r.worktrees)
+			}
+		})
 	}
 }
 
+// Both halves go through target(), because the sticky worktree is written
+// there and nowhere else: seeded by hand, this test would pass with that write
+// deleted, and in production every path-less follow-up — go_workspace,
+// go_search — would go home instead of following the call before it.
 func TestTargetFallsBackToTheLastPathBearingCall(t *testing.T) {
 	t.Parallel()
-	r := newRouter(t.Context(), nil, "/repo/home")
-	r.sticky = "/repo/linked"
+	_, linked := newLinkedWorktree(t)
+	r := newTestRouter(t, testHome)
+
+	bearing := json.RawMessage(`{"arguments":{"file":"` + filepath.Join(linked, "x.go") + `"}}`)
+	if got, _ := r.target(&jsonrpc.Request{Method: "tools/call", Params: bearing}); got != linked {
+		t.Fatalf("path-bearing tools/call went to %q, want %q", got, linked)
+	}
 
 	params := json.RawMessage(`{"arguments":{"query":"Foo"}}`)
-	if got := r.target(&jsonrpc.Request{Method: "tools/call", Params: params}); got != "/repo/linked" {
-		t.Fatalf("path-less tools/call went to %q, want the sticky worktree", got)
+	if got, _ := r.target(&jsonrpc.Request{Method: "tools/call", Params: params}); got != linked {
+		t.Fatalf("path-less tools/call went to %q, want the worktree the call before it named", got)
 	}
-	if got := r.target(&jsonrpc.Request{Method: "tools/list"}); got != "/repo/home" {
+	if got, _ := r.target(&jsonrpc.Request{Method: "tools/list"}); got != r.home {
 		t.Fatalf("non-call request went to %q, want home", got)
 	}
+}
+
+// A cancellation can arrive while its call is still queued at a lane that has
+// not dialled yet — the cold-start window the lanes exist to keep off the
+// reader is both the slowest and the likeliest moment for a client to give up.
+// The destination is therefore bound where both messages pass, in the client's
+// own order, and not where the lane finally writes the call: bound there, this
+// cancellation would find nothing owed and go home, naming an id home never
+// issued while the right gopls kept working.
+func TestCancellationFindsACallItsLaneHasNotSentYet(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		const cold = "/tmp/cold"
+		r := newTestRouter(t, testHome)
+		r.sticky = cold  // routing by path would have to resolve one through git
+		parkedDial(t, r) // where a cold worktree spends its time
+		t.Cleanup(r.closeLanes)
+
+		// Routed and picked up, but nothing is written yet, so the lane has no
+		// connection to name and has not owed this id.
+		r.route(&jsonrpc.Request{
+			ID:     mustID(t, "slow-call"),
+			Method: "tools/call",
+			Params: json.RawMessage(`{"arguments":{"query":"Foo"}}`),
+		})
+		synctest.Wait()
+
+		got, _ := r.target(&jsonrpc.Request{
+			Method: "notifications/cancelled",
+			Params: json.RawMessage(`{"requestId":"slow-call"}`),
+		})
+		if got != cold {
+			t.Fatalf("cancellation of a queued call went to %q, want %q", got, cold)
+		}
+	})
+}
+
+// A lane with no upstream drops a cancellation rather than dialling one:
+// bringing a gopls up costs an flock wait, a spawn and a whole handshake, to
+// tell a brand new process about a call it never received. Nothing is stranded
+// — the call died with the connection, and that connection's reader failed it.
+func TestCancellationForADisconnectedUpstreamIsDroppedNotDialled(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		r := newTestRouter(t, testHome)
+		forbidDial(t, r, "a cancellation dialled the worktree that owed its call")
+
+		cancel := &jsonrpc.Request{
+			Method: "notifications/cancelled",
+			Params: json.RawMessage(`{"requestId":"call-3"}`),
+		}
+		// A lane that never dialled, and one whose connection dies under this
+		// very write — the retry starts from the same "no upstream to tell", so
+		// the refusal has to be asked on every attempt rather than on the way in.
+		newLane(r, "/tmp/gone").send(cancel)
+		connectedLane(r, "/tmp/dying", failingConn()).send(cancel)
+
+		wantClientQuiet(t, r, "a cancellation produced a message for the client")
+	})
 }
 
 // A cancellation follows the id, not the default route: sent home it names an
 // id home never issued, so the gopls actually running the call never hears it.
 func TestCancellationFollowsTheRequestToItsUpstream(t *testing.T) {
 	t.Parallel()
-	r := newRouter(t.Context(), nil, "/repo/home")
+	r := newTestRouter(t, testHome)
 
-	r.conns["/repo/linked"] = &fakeConn{}
-	r.owe(mustID(t, "call-1"), owed{conn: r.conns["/repo/linked"], worktree: "/repo/linked"})
+	r.track(mustID(t, "call-1"), nil, "/repo/linked")
 	// A numeric id reaches MakeID as the float64 json.Unmarshal produces, from
 	// the notification here and from DecodeMessage when the call was keyed: the
 	// two must land on the same ID or every real client's cancellation misroutes.
-	numeric, err := jsonrpc.MakeID(float64(7))
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.conns["/repo/numbered"] = &fakeConn{}
-	r.owe(numeric, owed{conn: r.conns["/repo/numbered"], worktree: "/repo/numbered"})
-	// Owed, but by a connection send() has already dropped. Dialling a
-	// replacement would spawn a gopls to hear a cancellation for a call it never
-	// received, so this goes home like an unowed id.
-	r.owe(mustID(t, "call-3"), owed{conn: &fakeConn{}, worktree: "/repo/gone"})
+	r.track(mustID(t, float64(7)), nil, "/repo/numbered")
+	// A worktree with no lane at all: routing follows the id regardless, since
+	// whether that worktree has an upstream left to tell is the lane's
+	// question, not this one — see
+	// TestCancellationForADisconnectedUpstreamIsDroppedNotDialled. Which is
+	// also why no case here registers a lane or a connection.
+	r.track(mustID(t, "call-3"), nil, "/repo/gone")
 
 	tests := []struct {
 		name      string
@@ -882,16 +1350,15 @@ func TestCancellationFollowsTheRequestToItsUpstream(t *testing.T) {
 	}{
 		{"owed id", `"call-1"`, "/repo/linked"},
 		{"owed numeric id", `7`, "/repo/numbered"},
-		// Nobody connected owes these: an id already answered, one no client
-		// would send, and one whose upstream is gone.
-		{"unowed id", `"call-2"`, "/repo/home"},
-		{"unusable id", `{"bad":true}`, "/repo/home"},
-		{"disconnected upstream", `"call-3"`, "/repo/home"},
+		{"disconnected upstream", `"call-3"`, "/repo/gone"},
+		// Nobody owes these: an id already answered, and one no client would send.
+		{"unowed id", `"call-2"`, r.home},
+		{"unusable id", `{"bad":true}`, r.home},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			got := r.target(&jsonrpc.Request{
+			got, _ := r.target(&jsonrpc.Request{
 				Method: "notifications/cancelled",
 				Params: json.RawMessage(`{"requestId":` + test.requestID + `}`),
 			})
@@ -900,6 +1367,45 @@ func TestCancellationFollowsTheRequestToItsUpstream(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A retry places the call on a fresh connection, and its cancellation route has
+// to come back with it. claim() ends the failed attempt by dropping the id's
+// record whole, so a track() that restored only the ownership would leave the
+// client's cancellation routed home — naming an id home never issued, while the
+// gopls actually running the call never hears it.
+func TestCancellationFollowsACallOntoItsRetryConnection(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		fresh := newHandshakingConn()
+		r := newTestRouter(t, testHome)
+		handshakeReady(r)
+		// Never routed, only sent: the route under test is the one track() puts
+		// back, not the one route() recorded on the way in.
+		l := connectedLane(r, testWorktree, failingConn())
+		fixedDial(r, fresh)
+
+		id := sendCall(t, l, "call-retried")
+		// The retry is only as good as the connection it landed on, so the call
+		// is read off fresh before the route is asked about.
+		if _, err := recvRequest(fresh.writes, "notifications/initialized"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recvRequest(fresh.writes, "tools/call"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Encoded from the type the router decodes into, rather than spelled by
+		// hand: a test that splices the id into JSON itself also assumes it is a
+		// string, and would keep passing if the field were renamed under it.
+		params, err := json.Marshal(mcp.CancelledParams{RequestID: id.Raw()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := r.target(&jsonrpc.Request{Method: "notifications/cancelled", Params: params})
+		if got != testWorktree {
+			t.Errorf("cancellation of a retried call went to %q, want %q", got, testWorktree)
+		}
+	})
 }
 
 // newLinkedWorktree returns a fresh repository and a linked worktree of it.
