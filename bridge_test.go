@@ -1440,13 +1440,13 @@ func TestServeSwallowsTheEndOfTheClientAndReportsAnythingElse(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
 
 			// Serve returning at all is half of what this asserts: it waits for its
 			// reader and closes every lane, so a shutdown that ordered those wrongly
-			// would hang here rather than answer.
-			if err := serve(ctx, cancel, nil, testHome, tc.conn); !errors.Is(err, tc.want) {
+			// would hang here rather than answer. The context is the test's own and
+			// is never cancelled — serve derives what it cancels, so a session that
+			// leaned on the caller for that would hang here too.
+			if err := serve(t.Context(), nil, testHome, tc.conn); !errors.Is(err, tc.want) {
 				t.Fatalf("serve() = %v, want %v", err, tc.want)
 			}
 		})

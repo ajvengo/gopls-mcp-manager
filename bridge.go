@@ -49,14 +49,11 @@ var initID, _ = jsonrpc.MakeID("gopls-mcp-manager-init")
 // routable evidence. They follow the most recent path-bearing call, falling back
 // to the worktree the bridge was started in.
 func bridge(ctx context.Context, m *manager, home string) error {
-	ctx, cancel := context.WithCancel(ctx)
-
 	stdio, err := (&mcp.StdioTransport{}).Connect(ctx)
 	if err != nil {
-		cancel()
 		return err
 	}
-	return serve(ctx, cancel, m, home, stdio)
+	return serve(ctx, m, home, stdio)
 }
 
 // serve is the session over an already-connected client transport: everything
@@ -64,10 +61,15 @@ func bridge(ctx context.Context, m *manager, home string) error {
 // one thing here with a wrong answer — is reachable over a pair of in-memory
 // transports, since the one bridge opens is this process's real stdin.
 //
-// The cancel is passed in rather than derived, because ctx is what stdio was
-// connected under and cancelling a narrower one would leave the transport
-// running past the session.
-func serve(ctx context.Context, cancel context.CancelFunc, m *manager, home string, stdio mcp.Connection) error {
+// The session's context is derived here rather than handed in with a cancel to
+// match, so that nothing outside can end the session early or forget to end it
+// at all. Connecting a transport does not tie it to a context — StdioTransport's
+// Connect ignores the one it is given — so what stops the traffic is this
+// context, which every Read and Write below runs under, and Close, which ends
+// the connection itself. Both happen here, in that order.
+func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	r := newRouter(ctx, m, home)
 
 	// Only the reader is waited for, because r.lanes is its state and
