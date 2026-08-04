@@ -5,8 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Read is all any job here needs, and the merge gate is the reason to say so:
+# every pull request from now on runs these three, including one from a fork.
+permissions:
+  contents: read
+
+# Three jobs rather than three steps of one, because a required status check is
+# named per job: the gate lists build, test and lint separately, so a red run
+# says which one without being opened. They also run at once, and a lint failure
+# stops hiding a test failure behind it.
 jobs:
-  ci:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -18,15 +27,42 @@ jobs:
           go-version: '1.26.x'
           check-latest: true
 
-      # The tests shell out to git worktree, and the runner's default identity
-      # is enough only because newLinkedWorktree passes its own -c user.*.
-      - run: go test -race ./...
-
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.12
-
       - run: go build ./...
         env:
           GOOS: linux
           GOARCH: amd64
+
+      # Built for darwin as well, because that is where this tool is developed
+      # and run while every job here is linux. Signalling, flock and the ps this
+      # shells out to are what differ between them, and nothing else in CI
+      # compiles those for a Mac.
+      - run: go build ./...
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      # The tests shell out to git worktree, and the runner's default identity
+      # is enough only because newLinkedWorktree passes its own -c user.*.
+      - run: go test -race ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12
