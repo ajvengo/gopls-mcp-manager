@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -109,7 +110,7 @@ func mustWriteMap(t *testing.T, path string, records []record) {
 
 func mustReadMap(t *testing.T, path string) []record {
 	t.Helper()
-	records, err := readMap(path)
+	records, _, err := readMap(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,9 +129,9 @@ func wantRecords(t *testing.T, path string, whatWouldBeWrong string, want ...rec
 
 // newTestManager returns a manager over a map file of its own, which is what
 // every test below reads and writes through.
-func newTestManager(t *testing.T) manager {
-	t.Helper()
-	return manager{mapPath: filepath.Join(t.TempDir(), "gopls-ports.map"), alive: recordAlive}
+func newTestManager(tb testing.TB) manager {
+	tb.Helper()
+	return manager{mapPath: filepath.Join(tb.TempDir(), "gopls-ports.map"), alive: recordAlive, ready: awaitReady}
 }
 
 // newStubbedManager adds what the claimPort tests need on top: a gopls stub on
@@ -220,25 +221,89 @@ func listenInAllocationRange(t *testing.T, worktree string) (net.Listener, int) 
 }
 
 // listenLocal holds an ephemeral local port for as long as the test runs.
-func listenLocal(t *testing.T) (net.Listener, int) {
-	t.Helper()
+func listenLocal(tb testing.TB) (net.Listener, int) {
+	tb.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(func() { _ = listener.Close() })
+	tb.Cleanup(func() { _ = listener.Close() })
 	return listener, listener.Addr().(*net.TCPAddr).Port
+}
+
+// eventStreamHandler answers the way our endpoint does, which is the whole of
+// what a probe reads before calling a port alive.
+func eventStreamHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+	})
+}
+
+// serveEndpoint answers on a listener already bound, which is how a caller keeps
+// binding and answering as two separate events — after delays the answer without
+// delaying the bind, the way a gopls between fork and listen looks to a probe.
+//
+// Named rather than an http.Serve call, so that Close can end it: left running,
+// the server and its goroutine outlive the test and race the listener's own
+// cleanup. Not httptest, whose unstarted server insists on opening an ephemeral
+// listener of its own before this one can be substituted in — and macOS hands
+// those out of a range that overlaps the one ports are allocated from, so it
+// would occasionally take the port another test was about to claim.
+func serveEndpoint(tb testing.TB, listener net.Listener, after time.Duration) {
+	tb.Helper()
+	endpoint := &http.Server{Handler: eventStreamHandler()}
+	tb.Cleanup(func() { _ = endpoint.Close() })
+	go func() {
+		time.Sleep(after)
+		_ = endpoint.Serve(listener)
+	}()
+}
+
+// livePort returns a port answering the way our endpoint does, which is the
+// only answer endpointProbe accepts as alive. Distinct from answeringPort,
+// whose server answers but not like ours — that one reaches the inconclusive
+// verdict, and so pays the ps fork this one skips.
+func livePort(tb testing.TB) int {
+	tb.Helper()
+	server := httptest.NewServer(eventStreamHandler())
+	tb.Cleanup(server.Close)
+	return server.Listener.Addr().(*net.TCPAddr).Port
+}
+
+// silentPort returns a port held by something that takes the connection and
+// then says nothing — §8's server, the one a probe can only time out against.
+// Accepted connections are kept rather than closed, since closing is what would
+// give the prober its conclusive answer.
+func silentPort(tb testing.TB) int {
+	tb.Helper()
+	listener, port := listenLocal(tb)
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				_ = c.Close()
+			}
+		}()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, conn)
+		}
+	}()
+	return port
 }
 
 // deadPort returns a port nothing listens on, so a probe of it is refused: it
 // takes an ephemeral one and gives it straight back. Closing here rather than
 // leaving it to the cleanup is the whole point, and the cleanup's own close then
 // finds it shut — which is why that one discards its error and this one does not.
-func deadPort(t *testing.T) int {
-	t.Helper()
-	listener, port := listenLocal(t)
+func deadPort(tb testing.TB) int {
+	tb.Helper()
+	listener, port := listenLocal(tb)
 	if err := listener.Close(); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return port
 }
@@ -252,14 +317,14 @@ func refusedPort(t *testing.T) (int, func() bool) { return deadPort(t), nil }
 // it. Every caller cares: a probe that merely timed out reaches the same verdict
 // by the other route, so without the check the test would pass unchanged on any
 // run slow enough that nothing answered inside probeClient's 500ms.
-func answeringPort(t *testing.T, status int) (port int, answered func() bool) {
-	t.Helper()
+func answeringPort(tb testing.TB, status int) (port int, answered func() bool) {
+	tb.Helper()
 	var hit atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hit.Store(true)
 		http.Error(w, http.StatusText(status), status)
 	}))
-	t.Cleanup(server.Close)
+	tb.Cleanup(server.Close)
 	return server.Listener.Addr().(*net.TCPAddr).Port, hit.Load
 }
 
@@ -282,9 +347,8 @@ func wantSignalled(t *testing.T, cmd *exec.Cmd, whatWouldBeWrong string) {
 type verdict int
 
 const (
-	// spared is every verdict short of "provably dead and ours". Getting it
-	// wrong costs a full re-index of a tree nobody was asking about, or somebody
-	// else's process killed outright.
+	// spared is every verdict short of "provably dead and ours" — see
+	// wantRunning for what getting it wrong costs.
 	spared verdict = iota
 	// signalled: the record is the only handle anyone has on its gopls, so
 	// dropping one must terminate the process. Otherwise a 1-2GB index survives
@@ -307,10 +371,8 @@ func TestRecordAlive(t *testing.T) {
 	tests := []struct {
 		name string
 		// port yields the port under test and, where something answers there, a
-		// way to ask whether the probe actually reached it. A probe that merely
-		// timed out reaches the same verdict by the other route, so without that
-		// check a row would pass unchanged on any run slow enough that nothing
-		// answered inside probeClient's 500ms. nil when nothing is listening.
+		// way to ask whether the probe actually reached it — see answeringPort.
+		// nil when nothing is listening.
 		port func(t *testing.T) (port int, answered func() bool)
 		// proc holds the record's pid.
 		proc func(t *testing.T, port int) *exec.Cmd
@@ -484,12 +546,18 @@ func TestReadMapSkipsUnparseableLines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := readMap(m.mapPath)
+	got, intact, err := readMap(m.mapPath)
 	if err != nil {
 		t.Fatalf("readMap() failed on a damaged file: %v", err)
 	}
 	if !slices.Equal(got, []record{good}) {
 		t.Fatalf("readMap() = %#v, want just %#v", got, good)
+	}
+	// The damage is only ever repaired by the next write, and withRecords skips
+	// that write when the records come back unchanged — so a read that dropped
+	// lines and reported the file intact would leave them there for good.
+	if intact {
+		t.Fatal("readMap() called a file it dropped four lines from intact, so nothing would rewrite it")
 	}
 }
 
@@ -608,22 +676,7 @@ func TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting(t *testing.T) {
 		StartedAt: time.Now().Unix(),
 	}})
 
-	// Serving on the listener that is already holding the port, so that binding
-	// and answering stay the two separate events this test is about. Named rather
-	// than an http.Serve call, so that Close can end it: left running, the server
-	// and its goroutine outlive the test and race the listener's own cleanup.
-	// Not httptest, whose unstarted server insists on opening an ephemeral
-	// listener of its own before this one can be substituted in — and macOS hands
-	// those out of a range that overlaps the one ports are allocated from, so it
-	// would occasionally take the port another test was about to claim.
-	endpoint := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-	})}
-	t.Cleanup(func() { _ = endpoint.Close() })
-	go func() {
-		time.Sleep(binding)
-		_ = endpoint.Serve(listener)
-	}()
+	serveEndpoint(t, listener, binding)
 
 	start := time.Now()
 	got, err := m.ensure(worktree)
@@ -636,6 +689,75 @@ func TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < binding {
 		t.Errorf("ensure() answered after %s, before the endpoint came up at %s", elapsed, binding)
 	}
+}
+
+// A gopls this process started and that never became ready is this process's to
+// clean up, and both halves of that are load-bearing. The record is the only
+// handle anyone has on the process, so dropping it without the signal strands a
+// 1-2GB index holding its port until the machine reboots; signalling without
+// dropping it leaves a record naming a port with nothing on it, which its own
+// start grace would spare from every sweep that came looking.
+//
+// Not parallel: PATH is process-wide.
+func TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady(t *testing.T) {
+	m, worktree := newStubbedManager(t)
+	neighbour := record{Worktree: "/repo/other", Port: 62001, PID: 11}
+	mustWriteMap(t, m.mapPath, []record{neighbour})
+	m.alive = func(record) bool { return true }
+
+	// The pid is read while the readiness wait is still running, which is the
+	// last moment the map still names it: forget runs on the way out of the very
+	// call this hook is standing in for.
+	var pid int
+	m.ready = func(int) error {
+		for _, r := range mustReadMap(t, m.mapPath) {
+			if r.Worktree == worktree {
+				pid = r.PID
+			}
+		}
+		return errors.New("never bound")
+	}
+
+	if port, err := m.ensure(worktree); err == nil {
+		t.Fatalf("ensure() = %d for a gopls that never became ready, want an error", port)
+	}
+
+	if pid == 0 {
+		t.Fatal("no record named the worktree while its start was still being waited for")
+	}
+	// Polled rather than asked once: the signal is delivered synchronously but
+	// the process leaves a zombie behind until startGopls' reaper collects it,
+	// and kill(pid, 0) succeeds against a zombie.
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d still exists, want the gopls that never served signalled", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	wantRecords(t, m.mapPath, "ensure left the failed start in the map", neighbour)
+}
+
+// Another process's start that never became ready is reported and nothing else:
+// that process is the one holding the handle, and it signals and forgets its own
+// child. Reaping it from here would race a starter that is still inside its own
+// readiness wait, and dropping its record would take away the only handle it has.
+func TestEnsureLeavesAnotherProcessesFailedStartAlone(t *testing.T) {
+	t.Parallel()
+	const worktree = "/repo/theirs"
+	m := newTestManager(t)
+	// Inside its start grace, which is what makes ensure wait for a record it did
+	// not create rather than answer with its port straight away.
+	theirs := record{Worktree: worktree, Port: 62001, PID: os.Getpid(), StartedAt: time.Now().Unix()}
+	mustWriteMap(t, m.mapPath, []record{theirs})
+	m.alive = func(record) bool { return true }
+	m.ready = func(int) error { return errors.New("never bound") }
+
+	if port, err := m.ensure(worktree); err == nil {
+		t.Fatalf("ensure() = %d for a gopls that never became ready, want an error", port)
+	}
+
+	wantRecords(t, m.mapPath, "ensure dropped a record belonging to another process's start", theirs)
 }
 
 // A gopls that never came up leaves a record naming a port with nothing on it,
@@ -662,6 +784,85 @@ func TestForgetDropsOnlyTheNamedRecord(t *testing.T) {
 	}
 
 	wantRecords(t, m.mapPath, "forget dropped the wrong records", kept...)
+}
+
+// failingWriter is a client that stopped reading — a closed pipe on the other
+// end of stdout, which is what list writes to.
+type failingWriter struct{ after int }
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	if w.after <= 0 {
+		return 0, io.ErrClosedPipe
+	}
+	w.after--
+	return len(p), nil
+}
+
+// A client that stopped reading must not take the failure quietly: list is how
+// a person finds the stranded 1-2GB indexes this tool exists to reap, and a
+// truncated listing reported as success is one they would never come looking
+// for again. Both writes are rows, because the header and the records are two
+// separate calls and only the second is in a loop that could swallow it.
+func TestListReportsAWriterThatStoppedReading(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		after int
+	}{
+		{name: "header", after: 0},
+		{name: "record", after: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := newTestManager(t)
+			live := record{Worktree: "/repo/live", Port: 62001, PID: 11}
+			mustWriteMap(t, m.mapPath, []record{live})
+			m.alive = func(record) bool { return true }
+
+			if err := m.list(&failingWriter{after: tc.after}); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("list() = %v for a writer that stopped reading, want its error", err)
+			}
+		})
+	}
+}
+
+// A map file that cannot be read is not the same as one that is not there yet,
+// and the difference decides whether this tool may write. An unreadable file
+// still names live servers, so treating it as empty would allocate their ports
+// to somebody else and lose every record it holds on the next write.
+func TestReadMapReportsAFileItCannotRead(t *testing.T) {
+	t.Parallel()
+	// A directory, which opens and then refuses to be read — the closest thing
+	// to an unreadable file that does not depend on running as an unprivileged
+	// user, since root reads a 0000 file perfectly well.
+	records, intact, err := readMap(t.TempDir())
+	if err == nil {
+		t.Fatalf("readMap() = %#v, intact %v for a path it cannot read, want an error", records, intact)
+	}
+	if intact {
+		t.Fatal("readMap() called a file it could not read intact, which would let the next write skip its repair")
+	}
+}
+
+// withRecords hands the body's own refusal back rather than writing what it
+// returned alongside it: the body is what decides the map's next contents, and
+// one that failed has not decided anything.
+func TestWithRecordsWritesNothingWhenTheBodyRefuses(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t)
+	stored := record{Worktree: "/repo/live", Port: 62001, PID: 11}
+	mustWriteMap(t, m.mapPath, []record{stored})
+	m.alive = func(record) bool { return true }
+	refused := errors.New("no port left")
+
+	got, err := m.withRecords(func([]record) ([]record, error) { return nil, refused })
+	if !errors.Is(err, refused) {
+		t.Fatalf("withRecords() = %v, want the body's own error", err)
+	}
+	if got != nil {
+		t.Fatalf("withRecords() = %#v alongside an error, want nothing", got)
+	}
+	wantRecords(t, m.mapPath, "withRecords wrote what a failed body returned", stored)
 }
 
 func TestListShowsLiveRecordsAndCleansDeadRecords(t *testing.T) {

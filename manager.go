@@ -65,6 +65,10 @@ type record struct {
 type manager struct {
 	mapPath string
 	alive   func(record) bool // recordAlive; replaced by tests, and called concurrently — see cleanRecords
+	// ready is awaitReady, replaced by tests: what it waits out is readyTimeout,
+	// and ensure's failure path is otherwise ten seconds of sleeping away from
+	// every assertion about it.
+	ready func(port int) error
 }
 
 // gopls is resolved by startGopls, not here: list's whole job is to find and
@@ -80,6 +84,7 @@ func newManager() (*manager, error) {
 	return &manager{
 		mapPath: filepath.Join(home, ".local", "share", "gopls-ports.map"),
 		alive:   recordAlive,
+		ready:   awaitReady,
 	}, nil
 }
 
@@ -148,13 +153,17 @@ func cleanRecords(records []record, alive func(record) bool) []record {
 	return kept
 }
 
-func readMap(path string) ([]record, error) {
+// readMap returns the records the file holds, and whether it holds nothing
+// else. A file that is not intact has lines the read dropped, so it needs
+// rewriting whatever the caller then does with the records — see withRecords.
+// A file that is not there yet is intact: it already says what no records say.
+func readMap(path string) (records []record, intact bool, err error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, true, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -168,9 +177,10 @@ func readMap(path string) ([]record, error) {
 	// probe that decides on a kill: pid 0 signals this process's own group, a
 	// negative pid signals every process the user owns, and a port outside the
 	// range we allocate from can only refuse a probe and condemn a live server.
-	var records []record
+	var lines int
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
+		lines++
 		var r record
 		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
 			continue
@@ -181,9 +191,9 @@ func readMap(path string) ([]record, error) {
 		records = append(records, r)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, false, fmt.Errorf("read %s: %w", path, err)
 	}
-	return records, nil
+	return records, len(records) == lines, nil
 }
 
 func writeMap(path string, records []record) error {
@@ -349,6 +359,12 @@ func recordAlive(r record) bool {
 // one the user's editor started, and killing that is the very mistake this
 // guards against. The listen address we spawn with appears in no other gopls
 // command line, so it identifies ours exactly.
+//
+// ponytail: one fork per record, and a sweep asks for every record that did not
+// answer — 8 of them cost ~18ms against ~1.3ms when they are all alive
+// (BenchmarkSweepProbes), inside the map's flock. `ps -p` takes a list, so the
+// whole sweep is one fork if that ever matters; it costs cleanRecords a batching
+// pass before the fan-out, and it only runs when a gopls has actually died.
 func isOurGopls(pid, port int) bool {
 	out, err := exec.Command("ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	return err == nil && strings.Contains(string(out), goplsBinary) && strings.Contains(string(out), mcpAddress(port))
@@ -370,18 +386,40 @@ func portUnavailable(port int) bool {
 // reaps those servers: a caller that returned without writing would leave the
 // file claiming ports nothing holds. One write, so the caller that adds a
 // record does not fsync twice under the same lock — a cost every other
-// process's ensure queues behind. Unconditional, because the lines readMap
-// refused are gone before cleanRecords sees them: nothing here can tell whether
-// the file needs repairing, and the next write is the repair.
+// process's ensure queues behind.
 func (m *manager) withRecords(body func([]record) ([]record, error)) ([]record, error) {
+	return m.withMap(func(stored []record) ([]record, error) { return body(cleanRecords(stored, m.alive)) })
+}
+
+// withMap runs body under the map's flock, over what the file holds, and writes
+// back what it returns. The sweep is withRecords' addition, not this one's:
+// forget goes through here to drop one record without probing every other
+// worktree under the lock.
+//
+// Skipped entirely when body hands back what it was given, which is the steady
+// state: the write is a temp file, an fsync and a rename inside a lock every
+// process on the machine shares — some sixty times the rest of this function
+// (BenchmarkWithRecords). The intact flag is the other half of
+// the question: the lines readMap refused are gone from stored already, so
+// equal records do not mean an equal file, and only readMap can say whether the
+// repair is still owed.
+//
+// body must not mutate the slice it is handed. That slice is the comparison
+// basis, so a body editing it in place — slices.DeleteFunc does — would compare
+// its own result against itself, find no change, and leave the map saying what
+// it said before.
+func (m *manager) withMap(body func([]record) ([]record, error)) ([]record, error) {
 	var updated []record
 	err := withFileLock(m.mapPath, func() error {
-		stored, err := readMap(m.mapPath)
+		stored, intact, err := readMap(m.mapPath)
 		if err != nil {
 			return err
 		}
-		if updated, err = body(cleanRecords(stored, m.alive)); err != nil {
+		if updated, err = body(stored); err != nil {
 			return err
+		}
+		if intact && slices.Equal(stored, updated) {
+			return nil
 		}
 		return writeMap(m.mapPath, updated)
 	})
@@ -417,7 +455,7 @@ func (m *manager) ensure(worktree string) (int, error) {
 	if started == nil && !withinStartGrace(claimed) {
 		return claimed.Port, nil
 	}
-	if err := awaitReady(claimed.Port); err != nil {
+	if err := m.ready(claimed.Port); err != nil {
 		// Wrapped here rather than in awaitReady, which knows only a port: the
 		// worktree is in hand here, and the success path still does not hash it
 		// for a message nobody reads.
@@ -504,15 +542,12 @@ func (m *manager) claimPort(worktree string) (record, *os.Process, error) {
 // named and nothing else, on an error path that has already spent readyTimeout
 // and should not also probe every other worktree under the lock.
 func (m *manager) forget(started record) error {
-	return withFileLock(m.mapPath, func() error {
-		records, err := readMap(m.mapPath)
-		if err != nil {
-			return err
-		}
-		return writeMap(m.mapPath, slices.DeleteFunc(records, func(r record) bool {
-			return r == started
-		}))
+	// Cloned because DeleteFunc edits in place, and what it is handed is what
+	// withMap compares against to decide whether to write at all.
+	_, err := m.withMap(func(records []record) ([]record, error) {
+		return slices.DeleteFunc(slices.Clone(records), func(r record) bool { return r == started }), nil
 	})
+	return err
 }
 
 // list prints the surviving records. Printed after the lock is dropped, so a

@@ -354,6 +354,15 @@ and an exotic umask could leave the file unreadable to its own writer.
 M2. Every read-modify-write is wrapped in an exclusive `flock` on
 `<map>.lock`, so concurrent `bridge`/`ensure`/`list` processes serialize.
 
+The write is therefore skipped when it would change nothing — the steady state,
+a warm worktree whose record is present and still answering. The `fsync` in M1
+costs some sixty times everything else inside that lock — 5.5ms against 90µs
+for sixteen records (`BenchmarkWithRecords`) — and it is a lock every process
+on the machine shares.
+The skip needs both halves of the question: equal records, *and* a read that
+dropped no lines, since M3's repair is otherwise owed and would never come.
+→ `FuzzReadMap`, `TestReadMapSkipsUnparseableLines`
+
 M3. **A line that cannot be parsed is skipped, not fatal.** Every command reads
 this file; one bad line must not lock the operator out of the tool. The next
 write drops it.
@@ -429,7 +438,11 @@ Records are swept concurrently (L6). Within one record the steps run in order:
 L1. **Every record is offered to the liveness check**, including a second record
 for a worktree that `ensure` will never answer with. The record is the only
 handle on that process, and its port really is taken.
-→ `TestCleanRecordsOffersEveryRecordAndDropsOnlyTheDead`
+→ `TestCleanRecordsOffersEveryRecordAndDropsOnlyTheDead`, and `FuzzCleanRecords`
+  for the same two properties at any length: the probes run at once and write
+  into a shared slice by index, so what survives is assembled rather than
+  filtered, and the order has to survive too — `forget` matches a record by
+  value.
 
 L2. **A dropped record's process is always signalled while it is still ours.**
 Otherwise a 1–2 GB index survives unreferenced, holding its port, until reboot,
@@ -481,13 +494,20 @@ future buys nothing either — this field is the only way to make a record
 immortal, and the file is meant to be hand-editable.
 → `TestRecordAlive` (cases "a gopls still inside its start grace is spared",
   "a start that died inside its grace is not spared", "a record dated in the
-  future gets no grace")
+  future gets no grace"), and `FuzzWithinStartGrace` for the claim across the
+  whole domain rather than three points of it — this is the one field M1 does
+  not range-check, since unlike the other three it is no argument to `kill(2)`,
+  and the arithmetic behind it both wraps (the conversion to Go's epoch) and
+  saturates (the subtraction into a nanosecond `Duration`).
 
 ## 9. Spawning
 
 Started as `gopls mcp -listen 127.0.0.1:<port>` with `cwd` set to the worktree
 and `setsid`, stdout and stderr appended to
-`~/.local/share/gopls-mcp-logs/<sha256(worktree)[:8]>.log`.
+`~/.local/share/gopls-mcp-logs/<sha256(worktree)[:8]>.log`. The hash is not for
+brevity: a worktree is arbitrary bytes off the command line or out of `git`, and
+this is the one place one becomes a path this process opens for writing.
+→ `FuzzLogPath`
 
 P1. The child is **reaped**, not released. `setsid` does not reparent, so an
 unwaited gopls would stay a zombie child for the whole session — and
@@ -533,9 +553,14 @@ answered with a port nothing listens on. Dropped by identity rather than by
 worktree and port: L2 makes the port deterministic in the worktree, so the port
 a failed start held is the one the next start is handed, and a process delayed
 past its own grace would otherwise delete the live record that replaced its own.
-→ `TestForgetDropsOnlyTheNamedRecord` gates which record is dropped, not the
-  signalling and dropping that `ensure` does around it: no test drives a
-  spawned-but-never-ready gopls through `ensure` itself.
+→ `TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady` drives a
+  spawned-but-never-ready gopls through `ensure` and gates both halves — the
+  signal and the drop — since either alone is a leak: without the signal the
+  index outlives the map that named it (P2a), without the drop the port is
+  answered with for a whole grace window.
+  `TestForgetDropsOnlyTheNamedRecord` gates which record is dropped.
+  The readiness wait itself is a hook on the manager, so these cost a call
+  rather than the full 10 s budget.
 
 P6. **An `ensure` that did not start the gopls still waits for it, when the
 record it found is inside its start grace.** L7 vouched for that record without
@@ -544,7 +569,8 @@ to do for this caller, and skipping it hands the very next dial an
 `ECONNREFUSED` for a server that was coming up perfectly. The failure belongs to
 the process that started it — that one signals and forgets — so this caller only
 reports it.
-→ `TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`
+→ `TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`,
+  `TestEnsureLeavesAnotherProcessesFailedStartAlone`
 
 P7. Concurrent `ensure` calls for one worktree start **one** gopls between them:
 M2's `flock` covers the sweep, the allocation, the spawn and the record write as

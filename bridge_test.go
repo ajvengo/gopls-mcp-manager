@@ -83,6 +83,17 @@ func newFakeConn() *fakeConn {
 	return &fakeConn{reads: make(chan jsonrpc.Message), writes: make(chan jsonrpc.Message, 1)}
 }
 
+// deadConn is an upstream that has already gone away: msgs are everything it
+// will ever hand over, and its reader sees EOF straight after them.
+func deadConn(msgs ...jsonrpc.Message) *fakeConn {
+	reads := make(chan jsonrpc.Message, len(msgs))
+	for _, msg := range msgs {
+		reads <- msg
+	}
+	close(reads)
+	return &fakeConn{reads: reads}
+}
+
 // newHandshakingConn answers the private handshake out of its own write, so
 // that a test wanting a lane on a connected upstream needs no goroutine
 // scripting one. Everything the handshake does not swallow is queued as on a
@@ -432,23 +443,18 @@ func TestWithRootsCapability(t *testing.T) {
 	}
 }
 
-// The client's own initialize has to reach a connection that has not had one,
-// and refusing on the reader is what keeps that true. Let through, this call
-// would wake the home lane, which dials and — finding the initialize queued
-// behind it already stored — spends the private handshake on that connection.
-// The client's own initialize would then be written to an upstream that has
-// already been initialized, and the error gopls answers with would be forwarded
-// as the initialize result, ending the session before it began.
+// Refusing on the reader is what keeps the client's initialize from reaching a
+// connection that has already had one: let through, it would wake the home lane
+// into spending the private handshake on that connection, and gopls's
+// already-initialized error would come back as the client's initialize result,
+// ending the session before it began.
 //
-// Asserted on the dial rather than on that outcome, because the outcome needs
-// the lane to lose a race it usually wins: no dial at all is the property, and
-// it holds whoever wins.
+// Asserted on the dial rather than that outcome, because the outcome needs the
+// lane to lose a race it usually wins: no dial at all holds whoever wins.
 //
-// A notification has no id to answer, so inventing a response for one would be
-// a message the client has nothing to match against. Dropped instead — and the
-// lane still must not wake, which is the half a cancellation could not test:
-// that one is refused a dial anyway (R7), so it would pass with the refusal
-// deleted. The notification below is one that would otherwise open a connection.
+// A notification is dropped rather than refused, having no id to answer, and
+// the lane still must not wake. Not a cancellation: that is refused a dial
+// anyway (R7), so the row would pass with the refusal deleted.
 func TestAMessageBeforeInitializeNeverWakesALane(t *testing.T) {
 	t.Parallel()
 	id := mustID(t, "call-before-initialize")
@@ -555,10 +561,8 @@ func TestAColdWorktreeDoesNotHoldUpAnother(t *testing.T) {
 func TestHomeUpstreamEOFDoesNotCloseClient(t *testing.T) {
 	t.Parallel()
 
-	reads := make(chan jsonrpc.Message)
-	close(reads)
 	r := newTestRouter(t, testHome)
-	r.readFromUpstream(&fakeConn{reads: reads}, r.home)
+	r.readFromUpstream(deadConn(), r.home)
 
 	select {
 	case err := <-r.errs:
@@ -617,15 +621,13 @@ func TestSendReconnectsAndInitializesRestartedHome(t *testing.T) {
 func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		fresh := newFakeConn()
-		failedReads := make(chan jsonrpc.Message)
-		close(failedReads)
 		dials := 0
 		r := newTestRouter(t, testHome)
 		home := r.home
 		r.dial = func(context.Context, string) (mcp.Connection, error) {
 			dials++
 			if dials == 1 {
-				return yieldingConn(failedReads), nil
+				return yieldingConn(), nil
 			}
 			return fresh, nil
 		}
@@ -651,15 +653,10 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 	})
 }
 
-// The rule that a connection is initialized exactly once is the connection's
-// own, not a consequence of the order the reader happened to see: a client's
-// initialize reaching a lane that already holds a handshaken upstream is
-// refused there, without the second initialize ever being written.
-//
 // The reader refuses the disorder that produces this — H1a — so reaching it
 // takes a lane driven directly. That is the point: were the guard only on the
 // reader, a lane whose connection was opened by anything else would hand gopls
-// the duplicate and lose the session.
+// the duplicate initialize and lose the session.
 func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		r := newTestRouter(t, testHome)
@@ -685,11 +682,13 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 // first, so a reader started before the write — the regression
 // TestSendRetriesInitialInitializeWithoutPrivateHandshake pins — always claims
 // the id. Left to a real race, that reader wins about once in ten thousand runs.
-func yieldingConn(reads chan jsonrpc.Message) *fakeConn {
-	return &fakeConn{reads: reads, onWrite: func(context.Context, jsonrpc.Message) error {
+func yieldingConn() *fakeConn {
+	c := deadConn()
+	c.onWrite = func(context.Context, jsonrpc.Message) error {
 		synctest.Wait()
 		return io.EOF
-	}}
+	}
+	return c
 }
 
 // A wedged upstream must not be waited on forever, whichever half of opening it
@@ -747,20 +746,17 @@ func TestAWedgedUpstreamFailsItsCallWithinOneBudget(t *testing.T) {
 	}
 }
 
-// The bound must not outlive the dial. A connection reads its SSE stream under
-// the context it was dialled with for the whole of its life, so a plain
-// deadline context here would cut a healthy upstream loose the moment the
-// budget expired — the failure H5 describes, caused by the fix for it.
-// Asserted on a connection that is still in use, which is the only place the
-// property means anything: measured on one the lane had already closed and
-// given up, it would hold just as well with the context leaked, and that is the
-// case boundedConn exists to stop.
-// The other half of the same rule is that it must not outlive the connection
-// either: a wedged upstream fails its handshake on every attempt, so its lane
-// redials on every call — and a dial context surviving the connection it was
-// made for would leave one live child on the session context per call, for as
-// long as the client stays. Both halves are asserted here in order, on the one
-// connection, because that is the order they happen in.
+// The dial context must outlive the budget — a connection reads its SSE stream
+// under it for the whole of its life, so a plain deadline context would cut a
+// healthy upstream loose when the budget expired, the failure H5 describes
+// caused by the fix for it — and must not outlive the connection, or a wedged
+// upstream redialling on every call leaks one live child context per call for
+// as long as the client stays. Both halves are asserted on the one connection,
+// in the order they happen.
+//
+// The first is measured while the connection is still in use, which is the only
+// place it means anything: on one the lane had already closed, it would hold
+// with the context leaked too.
 func TestADialContextLivesExactlyAsLongAsItsConnection(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		r := newTestRouter(t, testHome)
@@ -818,6 +814,11 @@ func TestSendLeavesACallItsDyingUpstreamAlreadyFailed(t *testing.T) {
 
 // A gopls that dies mid-call must fail the calls it still owes. Nothing else
 // will ever produce their ids, so a client without a timeout would hang.
+//
+// failInFlight takes its ids off the awaited list in bulk rather than through
+// refuse, and dropping that delete costs nothing the first assertion can see.
+// The second is what catches it: an entry per dead call for the rest of the
+// session, and the next cancellation routed to a lane that stopped waiting.
 func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		conn := newFakeConn()
@@ -832,6 +833,16 @@ func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 		r.readFromUpstream(conn, testWorktree)
 
 		wantClientError(t, r, id, "upstream died and the in-flight call was left unanswered")
+
+		// Home, because nobody owes this id any more. Named against the lane it
+		// was sent to: still owed, the cancellation would go there instead.
+		got, _ := r.target(&jsonrpc.Request{
+			Method: "notifications/cancelled",
+			Params: json.RawMessage(`{"requestId":"call-in-flight"}`),
+		})
+		if got != testHome {
+			t.Fatalf("cancelling a call its dead upstream already failed went to %q, want home %q", got, testHome)
+		}
 	})
 }
 
@@ -842,20 +853,16 @@ func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 func TestUpstreamAnswerToAnAlreadyFailedCallIsDropped(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		id := mustID(t, "already-failed")
-		reads := make(chan jsonrpc.Message, 1)
-		// Nothing owes this id: send() claimed it and answered the client already.
-		reads <- &jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}
-		close(reads)
-
 		r := newTestRouter(t, testHome)
-		r.readFromUpstream(&fakeConn{reads: reads}, testWorktree)
+		// Nothing owes this id: send() claimed it and answered the client already.
+		r.readFromUpstream(deadConn(&jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}), testWorktree)
 
 		wantClientQuiet(t, r, "a call the bridge had already answered was answered a second time")
 	})
 }
 
-// A reconnect gives a worktree a new connection under the same name, so the
-// replaced one's reader must not fail the calls the live one already accepted.
+// A reconnect leaves two connections under one worktree, and the replaced one's
+// reader is still running.
 func TestStaleUpstreamDeathSparesTheReconnectedCall(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		live := newFakeConn()
@@ -866,17 +873,15 @@ func TestStaleUpstreamDeathSparesTheReconnectedCall(t *testing.T) {
 		sendCall(t, l, "call-after-reconnect")
 		mustRecv(t, live.writes, "the live connection to take the call it now owes")
 
-		replaced := make(chan jsonrpc.Message)
-		close(replaced)
-		r.readFromUpstream(&fakeConn{reads: replaced}, testWorktree)
+		r.readFromUpstream(deadConn(), testWorktree)
 
 		wantClientQuiet(t, r, "the replaced connection failed a call owned by the live one")
 	})
 }
 
-// A question we cannot route an answer back to is refused at once. Forwarding
-// it would return the client's reply addressed to nobody in particular, and an
-// upstream waiting on an answer that never comes stalls with no timeout.
+// Forwarding would return the client's reply addressed to nobody in particular,
+// and leave the upstream stalled on an answer that never comes, with no timeout
+// of its own.
 func TestUnroutableUpstreamRequestIsRefusedNotForwarded(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		id := mustID(t, "sample-1")
@@ -1408,6 +1413,91 @@ func TestCancellationFollowsACallOntoItsRetryConnection(t *testing.T) {
 	})
 }
 
+// brokenConn is a client transport whose read fails with something other than
+// the end of the stream — the one case serve reports rather than swallowing.
+// Everything else about it is a plain fakeConn.
+type brokenConn struct {
+	*fakeConn
+	err error
+}
+
+func (c *brokenConn) Read(context.Context) (jsonrpc.Message, error) { return nil, c.err }
+
+// A client closing its end is how every session ends, so reporting that as an
+// error would make a clean exit look like a crash to whatever ran this tool —
+// while a transport that broke for some other reason is the one thing the exit
+// status has to carry.
+func TestServeSwallowsTheEndOfTheClientAndReportsAnythingElse(t *testing.T) {
+	t.Parallel()
+	broken := errors.New("stdin fell over")
+	for _, tc := range []struct {
+		name string
+		conn mcp.Connection
+		want error
+	}{
+		{name: "client closed", conn: deadConn(), want: nil},
+		{name: "transport broke", conn: &brokenConn{fakeConn: deadConn(), err: broken}, want: broken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			// Serve returning at all is half of what this asserts: it waits for its
+			// reader and closes every lane, so a shutdown that ordered those wrongly
+			// would hang here rather than answer.
+			if err := serve(ctx, cancel, nil, testHome, tc.conn); !errors.Is(err, tc.want) {
+				t.Fatalf("serve() = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// writeToClient is the only path from an answer to the client, and the only
+// thing it decides is what to do when that path fails. Reporting once and
+// stopping is what lets serve exit; spinning on a transport that is gone would
+// burn a core for as long as the client stayed dead.
+func TestWriteToClientReportsAFailedWriteOnce(t *testing.T) {
+	t.Parallel()
+	r := newTestRouter(t, testHome)
+	writes := 0
+	conn := &fakeConn{onWrite: func(context.Context, jsonrpc.Message) error {
+		writes++
+		return io.ErrClosedPipe
+	}}
+	// Two queued, so that a writer which kept going after the failure would take
+	// the second one and be caught doing it.
+	r.out <- &jsonrpc.Response{ID: mustID(t, float64(1)), Result: json.RawMessage(`{}`)}
+	r.out <- &jsonrpc.Response{ID: mustID(t, float64(2)), Result: json.RawMessage(`{}`)}
+
+	r.writeToClient(conn) // returns, or this test times out
+
+	if err := <-r.errs; !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("writeToClient() reported %v, want the write's own error", err)
+	}
+	if writes != 1 {
+		t.Fatalf("writeToClient() attempted %d writes after the first one failed, want it to stop at 1", writes)
+	}
+}
+
+// The session ending is the other way out, and it is the ordinary one: serve
+// cancels the context before closing the transport, so a writer still holding a
+// message must drop it rather than report a failure nobody is left to read.
+func TestWriteToClientStopsWithTheSessionWithoutReportingIt(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	r := newRouter(ctx, nil, testHome)
+	cancel()
+
+	r.writeToClient(&fakeConn{writes: make(chan jsonrpc.Message, 1)})
+
+	select {
+	case err := <-r.errs:
+		t.Fatalf("writeToClient() reported %v for a session that ended normally", err)
+	default:
+	}
+}
+
 // newLinkedWorktree returns a fresh repository and a linked worktree of it.
 func newLinkedWorktree(t *testing.T) (root, linked string) {
 	t.Helper()
@@ -1416,16 +1506,16 @@ func newLinkedWorktree(t *testing.T) (root, linked string) {
 	runGit(t, "init", root)
 	runGit(t, "-C", root, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial")
 	runGit(t, "-C", root, "worktree", "add", "--detach", linked)
-	var err error
-	root, err = filepath.EvalSymlinks(root)
+	return mustEvalSymlinks(t, root), mustEvalSymlinks(t, linked)
+}
+
+func mustEvalSymlinks(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	linked, err = filepath.EvalSymlinks(linked)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return root, linked
+	return resolved
 }
 
 func runGit(t *testing.T, args ...string) {

@@ -10,14 +10,135 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
+
+// StartedAt is the one field readMap does not range-check — unlike the other
+// three it is no argument to kill(2) — while FuzzMapRoundTrip already shows the
+// map carrying arbitrary int64. What it is an argument to is this: a record
+// inside its grace is spared by every sweep without being probed at all, so
+// grace given wrongly makes that record immortal, holding its port against a
+// worktree whose next ensure starts a second gopls beside it.
+//
+// Both int64 extremes are seeded because the arithmetic is a conversion to Go's
+// epoch, which wraps, and a subtraction into a nanosecond Duration, which
+// saturates. The guard has to hold through both: grace means recent.
+func FuzzWithinStartGrace(f *testing.F) {
+	f.Add(int64(0))
+	f.Add(time.Now().Unix())
+	f.Add(time.Now().Unix() + 1<<40) // far future: no grace, or the record is immortal
+	f.Add(int64(math.MaxInt64))      // wraps the conversion to Go's epoch
+	f.Add(int64(math.MinInt64))      // wraps it the other way
+	f.Add(int64(math.MaxInt64) - 62135596800)
+	f.Add(int64(math.MinInt64) + 62135596800)
+	f.Add(int64(-1))
+
+	f.Fuzz(func(t *testing.T, startedAt int64) {
+		// Read once and around the call, so a second that ticks over mid-test
+		// widens the window rather than moving it: this must not fail on timing.
+		before := time.Now().Unix()
+		granted := withinStartGrace(record{StartedAt: startedAt})
+		after := time.Now().Unix()
+		if !granted {
+			return // no grace is always a safe answer; the sweep simply probes
+		}
+		if startedAt > after {
+			t.Fatalf("startedAt %d is in the future and was given grace, want a record nobody can make immortal", startedAt)
+		}
+		if oldest := before - int64(startGrace/time.Second); startedAt < oldest {
+			t.Fatalf("startedAt %d was given grace at %d, though the grace runs out at %d", startedAt, before, oldest)
+		}
+	})
+}
+
+// A worktree path is arbitrary bytes off the command line or out of git, and
+// this is the one place it becomes a path this process opens for writing. It
+// must land inside the log directory whatever it says: a worktree that walked
+// out of it would have this tool creating and appending to a file somewhere
+// else on every cold start, named by whoever chose the directory.
+func FuzzLogPath(f *testing.F) {
+	f.Add("/repo/plain")
+	f.Add("../../../etc/passwd")
+	f.Add("/repo/a/../../..")
+	f.Add("")
+	f.Add("/")
+	f.Add(strings.Repeat("../", 64))
+	f.Add("/repo/\x00null")
+	f.Add("/repo/юникод/路径")
+	f.Add("/repo/\xff\xfe")
+
+	// Built once: logPath only reads the map path, and a temp directory per
+	// iteration is two syscalls against a function that makes none.
+	m := newTestManager(f)
+	wantDir := filepath.Join(filepath.Dir(m.mapPath), "gopls-mcp-logs")
+
+	f.Fuzz(func(t *testing.T, worktree string) {
+		got := m.logPath(worktree)
+
+		if dir := filepath.Dir(got); dir != wantDir {
+			t.Fatalf("logPath(%q) = %q, which is under %q rather than %q", worktree, got, dir, wantDir)
+		}
+		// Cleaning is what a traversal would survive: a name that reduces to
+		// something else is one that reached the directory above by another road.
+		if filepath.Clean(got) != got {
+			t.Fatalf("logPath(%q) = %q, which cleans to %q", worktree, got, filepath.Clean(got))
+		}
+		if again := m.logPath(worktree); again != got {
+			t.Fatalf("logPath(%q) = %q, then %q: the same worktree logs to two files", worktree, got, again)
+		}
+	})
+}
+
+// cleanRecords probes its records at once, so what it hands back is assembled
+// from a slice several goroutines wrote into by index. Three properties say
+// that assembly is right at any length, and each has its own cost: a record
+// offered twice is a second probe on somebody else's gopls under the map lock,
+// one never offered is a dead server whose only handle is silently kept, and a
+// reordered result would still round-trip through the file and still be wrong,
+// since forget matches by value.
+func FuzzCleanRecords(f *testing.F) {
+	f.Add(uint(0), uint64(0))
+	f.Add(uint(1), uint64(1))
+	f.Add(uint(3), uint64(0b101))
+	f.Add(uint(8), uint64(0))
+	f.Add(uint(8), ^uint64(0))
+	f.Add(uint(64), uint64(0b1010101))
+
+	f.Fuzz(func(t *testing.T, count uint, deadMask uint64) {
+		// Bounded: what this is about is the assembly, and a million records
+		// would only be a million goroutines saying the same thing.
+		records := benchRecords(int(count % 65))
+		// Keyed off the record rather than an index, since which goroutine asks
+		// about which is exactly what is under test.
+		dead := func(r record) bool { return deadMask&(1<<uint(r.PID%64)) != 0 }
+		var offered atomic.Int64
+		alive := func(r record) bool {
+			offered.Add(1)
+			return !dead(r)
+		}
+
+		got := cleanRecords(records, alive)
+		if offered.Load() != int64(len(records)) {
+			t.Fatalf("alive() saw %d of %d records; one probed twice costs a stranger's gopls a probe, one skipped strands an index", offered.Load(), len(records))
+		}
+		// From the predicate, not from alive: calling alive again would count
+		// probes of its own, and the assertion above would then only hold for as
+		// long as nobody moved it below this.
+		want := slices.DeleteFunc(slices.Clone(records), dead)
+		if !slices.Equal(got, want) {
+			t.Fatalf("cleanRecords() = %#v, want %#v in that order", got, want)
+		}
+	})
+}
 
 // The map file is meant to be editable by hand, so readMap's input is arbitrary
 // bytes. Nothing it returns may violate the checks it makes, because every
@@ -41,7 +162,7 @@ func FuzzReadMap(f *testing.F) {
 	f.Fuzz(func(t *testing.T, content []byte) {
 		path := newTestManager(t).mapPath
 		mustWriteFile(t, path, string(content))
-		records, err := readMap(path)
+		records, intact, err := readMap(path)
 		if err != nil {
 			return // a read that failed hands nothing back to act on
 		}
@@ -55,6 +176,31 @@ func FuzzReadMap(f *testing.F) {
 			if r.Port < firstPort || r.Port > lastPort {
 				t.Errorf("readMap kept port %d, outside %d-%d: %#v", r.Port, firstPort, lastPort, r)
 			}
+		}
+
+		// The repair has to converge, because withRecords skips the write only when
+		// the records are unchanged and the file is intact. A file that rewrote to
+		// something this read would drop again, or that still reported damaged after
+		// its own repair, would be rewritten and fsynced under the machine-wide lock
+		// on every ensure for as long as it sits there.
+		if err := writeMap(path, records); err != nil {
+			t.Fatalf("writeMap refused what readMap handed back: %v", err)
+		}
+		again, againIntact, err := readMap(path)
+		if err != nil {
+			t.Fatalf("readMap failed on a file it wrote itself: %v", err)
+		}
+		if !slices.Equal(again, records) {
+			t.Fatalf("readMap is not idempotent: %#v, then %#v", records, again)
+		}
+		if !againIntact {
+			t.Fatalf("readMap called its own rewritten file damaged: %#v", again)
+		}
+		// Damaged has to mean there is something to repair. The converse is not
+		// claimed: a hand-edited file may order its keys differently from writeMap
+		// and still have lost nothing, so intact does not promise equal bytes.
+		if !intact && string(content) == mustReadString(t, path) {
+			t.Fatalf("readMap called %q damaged, but rewriting it changed nothing", content)
 		}
 	})
 }
@@ -134,6 +280,51 @@ func FuzzAllocatePort(f *testing.F) {
 		}
 		if slices.ContainsFunc(records, func(r record) bool { return r.Port == got }) {
 			t.Fatalf("allocatePort() = %d, a port already claimed", got)
+		}
+	})
+}
+
+// The other half of allocation: a port free in the map that the kernel will not
+// hand over anyway, which is what portUnavailable answers in production. The
+// walk has to step past both kinds and wrap, and a port it returns is one a
+// gopls is about to be spawned on — so returning an unavailable one binds
+// nothing and strands the record that names it.
+func FuzzAllocatePortAroundUnavailable(f *testing.F) {
+	f.Add("/repo/a", uint64(0))
+	f.Add("/repo/a", ^uint64(0)) // the whole window refuses
+	f.Add("/repo/b", uint64(1))
+	f.Add("/repo/b", uint64(0b1010101))
+	f.Add("", uint64(1<<63))
+
+	f.Fuzz(func(t *testing.T, worktree string, blocked uint64) {
+		// A bit per port from the base onward, so refusals land where the walk
+		// actually goes rather than somewhere it would never reach. Beyond the
+		// window every port is free, which is what makes an error meaningful:
+		// only a walk that failed to wrap can report one.
+		base := basePort(worktree)
+		offset := func(port int) int { return (port - base + portCount) % portCount }
+		unavailable := func(port int) bool {
+			at := offset(port)
+			return at < 64 && blocked&(1<<at) != 0
+		}
+
+		got, err := allocatePort(worktree, nil, unavailable)
+		if err != nil {
+			t.Fatalf("allocatePort() failed with %d of %d ports free: %v", portCount-64, portCount, err)
+		}
+		if unavailable(got) {
+			t.Fatalf("allocatePort() = %d, a port that refuses to bind", got)
+		}
+		if got < firstPort || got > lastPort {
+			t.Fatalf("allocatePort() = %d, outside %d-%d", got, firstPort, lastPort)
+		}
+		// The walk is in order from the base, so the answer is the first port
+		// nothing objects to — anything later means a free port was stepped over
+		// and two worktrees that should differ can collide further along.
+		for port := base; port != got; port = nextPort(port) {
+			if !unavailable(port) {
+				t.Fatalf("allocatePort() = %d (offset %d), skipping free port %d (offset %d)", got, offset(got), port, offset(port))
+			}
 		}
 	})
 }
@@ -224,6 +415,45 @@ func FuzzWithRootsCapability(f *testing.F) {
 		}
 		if absentJSON(out.Capabilities.Roots) {
 			t.Fatalf("withRootsCapability(%s) = %s: rewritten, but with no roots capability", params, got)
+		}
+	})
+}
+
+// jsonKey is what keeps the rewrite above from adding a second spelling of a
+// key the client already sent — two keys mapping to one field, with gopls
+// reading whichever marshalled first. Fuzzed directly as well as through
+// withRootsCapability, because the hazard is in the object's keys rather than
+// in the params around them, and a decoder folds case, so the interesting keys
+// are the ones no seed would think to write.
+func FuzzJSONKey(f *testing.F) {
+	f.Add(`{}`, "capabilities")
+	f.Add(`{"capabilities":{}}`, "capabilities")
+	f.Add(`{"CApABilities":{}}`, "capabilities")
+	f.Add(`{"capabilities":1,"CAPABILITIES":2}`, "capabilities")
+	f.Add(`{"roots":null}`, "roots")
+	f.Add(`{"":1}`, "")
+	f.Add(`{"Ω":1}`, "ω")
+	f.Add(`{"other":1}`, "capabilities")
+
+	f.Fuzz(func(t *testing.T, object string, name string) {
+		var decoded map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(object), &decoded); err != nil || decoded == nil {
+			t.Skip() // not an object, so there are no keys to pick between
+		}
+		key := jsonKey(decoded, name)
+		if key != name && !strings.EqualFold(key, name) {
+			t.Fatalf("jsonKey(%s, %q) = %q, a key no decoder would read as %q", object, name, key, name)
+		}
+		if _, present := decoded[key]; !present && key != name {
+			t.Fatalf("jsonKey(%s, %q) = %q, which the object does not have", object, name, key)
+		}
+		// The property the caller needs: writing under the key it hands back
+		// never leaves the object with more spellings of name than it had. An
+		// object already ambiguous stays exactly as ambiguous.
+		before := max(foldCount(decoded, name), 1)
+		decoded[key] = json.RawMessage(`{}`)
+		if after := foldCount(decoded, name); after > before {
+			t.Fatalf("writing under jsonKey(%s, %q) = %q left %d keys folding to it, want at most %d", object, name, key, after, before)
 		}
 	})
 }
