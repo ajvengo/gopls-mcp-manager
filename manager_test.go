@@ -108,6 +108,23 @@ func mustWriteMap(t *testing.T, path string, records []record) {
 	}
 }
 
+// appendToMap puts text after whatever the map already holds, which is the only
+// way these tests can produce a file readMap will drop lines from: writeMap can
+// only write one it would accept entirely.
+func appendToMap(t *testing.T, path string, text string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(text); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func mustReadMap(t *testing.T, path string) []record {
 	t.Helper()
 	records, _, err := readMap(path)
@@ -265,15 +282,21 @@ func serveEndpoint(tb testing.TB, listener net.Listener, after time.Duration) {
 // verdict, and so pays the ps fork this one skips.
 func livePort(tb testing.TB) int {
 	tb.Helper()
-	server := httptest.NewServer(eventStreamHandler())
-	tb.Cleanup(server.Close)
-	return server.Listener.Addr().(*net.TCPAddr).Port
+	listener, port := listenLocal(tb)
+	serveEndpoint(tb, listener, 0)
+	return port
 }
 
 // silentPort returns a port held by something that takes the connection and
 // then says nothing — §8's server, the one a probe can only time out against.
 // Accepted connections are kept rather than closed, since closing is what would
 // give the prober its conclusive answer.
+//
+// Accepted at all, rather than left to pile up in the kernel's backlog, because
+// a full backlog starts refusing — which is that same conclusive answer by
+// another road. BenchmarkSweepProbes probes eight records an iteration, so the
+// backlog would not last a second of it. The cost is one held descriptor per
+// probe until the listener closes, which bounds it by the caller's own run.
 func silentPort(tb testing.TB) int {
 	tb.Helper()
 	listener, port := listenLocal(tb)
@@ -529,22 +552,12 @@ func TestReadMapSkipsUnparseableLines(t *testing.T) {
 	m := newTestManager(t)
 	good := record{Worktree: "/repo/good", Port: 62001, PID: 11}
 	mustWriteMap(t, m.mapPath, []record{good})
-	f, err := os.OpenFile(m.mapPath, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Not just unparseable lines: valid JSON whose fields would be handed to
 	// kill(2). A missing pid decodes to 0, which signals our own process group.
-	damage := "garbage\t\tnot-a-port\tx\n\"/repo/b\"\tnope\t12\n" +
-		`{"Worktree":"/repo/no-pid","Port":62002}` + "\n" +
-		`{"Worktree":"/repo/every-process","Port":62003,"PID":-1}` + "\n" +
-		`{"Worktree":"/repo/bad-port","Port":0,"PID":13}` + "\n"
-	if _, err := f.WriteString(damage); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	appendToMap(t, m.mapPath, "garbage\t\tnot-a-port\tx\n\"/repo/b\"\tnope\t12\n"+
+		`{"Worktree":"/repo/no-pid","Port":62002}`+"\n"+
+		`{"Worktree":"/repo/every-process","Port":62003,"PID":-1}`+"\n"+
+		`{"Worktree":"/repo/bad-port","Port":0,"PID":13}`+"\n")
 
 	got, intact, err := readMap(m.mapPath)
 	if err != nil {
@@ -558,6 +571,61 @@ func TestReadMapSkipsUnparseableLines(t *testing.T) {
 	// lines and reported the file intact would leave them there for good.
 	if intact {
 		t.Fatal("readMap() called a file it dropped four lines from intact, so nothing would rewrite it")
+	}
+}
+
+// The write is what costs: a temp file, an fsync and a rename inside a lock
+// every process on the machine shares, on a path a warm tool call takes every
+// time. Skipping it turns on two questions rather than one, and the halves fail
+// in opposite directions — keyed on the records alone, the repair M3 leaves to
+// the next write is owed forever; never skipping pays the fsync for nothing.
+//
+// Asserted on the mtime because the skip is the absence of a write, which the
+// records cannot show: both rows end holding exactly the same one.
+func TestWithRecordsWritesOnlyWhenTheFileWouldChange(t *testing.T) {
+	t.Parallel()
+	kept := record{Worktree: "/repo/kept", Port: 62001, PID: 11}
+	for _, tc := range []struct {
+		name      string
+		damage    string
+		wantWrite bool
+	}{
+		{name: "records unchanged and the read dropped nothing", wantWrite: false},
+		{name: "records unchanged but the read dropped a line", damage: "garbage\n", wantWrite: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := newTestManager(t)
+			// Every record alive, so the sweep hands back what it was given and the
+			// records are equal in both rows — leaving the intact flag as the only
+			// thing that differs between them.
+			m.alive = func(record) bool { return true }
+			mustWriteMap(t, m.mapPath, []record{kept})
+			if tc.damage != "" {
+				appendToMap(t, m.mapPath, tc.damage)
+			}
+			// Far enough back that the fresh mtime a rename leaves cannot be mistaken
+			// for it, whatever the filesystem's timestamp resolution.
+			stale := time.Now().Add(-time.Hour)
+			if err := os.Chtimes(m.mapPath, stale, stale); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := m.withRecords(func(rs []record) ([]record, error) { return rs, nil }); err != nil {
+				t.Fatal(err)
+			}
+
+			info, err := os.Stat(m.mapPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if written := !info.ModTime().Equal(stale); written != tc.wantWrite {
+				t.Fatalf("withRecords() rewrote the map = %t, want %t", written, tc.wantWrite)
+			}
+			// Either way the file ends up saying the same thing: the row above is
+			// about what it cost to get there, not about what it holds.
+			wantRecords(t, m.mapPath, "the map lost the record it should have kept", kept)
+		})
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -138,7 +137,13 @@ func BenchmarkCallRoundTrip(b *testing.B) {
 	var i float64
 	for b.Loop() {
 		i++
-		client <- &jsonrpc.Request{ID: mustID(b, i), Method: "tools/call", Params: params}
+		// Not mustID: MakeID cannot fail for a float64, and its tb.Helper() takes
+		// testing's lock and walks the stack every iteration — some 280ns against
+		// the ~4µs measured here, which would be the bridge charged 6% for the
+		// benchmark's own scaffolding. An id that came out wrong anyway fails the
+		// answer check below.
+		id, _ := jsonrpc.MakeID(i)
+		client <- &jsonrpc.Request{ID: id, Method: "tools/call", Params: params}
 		if resp, ok := (<-sink.writes).(*jsonrpc.Response); !ok || resp.Error != nil {
 			b.Fatalf("call %v was not answered: %#v", i, resp)
 		}
@@ -200,7 +205,7 @@ func BenchmarkStdioCodec(b *testing.B) {
 // the critical section. Nothing here forks or probes, so what is left is the
 // syscalls the lock actually holds.
 func BenchmarkWithRecords(b *testing.B) {
-	records := benchRecords(16)
+	records := testRecords(16)
 	benches := []struct {
 		name string
 		body func([]record) ([]record, error)
@@ -211,10 +216,10 @@ func BenchmarkWithRecords(b *testing.B) {
 			// iterations, so a body that appended would report the average over a
 			// file that kept growing rather than the cost of one write. The change
 			// has to be a real one, or the skip above eats it and both rows measure
-			// the same thing.
-			out := slices.Clone(rs)
-			out[len(out)-1].PID++
-			return out, nil
+			// the same thing. Edited in place because withMap hands every body a
+			// copy of its own.
+			rs[len(rs)-1].PID++
+			return rs, nil
 		}},
 	}
 	for _, bench := range benches {
@@ -236,7 +241,7 @@ func BenchmarkWithRecords(b *testing.B) {
 	}
 }
 
-func benchRecords(n int) []record {
+func testRecords(n int) []record {
 	records := make([]record, n)
 	for i := range records {
 		records[i] = record{Worktree: fmt.Sprintf("/repo/w%d", i), Port: firstPort + i, PID: 1000 + i}
@@ -259,23 +264,27 @@ func benchRecords(n int) []record {
 // whole timeout, so it runs at half a second an iteration by construction and
 // wants the default benchtime rather than a count.
 func BenchmarkSweepProbes(b *testing.B) {
-	odd, _ := answeringPort(b, http.StatusOK)
 	for _, bench := range []struct {
 		name string
-		port int
+		// Stood up inside the row rather than in the table, so that running one
+		// row does not also start the other three servers — silent's accept
+		// goroutine holds every connection it takes, and at a long benchtime the
+		// rows not being measured would sit on file descriptors for the whole run.
+		port func(testing.TB) int
 	}{
-		{name: "live", port: livePort(b)},
-		{name: "refused", port: deadPort(b)},
-		{name: "odd", port: odd},
-		{name: "silent", port: silentPort(b)},
+		{name: "live", port: livePort},
+		{name: "refused", port: deadPort},
+		{name: "odd", port: func(tb testing.TB) int { port, _ := answeringPort(tb, http.StatusOK); return port }},
+		{name: "silent", port: silentPort},
 	} {
 		b.Run(bench.name, func(b *testing.B) {
-			records := benchRecords(8)
+			port := bench.port(b)
+			records := testRecords(8)
 			for i := range records {
 				// Every record aims at the one server, since what is being timed is
 				// the verdict rather than which port reached it. The pid is this
 				// process, so the kill(2) liveness check passes and the probe runs.
-				records[i].Port = bench.port
+				records[i].Port = port
 				records[i].PID = os.Getpid()
 			}
 			b.ReportAllocs()

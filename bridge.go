@@ -331,8 +331,9 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 
 // refuse answers req with an error, for a message no upstream took: the reader
 // could choose no lane for it, none may run it yet, or the lane that owned it
-// could not place it. It is the only way the bridge reports a problem for a
-// call the client is still waiting on.
+// could not place it. It reports a problem for one call the client is still
+// waiting on; failInFlight is the other way that happens, for every call a lane
+// stranded at once.
 //
 // Notifications are dropped instead of refused: a notification has no id to
 // answer, and inventing a response for one would be a message the client has

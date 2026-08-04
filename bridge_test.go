@@ -24,10 +24,11 @@ type fakeConn struct {
 	reads  chan jsonrpc.Message
 	writes chan jsonrpc.Message
 
-	// onWrite replaces the default write, and is the one seam these tests need
-	// from a connection: every upstream they stub differs from a plain one in
-	// what writing to it does — it fails, it answers out of the write itself, it
-	// dies first — and in nothing else. nil is the default, which queues the
+	// onWrite replaces the default write, which is what almost every upstream
+	// these tests stub differs in: it fails, it answers out of the write itself,
+	// it dies first — and is a plain connection otherwise. The exception is
+	// brokenConn, which wraps one of these to fail a read instead. nil is the
+	// default, which queues the
 	// message on writes. A hook that wants the default for the messages it does
 	// not care about calls queue.
 	onWrite func(ctx context.Context, msg jsonrpc.Message) error
