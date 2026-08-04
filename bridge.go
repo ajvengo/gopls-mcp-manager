@@ -56,7 +56,18 @@ func bridge(ctx context.Context, m *manager, home string) error {
 		cancel()
 		return err
 	}
+	return serve(ctx, cancel, m, home, stdio)
+}
 
+// serve is the session over an already-connected client transport: everything
+// bridge does once it has one. Split out so that the shutdown order below — the
+// one thing here with a wrong answer — is reachable over a pair of in-memory
+// transports, since the one bridge opens is this process's real stdin.
+//
+// The cancel is passed in rather than derived, because ctx is what stdio was
+// connected under and cancelling a narrower one would leave the transport
+// running past the session.
+func serve(ctx context.Context, cancel context.CancelFunc, m *manager, home string, stdio mcp.Connection) error {
 	r := newRouter(ctx, m, home)
 
 	// Only the reader is waited for, because r.lanes is its state and
@@ -71,7 +82,7 @@ func bridge(ctx context.Context, m *manager, home string) error {
 		r.readFromClient(stdio)
 	}()
 
-	err = <-r.errs
+	err := <-r.errs
 	cancel()
 	_ = stdio.Close()
 	<-readerDone
@@ -224,8 +235,7 @@ draining:
 		//
 		// Asked through Done rather than Err: Err takes the session context's own
 		// mutex, which every lane would then share once a message — the very
-		// contention lane.ctx exists to keep off the session context. The label is
-		// what makes this a break out of the loop rather than out of the select.
+		// contention lane.ctx exists to keep off the session context.
 		select {
 		case <-l.r.ctx.Done():
 			break draining
@@ -243,8 +253,6 @@ draining:
 func (r *router) route(req *jsonrpc.Request) {
 	worktree, err := r.target(req)
 	if err != nil {
-		// Refused here because no lane owns a message whose destination is what
-		// could not be decided. A notification is dropped: no id to answer.
 		r.refuse(req, jsonrpc.CodeInvalidParams, "%s", err)
 		return
 	}
@@ -298,10 +306,8 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 		}
 		req, ok := msg.(*jsonrpc.Request)
 		if !ok {
-			// A response answers a question some upstream asked, and we ask the
-			// client none: roots/list is answered here and everything else is
-			// refused. So this replies to nothing, and handing it to an upstream
-			// would only make one dial and handshake to be told so.
+			// Not a request, and this bridge asks the client nothing, so a stray
+			// response has nothing to route to.
 			continue
 		}
 		if req.Method == "initialize" {
@@ -309,16 +315,11 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 			r.initialize.Store(req)
 		} else if r.initialize.Load() == nil {
 			// A request the client sent before its own initialize, which the
-			// protocol does not allow it to send at all. Refused here rather
-			// than by the lane that would run it, because this is the only
-			// place that sees the client's own order: a lane sees its queue,
-			// where the offending request and the initialize behind it are two
-			// iterations of one loop, and the first would dial, find the
-			// pointer already filled by the time it looked, and spend the
-			// private handshake on that connection. Answering the offending
-			// message is all this does — the connection that would then be owed
-			// a second initialize refuses it from its own state (see upstream),
-			// so the invariant does not rest on winning that race.
+			// protocol disallows. Refused here rather than by the lane that
+			// would run it, because only this loop sees the client's own order:
+			// a lane could dial before the initialize behind it is stored. The
+			// invariant does not rest on winning that race — a connection then
+			// owed a second initialize refuses it itself (see upstream).
 			r.refuse(req, jsonrpc.CodeInvalidRequest, "%s arrived before the client sent initialize", req.Method)
 			continue
 		}
@@ -326,19 +327,28 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 	}
 }
 
-// refuse answers req with an error, on the goroutine that read it rather than
-// by any lane. Both callers refuse for the same kind of reason: the message
-// cannot be handed to an upstream at all — either no lane could be chosen for
-// it, or none may run it yet — so there is no lane whose job this could be.
+// refuse answers req with an error, for a message no upstream took: the reader
+// could choose no lane for it, none may run it yet, or the lane that owned it
+// could not place it. It is the only way the bridge reports a problem for a
+// call the client is still waiting on.
 //
 // Notifications are dropped instead of refused: a notification has no id to
 // answer, and inventing a response for one would be a message the client has
 // nothing to match against.
+//
+// Answering ends the call, so its route goes too — a cancellation arriving now
+// belongs at home, not at a lane that has stopped waiting for it. This is the
+// plain delete, not a claim: every caller has already established that the
+// reply is theirs to send, and one with nothing to drop loses nothing by saying
+// so, since refuse can be answering a message that was never tracked.
 func (r *router) refuse(req *jsonrpc.Request, code int64, format string, args ...any) {
 	if !req.ID.IsValid() {
 		return
 	}
-	r.fail(req.ID, code, format, args...)
+	r.mu.Lock()
+	delete(r.awaitingUpstream, req.ID)
+	r.mu.Unlock()
+	r.forward(errorResponse(req.ID, code, format, args...))
 }
 
 // withRootsCapability makes every upstream ask this bridge for its roots. Some
@@ -517,10 +527,9 @@ func (l *lane) send(req *jsonrpc.Request) {
 			return
 		}
 	}
-	if !id.IsValid() {
-		return // a notification has nowhere to report a failure to
-	}
-	l.r.fail(id, jsonrpc.CodeInternalError, "gopls for %s: %v", l.worktree, err)
+	// A notification has nowhere to report a failure to, which refuse is what
+	// already knows.
+	l.r.refuse(req, jsonrpc.CodeInternalError, "gopls for %s: %v", l.worktree, err)
 }
 
 // track records a request as being in flight to worktree, and with conn once an
@@ -559,27 +568,10 @@ func (r *router) claim(id jsonrpc.ID) bool {
 	return won
 }
 
-// fail answers id with an error: the only way the bridge can report a problem
-// for a call the client is still waiting on.
-//
-// Answering ends the call, so its route goes too — a cancellation arriving now
-// belongs at home, not at a lane that has stopped waiting for it. Done here
-// rather than at each caller because it holds for all of them, and the two that
-// have nothing to drop lose nothing by saying so: refuseBeforeInitialize never
-// tracked its id, and failInFlight took its own off the list to get here. This
-// is the plain delete, not a claim — every caller has already established that
-// the reply below is theirs to send.
-func (r *router) fail(id jsonrpc.ID, code int64, format string, args ...any) {
-	r.mu.Lock()
-	delete(r.awaitingUpstream, id)
-	r.mu.Unlock()
-	r.forward(errorResponse(id, code, format, args...))
-}
-
 // errorResponse builds the one error shape this bridge sends, in both
-// directions: fail forwards it to the client, answeredUpstream writes it back to
-// a gopls. Shared so the two cannot drift into answering the same way in
-// different words.
+// directions: refuse and failInFlight forward it to the client,
+// answeredUpstream writes it back to a gopls. Shared so they cannot drift into
+// answering the same way in different words.
 func errorResponse(id jsonrpc.ID, code int64, format string, args ...any) *jsonrpc.Response {
 	return &jsonrpc.Response{ID: id, Error: &jsonrpc.Error{
 		Code:    code,
@@ -789,13 +781,19 @@ func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error)
 	for id, owner := range r.awaitingUpstream {
 		if owner.conn == conn {
 			stranded = append(stranded, id)
+			// The claim and the answer, same as refuse makes them, but once for
+			// the whole set: taking the id here is what says this caller answers
+			// it, and leaving it would route a later cancellation to a lane that
+			// has stopped waiting. Nothing can put it back before the forward
+			// below — a retry only re-tracks an id whose claim it won, and the
+			// claim is this delete.
 			delete(r.awaitingUpstream, id)
 		}
 	}
 	r.mu.Unlock()
 
 	for _, id := range stranded {
-		r.fail(id, jsonrpc.CodeInternalError, "gopls for %s went away mid-call: %v", worktree, cause)
+		r.forward(errorResponse(id, jsonrpc.CodeInternalError, "gopls for %s went away mid-call: %v", worktree, cause))
 	}
 }
 
@@ -827,14 +825,13 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 // answerRoots tells an upstream that its one workspace root is the worktree it
 // serves, instead of forwarding the question to the client.
 //
-// This is what makes a gopls notice a file created after it started. Its headless
-// MCP mode already runs a full in-process LSP session and an fsnotify watcher
-// that feeds it didChangeWatchedFiles — but it only watches the roots the client
-// reports, and only asks for them at all once it has seen the roots capability in
-// initialize. Left to the client, every upstream would hear the same answer: the
-// single tree the session was opened in. Every other worktree would then watch
-// nothing and answer "no package metadata" for a file that is right there on disk,
-// which is indistinguishable from a genuinely broken tree.
+// This is what makes a gopls notice a file created after it started: its watcher
+// only watches the roots the client reports, and it only asks for them once it
+// has seen the roots capability in initialize — which is why withRootsCapability
+// puts one there. Left to the client, every upstream would hear the same answer,
+// the single tree the session was opened in, and every other worktree would watch
+// nothing and answer "no package metadata" for a file that is right there on
+// disk — indistinguishable from a genuinely broken tree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) {
 	// Two strings in a fixed shape: marshaling them cannot fail, and there would
 	// be nobody to tell anyway — the id belongs to the upstream, so an error
