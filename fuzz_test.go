@@ -116,7 +116,7 @@ func FuzzCleanRecords(f *testing.F) {
 	f.Fuzz(func(t *testing.T, count uint, deadMask uint64) {
 		// Bounded: what this is about is the assembly, and a million records
 		// would only be a million goroutines saying the same thing.
-		records := benchRecords(int(count % 65))
+		records := testRecords(int(count % 65))
 		// Keyed off the record rather than an index, since which goroutine asks
 		// about which is exactly what is under test.
 		dead := func(r record) bool { return deadMask&(1<<uint(r.PID%64)) != 0 }
@@ -393,12 +393,7 @@ func FuzzWithRootsCapability(f *testing.F) {
 		if err := json.Unmarshal(got, &rewritten); err != nil {
 			t.Fatalf("withRootsCapability(%s) = %s, no longer an object: %v", params, got, err)
 		}
-		// encoding/json matches field names case-insensitively, so a second
-		// spelling of a key the client already sent leaves two keys mapping to
-		// one field — and which one gopls reads comes down to their order.
-		// Adding the key to an object that had none is the point; making it
-		// ambiguous is the bug. An input already ambiguous stays its own.
-		before := max(foldCount(object, "capabilities"), 1)
+		before := spellingBudget(object, "capabilities")
 		if after := foldCount(rewritten, "capabilities"); after > before {
 			t.Fatalf("withRootsCapability(%s) = %s: %d keys fold to \"capabilities\", want at most %d", params, got, after, before)
 		}
@@ -448,14 +443,27 @@ func FuzzJSONKey(f *testing.F) {
 			t.Fatalf("jsonKey(%s, %q) = %q, which the object does not have", object, name, key)
 		}
 		// The property the caller needs: writing under the key it hands back
-		// never leaves the object with more spellings of name than it had. An
-		// object already ambiguous stays exactly as ambiguous.
-		before := max(foldCount(decoded, name), 1)
+		// never leaves the object with more spellings of name than it had.
+		before := spellingBudget(decoded, name)
 		decoded[key] = json.RawMessage(`{}`)
 		if after := foldCount(decoded, name); after > before {
 			t.Fatalf("writing under jsonKey(%s, %q) = %q left %d keys folding to it, want at most %d", object, name, key, after, before)
 		}
 	})
+}
+
+// spellingBudget is how many keys may fold to name once something has written
+// under it — the assertion both fuzzers above are built around.
+//
+// encoding/json matches field names case-insensitively, so a second spelling of
+// a key the client already sent leaves two keys mapping to one field, and which
+// one gopls reads comes down to their order. Adding the key to an object that
+// had none is the point; making it ambiguous is the bug. Hence the clamp to 1:
+// an object with no spelling is allowed to gain its first, and one already
+// ambiguous is allowed to stay exactly as ambiguous as it arrived — dropping it
+// would forbid the write these fuzzers exist to permit.
+func spellingBudget(object map[string]json.RawMessage, name string) int {
+	return max(foldCount(object, name), 1)
 }
 
 // foldCount is how many of object's keys a Go decoder would read as name.

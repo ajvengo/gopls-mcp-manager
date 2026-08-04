@@ -356,12 +356,14 @@ M2. Every read-modify-write is wrapped in an exclusive `flock` on
 
 The write is therefore skipped when it would change nothing — the steady state,
 a warm worktree whose record is present and still answering. The `fsync` in M1
-costs some sixty times everything else inside that lock — 5.5ms against 90µs
-for sixteen records (`BenchmarkWithRecords`) — and it is a lock every process
-on the machine shares.
+costs some forty times everything else inside that lock and up — around 6ms
+against 150µs for sixteen records, the ratio moving with how busy the disk is
+(`BenchmarkWithRecords`) — and it is a lock every process on the machine
+shares.
 The skip needs both halves of the question: equal records, *and* a read that
 dropped no lines, since M3's repair is otherwise owed and would never come.
-→ `FuzzReadMap`, `TestReadMapSkipsUnparseableLines`
+→ `TestWithRecordsWritesOnlyWhenTheFileWouldChange`, `FuzzReadMap`,
+`TestReadMapSkipsUnparseableLines`
 
 M3. **A line that cannot be parsed is skipped, not fatal.** Every command reads
 this file; one bad line must not lock the operator out of the tool. The next

@@ -398,16 +398,17 @@ func (m *manager) withRecords(body func([]record) ([]record, error)) ([]record, 
 //
 // Skipped entirely when body hands back what it was given, which is the steady
 // state: the write is a temp file, an fsync and a rename inside a lock every
-// process on the machine shares — some sixty times the rest of this function
-// (BenchmarkWithRecords). The intact flag is the other half of
-// the question: the lines readMap refused are gone from stored already, so
-// equal records do not mean an equal file, and only readMap can say whether the
-// repair is still owed.
+// process on the machine shares — some forty times the rest of this function
+// and up, the ratio moving with how busy the disk is (BenchmarkWithRecords).
+// The intact flag is the other half of the question: the lines readMap refused
+// are gone from stored already, so equal records do not mean an equal file, and
+// only readMap can say whether the repair is still owed.
 //
-// body must not mutate the slice it is handed. That slice is the comparison
-// basis, so a body editing it in place — slices.DeleteFunc does — would compare
-// its own result against itself, find no change, and leave the map saying what
-// it said before.
+// body is handed its own copy, because what it is given is also what its result
+// is compared against: a body editing in place — slices.DeleteFunc does — would
+// otherwise compare its result against itself, find no change, and leave the map
+// saying what it said before. Cloning here rather than asking every body to is
+// what keeps that from being a rule each caller has to know and none can test.
 func (m *manager) withMap(body func([]record) ([]record, error)) ([]record, error) {
 	var updated []record
 	err := withFileLock(m.mapPath, func() error {
@@ -415,7 +416,7 @@ func (m *manager) withMap(body func([]record) ([]record, error)) ([]record, erro
 		if err != nil {
 			return err
 		}
-		if updated, err = body(stored); err != nil {
+		if updated, err = body(slices.Clone(stored)); err != nil {
 			return err
 		}
 		if intact && slices.Equal(stored, updated) {
@@ -542,10 +543,8 @@ func (m *manager) claimPort(worktree string) (record, *os.Process, error) {
 // named and nothing else, on an error path that has already spent readyTimeout
 // and should not also probe every other worktree under the lock.
 func (m *manager) forget(started record) error {
-	// Cloned because DeleteFunc edits in place, and what it is handed is what
-	// withMap compares against to decide whether to write at all.
 	_, err := m.withMap(func(records []record) ([]record, error) {
-		return slices.DeleteFunc(slices.Clone(records), func(r record) bool { return r == started }), nil
+		return slices.DeleteFunc(records, func(r record) bool { return r == started }), nil
 	})
 	return err
 }
