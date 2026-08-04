@@ -100,11 +100,10 @@ func FuzzLogPath(f *testing.F) {
 
 // cleanRecords probes its records at once, so what it hands back is assembled
 // from a slice several goroutines wrote into by index. Three properties say
-// that assembly is right at any length, and each has its own cost: a record
-// offered twice is a second probe on somebody else's gopls under the map lock,
-// one never offered is a dead server whose only handle is silently kept, and a
-// reordered result would still round-trip through the file and still be wrong,
-// since forget matches by value.
+// that assembly is right at any length: every record offered, none offered
+// twice, and the order preserved — a reordered result would still round-trip
+// through the file and still be wrong, since forget matches by value. What each
+// failure costs is in the messages below.
 func FuzzCleanRecords(f *testing.F) {
 	f.Add(uint(0), uint64(0))
 	f.Add(uint(1), uint64(1))

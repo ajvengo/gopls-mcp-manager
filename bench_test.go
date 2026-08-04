@@ -15,13 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// The reader goroutine runs target for every message the client sends, and
-// nothing else routes while it does. It is not the throughput ceiling though:
-// reading that message off the transport costs several times more and allocates
-// two orders of magnitude more, the SDK's decoder taking a fresh 64KiB buffer
-// per message — see BenchmarkStdioCodec, and BenchmarkCallRoundTrip for what
-// the two come to together. Measured here so that nobody spends a diff on
-// routing before the decode above it.
+// benchRouter is the warm router the routing benchmarks below share.
 func benchRouter(b *testing.B) (*router, string) {
 	b.Helper()
 	dir := b.TempDir()
@@ -45,6 +39,13 @@ func fileCallParams(file string) json.RawMessage {
 // The whole routing decision for the message an agent sends most: unmarshal
 // plus the memo hit below. Its allocs/op is what says whether target still
 // gathers its path arguments into a slice before resolving them.
+//
+// The reader goroutine runs this for every message and nothing else routes
+// while it does — but it is not the throughput ceiling: reading the message off
+// the transport costs several times more and allocates two orders of magnitude
+// more, the SDK's decoder taking a fresh 64KiB buffer per message. See
+// BenchmarkStdioCodec, and BenchmarkCallRoundTrip for the two together, before
+// spending a diff on the routing rather than the decode above it.
 func BenchmarkTargetToolCall(b *testing.B) {
 	r, file := benchRouter(b)
 	req := &jsonrpc.Request{

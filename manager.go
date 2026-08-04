@@ -319,10 +319,6 @@ func recordAlive(r record) bool {
 	if err != nil && !errors.Is(err, syscall.EPERM) {
 		return false // already gone, nothing to kill
 	}
-	// A gopls between fork and bind refuses every probe, and a refusal is the
-	// one conclusive verdict below — so a sweep landing in that window would
-	// SIGTERM a server that is starting exactly as it should.
-	//
 	// Asked after the pid, not before: the grace is for a process that exists
 	// and has not bound yet, and a start that crashed instead is not that. Held
 	// off until the timestamp expired, such a record would answer every ensure
@@ -382,11 +378,10 @@ func portUnavailable(port int) bool {
 // withRecords runs body under the map's flock, over the records whose server is
 // still alive, and writes back what it returns.
 //
-// The write belongs here rather than to each caller because probing is what
-// reaps those servers: a caller that returned without writing would leave the
-// file claiming ports nothing holds. One write, so the caller that adds a
-// record does not fsync twice under the same lock — a cost every other
-// process's ensure queues behind.
+// The sweep is why a write happens at all: probing is what reaps dead servers,
+// so a caller that returned without writing would leave the file claiming ports
+// nothing holds. One write, so the caller that adds a record does not fsync
+// twice under the same lock — a cost every other process's ensure queues behind.
 func (m *manager) withRecords(body func([]record) ([]record, error)) ([]record, error) {
 	return m.withMap(func(stored []record) ([]record, error) { return body(cleanRecords(stored, m.alive)) })
 }
@@ -446,8 +441,7 @@ func (m *manager) ensure(worktree string) (int, error) {
 	}
 	// P6. A record inside its start grace was vouched for by L7 without being
 	// probed at all, so its port can still refuse: the gopls it names was forked
-	// by somebody who has not seen it bind yet. Waited for here rather than under
-	// the flock, so the wait costs only this caller (P4).
+	// by somebody who has not seen it bind yet. Waited for outside the flock (P4).
 	//
 	// Our own start is waited for on the fact rather than the clock: the grace
 	// would almost always cover it too, but "almost" would make the cleanup
@@ -606,8 +600,8 @@ func (m *manager) startGopls(worktree string, port int) (*os.Process, error) {
 }
 
 // awaitReady polls until the gopls just spawned on port serves its endpoint.
-// The caller signals the process it holds when this gives up: a bare kill(pid)
-// could land on whatever the kernel handed that number to next.
+// The caller signals the process it holds when this gives up, rather than the
+// recorded pid — see isOurGopls for why a bare pid is not enough.
 func awaitReady(port int) error {
 	deadline := time.Now().Add(readyTimeout)
 	// Backed off rather than polled flat: a gopls that binds 15ms after the fork

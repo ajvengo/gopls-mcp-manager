@@ -11,11 +11,8 @@ import (
 	"testing"
 )
 
-// The argument grammar is what decides between three commands, two of which
-// fork a gopls, and it is the last point at which a mistyped command line is
-// still cheap. The rows are the shapes that have a plausible reading run has to
-// refuse anyway: an unknown verb, and the two commands whose arity is not what
-// the caller assumed.
+// The argument grammar decides between three commands, two of which fork a
+// gopls, and it is the last point at which a mistyped command line is cheap.
 func TestRunRefusesCommandLinesItHasNoMeaningFor(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
