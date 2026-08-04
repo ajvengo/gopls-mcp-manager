@@ -111,9 +111,14 @@ hit, so a worktree removed mid-session — or a directory that becomes part of a
 different worktree, by being replaced with a linked one at the same path — keeps
 answering with what it resolved to first, until the routed gopls reports the
 path itself.
-Keying by directory neither causes that nor widens it: a path-keyed memo went
-stale the same way, and less evenly, since a file it had never seen would route
-somewhere its neighbours did not.
+
+The verbatim path argument is memoized **in front** of that, because reaching
+the directory memo is not free: `containingDir` lstats every component, which a
+profile put at two thirds of the routing path — time the reader goroutine spends
+routing nobody else's call. Two maps rather than one, so the directory memo's
+entry count stays exactly the number of `git` forks the session has paid for,
+which is what the tests assert on. Neither memo is invalidated and neither is
+bounded; the front one carries its own `ponytail:` note.
 → `TestWorktreeOfResolvesAndMemoizes` (cases "one directory, three spellings, one
   fork", "two worktrees stay apart across a memo hit");
   `TestWorktreePathResolvesEachPathToItsOwnWorktree`
@@ -406,7 +411,8 @@ fails, are skipped in order.
 
 Records are swept concurrently (L6). Within one record the steps run in order:
 
-1. `kill(pid, 0)` — `ESRCH` means gone; the record is dropped, nothing to kill.
+1. `kill(pid, 0)` — any error but `EPERM` means gone; the record is dropped,
+   nothing to kill.
 2. **Start grace (L7).** A record younger than the readiness budget plus 5 s
    (15 s today) is alive, full stop.
 3. HTTP probe of `127.0.0.1:<port>`, 500 ms, expecting `200` and
@@ -464,12 +470,15 @@ as long as the pid is still ours.
   dropped unsignalled")
 
 L4. The sweep writes its own result back, so a dead record disappears from the
-file as a side effect of any command that reaches a port — whatever the caller
-does next. `ensure` returning early, with no port allocatable or `gopls` failing
-to start, drops them just the same: the file is made to agree with the processes
-that exist at the moment the sweep decides which ones those are, not at the
-moment its caller happens to succeed.
-→ `TestListShowsLiveRecordsAndCleansDeadRecords`
+file as a side effect of any command that reaches a port. A body that returns an
+error is the exception: nothing is written, so `ensure` returning early — no port
+allocatable, or `gopls` failing to start — leaves the swept records in the file.
+Only the file, since the sweep signalled them under L2 before the failure; the
+next command re-probes corpses that answer nothing and drops them again. A
+`gopls` missing from `PATH` therefore keeps the same dead lines in the map until
+a command succeeds.
+→ `TestListShowsLiveRecordsAndCleansDeadRecords`,
+`TestWithRecordsWritesNothingWhenTheBodyRefuses`
 
 L6. **Records are swept concurrently**, so the liveness check has to be safe to
 call from several goroutines at once. The sweep runs inside M2's exclusive
@@ -552,7 +561,7 @@ P5. A gopls that never becomes ready has its record **dropped explicitly**,
 under the lock again, rather than left for the next sweep: L7 would spare it for
 a whole grace window, during which every `ensure` for that worktree would be
 answered with a port nothing listens on. Dropped by identity rather than by
-worktree and port: L2 makes the port deterministic in the worktree, so the port
+worktree and port: §7 makes the port deterministic in the worktree, so the port
 a failed start held is the one the next start is handed, and a process delayed
 past its own grace would otherwise delete the live record that replaced its own.
 → `TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady` drives a

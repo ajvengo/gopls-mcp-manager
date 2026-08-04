@@ -27,10 +27,8 @@ type fakeConn struct {
 	// onWrite replaces the default write, which is what almost every upstream
 	// these tests stub differs in: it fails, it answers out of the write itself,
 	// it dies first — and is a plain connection otherwise. The exception is
-	// brokenConn, which wraps one of these to fail a read instead. nil is the
-	// default, which queues the
-	// message on writes. A hook that wants the default for the messages it does
-	// not care about calls queue.
+	// brokenConn, which wraps one of these to fail a read instead. A hook that
+	// wants the default for messages it does not care about calls queue.
 	onWrite func(ctx context.Context, msg jsonrpc.Message) error
 }
 
@@ -61,9 +59,8 @@ func (c *fakeConn) queue(ctx context.Context, msg jsonrpc.Message) error {
 	case c.writes <- msg:
 		return nil
 	case <-ctx.Done():
-		// A real Connection honours its context, and the retried handshake in
-		// TestAWedgedUpstreamFailsItsCallWithinOneBudget hangs against one
-		// that does not: by then the shared deadline has already expired.
+		// See TestAWedgedUpstreamFailsItsCallWithinOneBudget, whose retried
+		// handshake reaches here with the shared deadline already expired.
 		return ctx.Err()
 	}
 }
@@ -151,8 +148,7 @@ func handshakeReady(r *router) {
 	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: json.RawMessage(clientInitializeParams)})
 }
 
-// sendCall puts a tools/call on l under a fresh id and hands the id back, which
-// is what every caller then asserts on.
+// sendCall puts a tools/call on l under a fresh id and hands the id back.
 func sendCall(t *testing.T, l *lane, name string) jsonrpc.ID {
 	t.Helper()
 	id := mustID(t, name)
@@ -266,8 +262,7 @@ func recvWithin[T any](ch <-chan T, wanted string) (T, error) {
 	}
 }
 
-// recvRequest insists the next message is a request naming method, which is the
-// shape every wait on a connection's writes has.
+// recvRequest insists the next message is a request naming method.
 func recvRequest(ch <-chan jsonrpc.Message, method string) (*jsonrpc.Request, error) {
 	msg, err := recvWithin(ch, method)
 	if err != nil {
@@ -349,7 +344,9 @@ func wantClientQuiet(t *testing.T, r *router, whatWouldBeWrong string) {
 // wantClientError is its twin: the bridge must answer a call nothing else will
 // ever answer, or a client without a timeout hangs on it forever. Same rule —
 // call it from inside a bubble.
-func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong string) {
+// Returns the response so a caller that cares which error it was can hand it to
+// wantWireError; most only care that the call was answered at all.
+func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong string) *jsonrpc.Response {
 	t.Helper()
 	synctest.Wait()
 	select {
@@ -364,8 +361,10 @@ func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong st
 		if resp.Error == nil {
 			t.Errorf("call %v was answered without an error", id)
 		}
+		return resp
 	default:
 		t.Fatal(whatWouldBeWrong)
+		return nil
 	}
 }
 
@@ -465,7 +464,10 @@ func TestAMessageBeforeInitializeNeverWakesALane(t *testing.T) {
 		want func(t *testing.T, r *router)
 	}{
 		{"request is refused", &jsonrpc.Request{ID: id, Method: "tools/call"}, func(t *testing.T, r *router) {
-			wantClientError(t, r, id, "a tools/call before initialize was left unanswered")
+			resp := wantClientError(t, r, id, "a tools/call before initialize was left unanswered")
+			// The code, not just the failure: H1a names it, and nothing else here
+			// would notice it drifting to a generic internal error.
+			_ = wantWireError(t, resp, jsonrpc.CodeInvalidRequest)
 		}},
 		{"notification is dropped", &jsonrpc.Request{Method: "notifications/initialized"}, func(t *testing.T, r *router) {
 			wantClientQuiet(t, r, "a notification sent before initialize was answered")
@@ -930,8 +932,8 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 			r.readFromUpstream(conn, testWorktree)
 		}()
 
-		// Not sendCall: instantConn was built around this exact id, and minting a
-		// second one from the same string would only hide that.
+		// Not sendCall: this conn's onWrite is built around this exact id, and
+		// minting a second one from the same string would only hide that.
 		l.send(&jsonrpc.Request{ID: id, Method: "tools/call"})
 		close(conn.reads) // the upstream dies once the call is long since answered
 		mustRecv(t, done, "the upstream reader to finish")
@@ -1033,8 +1035,7 @@ func TestUpstreamRootsAnsweredWithItsOwnWorktree(t *testing.T) {
 // under a directory that does not exist yet must not climb to the grandparent
 // and resolve against a tree the caller never named.
 //
-// One repository pair for every row: newLinkedWorktree forks git three times,
-// and none of these rows can see another's paths.
+// One repository pair for every row, because none of them writes.
 func TestWorktreePathResolvesEachPathToItsOwnWorktree(t *testing.T) {
 	t.Parallel()
 	root, linked := newLinkedWorktree(t)
@@ -1149,6 +1150,11 @@ func TestToolCallSpanningTwoWorktreesIsRefused(t *testing.T) {
 
 	r := newTestRouter(t, testHome)
 	handshakeReady(r)
+	// Seeded so the refusal has something to damage: R2a leaves sticky alone,
+	// the call having picked no worktree, and a refusal that reset it would send
+	// the next path-less call home instead of where the client was working.
+	const working = "/repo/where-the-client-was"
+	r.sticky = working
 	id := mustID(t, "spanning-call")
 	arguments := `{"files":[` + strconv.Quote(filepath.Join(linked, "main.go")) + `,` + strconv.Quote(filepath.Join(root, "main.go")) + `]}`
 	r.route(&jsonrpc.Request{ID: id, Method: "tools/call", Params: json.RawMessage(`{"arguments":` + arguments + `}`)})
@@ -1166,6 +1172,9 @@ func TestToolCallSpanningTwoWorktreesIsRefused(t *testing.T) {
 	}
 	if len(r.lanes) != 0 {
 		t.Fatalf("refused call opened %d lane(s), want none", len(r.lanes))
+	}
+	if r.sticky != working {
+		t.Fatalf("sticky = %q after a refused call, want %q left untouched", r.sticky, working)
 	}
 }
 
@@ -1378,8 +1387,8 @@ func TestCancellationFollowsTheRequestToItsUpstream(t *testing.T) {
 // A retry places the call on a fresh connection, and its cancellation route has
 // to come back with it. claim() ends the failed attempt by dropping the id's
 // record whole, so a track() that restored only the ownership would leave the
-// client's cancellation routed home — naming an id home never issued, while the
-// gopls actually running the call never hears it.
+// client's cancellation routed home, which is the failure
+// TestCancellationFollowsTheRequestToItsUpstream describes.
 func TestCancellationFollowsACallOntoItsRetryConnection(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		fresh := newHandshakingConn()

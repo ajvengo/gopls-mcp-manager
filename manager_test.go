@@ -97,10 +97,6 @@ func TestCleanRecordsProbesEveryRecordAtOnce(t *testing.T) {
 	})
 }
 
-// mustWriteMap and mustReadMap keep the map file itself out of the way: every
-// test below either seeds records or reads them back, and for all but
-// TestReadMapSkipsUnparseableLines — which is about the read failing or not —
-// neither step is what the test is asking about.
 func mustWriteMap(t *testing.T, path string, records []record) {
 	t.Helper()
 	if err := writeMap(path, records); err != nil {
@@ -144,8 +140,7 @@ func wantRecords(t *testing.T, path string, whatWouldBeWrong string, want ...rec
 	}
 }
 
-// newTestManager returns a manager over a map file of its own, which is what
-// every test below reads and writes through.
+// newTestManager returns a manager over a map file of its own.
 func newTestManager(tb testing.TB) manager {
 	tb.Helper()
 	return manager{mapPath: filepath.Join(tb.TempDir(), "gopls-ports.map"), alive: recordAlive, ready: awaitReady}

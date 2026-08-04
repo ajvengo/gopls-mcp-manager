@@ -461,7 +461,6 @@ func (r *router) cancelTarget(params json.RawMessage) string {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// An id nobody owes yields "", which is already how this reports "no answer".
 	// Whether that worktree still has an upstream to tell is deliberately not
 	// asked: the lane owns its connection and is the only party whose answer
 	// cannot already be stale by the time it is acted on, so it decides — see
@@ -470,9 +469,8 @@ func (r *router) cancelTarget(params json.RawMessage) string {
 }
 
 func (l *lane) send(req *jsonrpc.Request) {
-	// Only the first home connection receives the client's own initialize; see
-	// upstream. Derived here rather than passed in, so that the id and the
-	// message it is sent with cannot disagree.
+	// Derived here rather than passed in, so that the id and the message it is
+	// sent with cannot disagree; see upstream for the one-initialize rule.
 	id, initial := req.ID, req.Method == "initialize"
 	// One budget for both attempts, because the retry redials: a per-attempt
 	// deadline would let a wedged upstream stall the client twice over.
@@ -530,8 +528,6 @@ func (l *lane) send(req *jsonrpc.Request) {
 			return
 		}
 	}
-	// A notification has nowhere to report a failure to, which refuse is what
-	// already knows.
 	l.r.refuse(req, jsonrpc.CodeInternalError, "gopls for %s: %v", l.worktree, err)
 }
 
@@ -611,9 +607,7 @@ func (l *lane) cache(conn mcp.Connection) {
 //
 // A connection is initialized exactly once, and this is where that holds: it is
 // answered from the state of the connection, not from the order the client's
-// messages happened to arrive in. Either branch below hands back an upstream
-// that has had its one initialize — the private replay for every message but
-// the client's own, and the caller's own write for that one.
+// messages happened to arrive in.
 func (l *lane) upstream(ctx context.Context, initial bool) (mcp.Connection, error) {
 	if l.conn != nil {
 		if initial {
@@ -675,9 +669,7 @@ func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 		cancel()
 		return nil, err
 	}
-	// Not cancelled here: this context is the connection's for as long as it
-	// lives. It is handed to the connection instead, which releases it when it
-	// is closed.
+	// Handed to the connection, which releases it on Close — see boundedConn.
 	return &boundedConn{Connection: conn, release: cancel}, nil
 }
 
@@ -803,11 +795,10 @@ func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error)
 // answeredUpstream handles a server-initiated request here rather than passing
 // it to the client, and reports whether it did.
 //
-// Every read loop that can see one has to call this: a roots/list slipping
-// through to the client comes back naming the tree the session opened in, the
-// whole failure this bridge exists to prevent. Anything else is refused —
-// an upstream holding an unanswerable question waits forever, so a definite
-// error is the kinder reply.
+// Every read loop that can see one has to call this — see answerRoots for what
+// goes wrong when a roots/list reaches the client. Anything else is refused: an
+// upstream holding an unanswerable question waits forever, so a definite error
+// is the kinder reply.
 //
 // ctx is the caller's budget for talking to conn: the handshake answers roots
 // inside its deadline (S2), a running reader has only the session.
@@ -988,11 +979,8 @@ func worktreePath(ctx context.Context, input string) (string, error) {
 // serve. The timeout stays on top of it, because the caller's context may have
 // no deadline at all.
 func worktreeOfDir(ctx context.Context, dir string) (string, error) {
-	// Bounded, because this runs on the goroutine that reads the client: a git
-	// that never returns — a stalled network filesystem is enough — would wedge
-	// the session with neither side timing out, which is the failure H5 bounds
-	// for the handshake. Generous, since rev-parse reads no tree: only a hang
-	// should ever reach it.
+	// Generous, since rev-parse reads no tree: only a hang should ever reach it —
+	// the same failure H5 bounds for the handshake.
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// git -C resolves its own cwd physically, so the toplevel it prints already

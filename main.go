@@ -25,7 +25,7 @@ func run(args []string, stdout io.Writer) error {
 	if len(args) > 1 {
 		command = args[1]
 	}
-	usage := fmt.Errorf("usage: %s [bridge|ensure] [absolute-worktree-path] | list", args[0])
+	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | list", args[0])
 	switch command {
 	case "list":
 		if len(args) != 2 {
