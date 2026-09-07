@@ -19,8 +19,12 @@ import (
 func benchRouter(b *testing.B) (*router, string) {
 	b.Helper()
 	dir := b.TempDir()
-	// TempDir on darwin hands back /var/... which is a symlink to /private/var,
-	// so a real EvalSymlinks walk happens here just as it does in a session.
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	// Use the same physical spelling for existing and nonexistent fixture files.
+	// Symlink memo consistency is covered separately by the routing tests.
 	file := filepath.Join(dir, "main.go")
 	mustWriteFile(b, file, "package main\n")
 	r := newTestRouter(b, dir)
@@ -228,13 +232,13 @@ func BenchmarkWithRecords(b *testing.B) {
 			m := newTestManager(b)
 			// Every record answers alive without a syscall: the probes are another
 			// benchmark's subject, and a real one here would drown the file work.
-			m.alive = func(record) bool { return true }
+			m.alive = func(context.Context, record) bool { return true }
 			if err := writeMap(m.mapPath, records); err != nil {
 				b.Fatal(err)
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := m.withRecords(bench.body); err != nil {
+				if _, err := m.withRecords(b.Context(), bench.body); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -290,7 +294,7 @@ func BenchmarkSweepProbes(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				cleanRecords(records, recordAlive)
+				cleanRecords(records, func(r record) bool { return recordAlive(b.Context(), r) })
 			}
 		})
 	}

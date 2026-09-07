@@ -61,8 +61,9 @@ Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
   own working directory rather than yours. gopls' schemas ask for absolute paths.
 - **Calls with no usable path** (`go_workspace`, `go_search`, `go_package_api`)
   follow the sticky worktree, falling back to home.
-- **A cancellation follows the call it names**, reaching the gopls that owes that
-  request id rather than home.
+- **A cancellation follows the call it names.** Queued or dialling calls are
+  cancelled locally. Delivered calls use a separate bounded control queue to
+  reach the exact connection that owes their request id.
 - Everything else that is not a `tools/call` goes to home.
 
 Resolution shells out to `git rev-parse --show-toplevel`, so answers are
@@ -83,12 +84,19 @@ each directory costs one `git` fork however many files you name in it.
   come back as errors rather than hanging, since MCP clients have no timeout.
 - **Each worktree gets its own lane**, so starting a cold worktree — a lock wait,
   a `gopls` spawn, a handshake — costs that worktree's calls and nobody else's.
-- **Each client message is bounded** at 30 s (the readiness budget plus 20 s),
-  retry included, so a gopls that accepts the connection and then says nothing
-  fails that call instead of wedging the worktree for the session. It does not
-  bound the answer: a gopls that takes a call and then goes quiet *without*
+- **Each admitted message has a 30 s delivery budget**, including queue time,
+  lock acquisition, readiness, handshake and retry. An expired queued call
+  cannot start a server. Filesystem syscalls cannot be interrupted by a Go
+  context, and failed-child cleanup has a separate short budget. The budget
+  does not bound the answer after delivery: a gopls that goes quiet without
   dying still leaves its caller waiting.
+- **A full worktree queue rejects requests** with an overload error instead of
+  blocking other worktrees. Each delivery and cancellation queue holds 64
+  messages. Notifications are advisory and are dropped when their queue is full.
 - The bridge stops when the stdio client goes away, or on `^C` / `SIGTERM`.
+  It waits for owned failed-child cleanup before exiting: SIGTERM, up to 2 s,
+  then SIGKILL and up to 2 s to confirm exit. A failed child's record is removed
+  only after exit is confirmed, with up to 2 s to acquire the cleanup lock.
 
 SPEC.md §3–§5 has the rest: which party may answer a call, what the private
 handshake ids are for, and what the budget deliberately excludes.

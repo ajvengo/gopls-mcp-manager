@@ -24,7 +24,7 @@ For each message read from the client:
 | --- | --- |
 | `tools/call` whose `file`, `dir` or `files[i]` resolves to a worktree | that worktree; it becomes sticky |
 | `tools/call` with no such argument | sticky, else home |
-| `notifications/cancelled` naming a request still in flight | the worktree it was routed to, which drops it if it has no upstream left |
+| `notifications/cancelled` naming a request still in flight | cancel queued/dialling delivery locally, otherwise forward on the owning connection's control queue |
 | any other request or notification | home |
 | anything but `initialize`, before the client's `initialize` | refused, or dropped if it is a notification (H1a) |
 | a response | dropped |
@@ -70,8 +70,13 @@ part of: a first-touch path on a stalled filesystem still costs every worktree
 up to that subprocess's 10 s. Choosing has to be serialized there — sticky (R3)
 and the cancel-behind-its-call ordering (R7) both depend on it — so what the
 lanes removed is the `flock` wait, the spawn and the handshake, not every way one
-worktree can delay another. A lane's queue is 64 deep, which is the other.
-→ `TestAColdWorktreeDoesNotHoldUpAnother`
+worktree can delay another. A lane's queue is 64 deep; admission never waits for
+space. Requests exceeding that capacity receive overload error -32000, and
+notifications exceeding it are dropped. Queue time counts against H5's budget.
+Expired queued calls fail without dialling an upstream.
+→ `TestAColdWorktreeDoesNotHoldUpAnother`,
+  `TestFullLaneRejectsWithoutBlockingOtherWorktrees`,
+  `TestQueuedDeliveryExpiresWithoutDialling`
 
 R4. **A linked worktree is a distinct destination**, and a nested directory
 resolves to the worktree containing it. Resolution goes through
@@ -82,9 +87,13 @@ directory, so its parent would be the link's own, and a link pointing into
 another worktree would route to the tree holding the link rather than the tree
 holding the code. A linked *directory* needs no help — `git -C` resolves its
 cwd physically — but a linked file never reaches git, since only its parent is
-passed. Resolution that fails leaves the argument untouched rather than
-rejecting it: `EvalSymlinks` requires every component to exist, and R2 turns on
-a path under an existing directory still resolving. The subprocess is bounded at
+passed. When the whole path cannot be resolved, its immediate parent is resolved
+if that parent exists. Existing and missing files under a symlinked directory
+therefore share one physical memo key. A missing parent is never climbed past,
+which preserves R2.
+→ `TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles`
+
+ The subprocess is bounded at
 10 s, for the same reason H5 bounds the handshake: it runs on the goroutine that
 reads the client, so a `git` wedged on an unresponsive filesystem would otherwise
 stall the session for good. On expiry the path is simply unresolvable, which is
@@ -127,44 +136,28 @@ R6. **The client never sends a response the bridge needs.** `roots/list` is
 answered locally and every other server-initiated request is refused, so a
 response from the client answers nothing and is discarded.
 
-R7. **A cancellation follows its request, not the default route.** Home has
-never issued an id belonging to another worktree, so a `notifications/cancelled`
-delivered there is dropped while the gopls actually running the call keeps
-going. An id nobody owes — answered, cancelled twice, unparseable — routes home
-as before, where it is equally harmless.
-
-**The destination is bound when the call is routed**, not when its lane finally
-writes it. Both messages pass through the reader in the client's own order, so
-there the answer always exists; bound at the write instead, a cancellation
-arriving while its call is still queued behind a cold start — the slowest
-moment, and so the likeliest one for a client to give up — would find nothing
-owed and go home, naming an id home never issued.
-
-The route is therefore recorded on the same in-flight entry F3 keeps, alongside
-the connection rather than in a table of its own — it is simply known strictly
-earlier, when routing has picked a worktree and no lane has a connection to name
-yet, so the entry carries a worktree and a nil connection until a write is
-placed. One entry rather than two is what stops the route and the connection
-disagreeing about whether a call is in flight: they are dropped in one delete,
-and a retry that just ended its failed attempt re-records both in one write.
-Between the two the call is nowhere, and a cancellation arriving there goes
-home. No upstream holds the call in that window — but the retry places it a
-moment later, so the cancellation is not merely late, it is lost, and the call
-runs to completion. Accepted rather than fixed: the window is two statements
-wide on a single goroutine, and holding cancellations for ids mid-retry would
-need a second table to answer a question MCP treats as advisory anyway.
+R7. **A cancellation follows its request, not the default route.** Ownership is
+recorded at queue admission. If delivery is still queued or dialling, cancellation
+ends its delivery context; the lane fails the call with error -32800 without
+sending it. Unknown or malformed cancellation ids are dropped.
 → `TestCancellationFindsACallItsLaneHasNotSentYet`,
-  `TestCancellationFollowsACallOntoItsRetryConnection`
+  `TestQueuedCancellationPreventsDelivery`, `TestDeliveryCancellationStopsADial`
 
-**A cancellation never opens a connection.** Dialling one would have `ensure`
-spawn a whole gopls to hand it a cancellation for a call it never received. The
-lane decides this, not the routing: it owns its connection, so it is the only
-party whose answer cannot already be stale by the time it is acted on. Routing
-therefore sends the notification to the worktree that owes the id whether or not
-its upstream is still there, and a lane with none drops it. Nothing is stranded
-— the call died with the connection, and that connection's reader failed it (F2).
-→ `TestCancellationFollowsTheRequestToItsUpstream`,
+Once a connection is assigned, cancellation uses a separate 64-message control
+queue carrying that exact connection. It cannot open a connection, block the
+client reader on lane capacity, or overtake the target call's write. A full
+control queue drops excess notifications; control delivery has a 30 s budget.
+→ `TestCancellationBypassesFullDeliveryQueue`,
+  `TestFullControlQueueDoesNotBlockRouting`, `TestCancellationCannotOvertakeItsCall`,
   `TestCancellationForADisconnectedUpstreamIsDroppedNotDialled`
+
+A retry restores cancellable ownership before dialling. The brief interval
+between claiming the failed attempt and restoring the entry can still lose an
+advisory cancellation. A control already bound to the failed connection is not
+retargeted to the replacement. Delivered calls remain the upstream's to answer;
+cancellation does not synthesize their final response.
+→ `TestCancellationFollowsTheRequestToItsUpstream`,
+  `TestCancellationFollowsACallOntoItsRetryConnection`
 
 ## 3. Handshake
 
@@ -215,9 +208,9 @@ goroutine, so an upstream that accepts the connection and then answers nothing
 would stall every later call to that worktree for the rest of the session, with
 neither side timing out — and §8 deliberately keeps such a server alive, so
 `ensure` hands one back. A budget already spent cancels F1's retry
-rather than restarting it: redialling would pay §10's unbounded `flock` wait to
-reach a handshake that expires on its first write. The deadline covers the
-handshake, including the roots S2 answers inside it.
+rather than restarting it. The deadline starts at queue admission and covers
+lock acquisition, readiness, connect, handshake, roots replies and delivery.
+Cleanup of an owned failed child has its own budget (P2a).
 → `TestAWedgedUpstreamFailsItsCallWithinOneBudget`
 
 H6. **The connect is bounded by the same deadline**, and separately from the
@@ -230,8 +223,12 @@ that would cut a healthy upstream loose the moment the budget expired, which is
 the failure H5 exists to prevent. So the context is cancellable, only a
 watchdog cancels it, and the watchdog is disarmed the moment the dial returns;
 a connection handed back after it fired is closed, since its stream is already
-unreadable. What this bounds is the connect alone. `ensure`'s `flock` takes no
-context and stays unbounded (§10).
+unreadable. The same cancellation reaches `ensure`: lock acquisition uses
+nonblocking flock retries, HTTP probes carry the context, ps has a one-second
+ceiling, and readiness polls wait on the context. A cancelled sweep writes
+nothing and does not treat cancellation as evidence against a shared server.
+→ `TestEnsureCancelledAtLockDoesNotSpawn`, `TestCancelledSweepPreservesRecords`,
+  `TestReadinessProbeHonoursCancellation`
 
 **The context is the connection's, and is released with it.** Surviving the dial
 is not the same as surviving the session: the connection is what still needs it,
@@ -246,8 +243,8 @@ H7. **Delivering the call is bounded by the same deadline too**, for the same
 reason and against the same server. The SSE transport delivers a message as an
 HTTP POST on a client carrying no timeout of its own, so under the session
 context alone a server that takes the POST and never completes it parks its lane
-on that one call for the rest of the session — and the calls queueing behind it
-eventually fill the lane and stall the reader for every other worktree. Only the
+on that one call. Subsequent calls can fill the bounded lane queue, at which
+point excess requests are refused rather than blocking other worktrees. Only the
 delivery is covered; how long gopls then takes to answer is its own business and
 stays unbounded (§10).
 
@@ -280,7 +277,7 @@ S4. **Every other server-initiated request is answered with
 → `TestUnroutableUpstreamRequestIsRefusedNotForwarded`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
-lane also writes to. `mcp.Connection` documents `Write` as safe to call
+lane also writes to. The cancellation control worker is another writer. `mcp.Connection` documents `Write` as safe to call
 concurrently and `Close` as safe alongside a blocked `Read`, and both
 implementations in use honour it: `sseClientConn.Write` shares nothing but an
 `*http.Client` and a mutex-guarded closed flag, and `ioConn.Write` serialises on
@@ -341,8 +338,10 @@ path clears `lane.conn` while its reader is still winding down.
 → `TestSendRetriesInitialInitializeWithoutPrivateHandshake` (the retry, which
   only a single-goroutine first attempt can reach)
 
-F6. Only the stdio client going away stops the bridge. `io.EOF`,
-`context.Canceled` and `ErrConnectionClosed` exit zero.
+F6. The stdio client going away or the session context being cancelled stops
+the bridge. `io.EOF`, `context.Canceled` and `ErrConnectionClosed` exit zero.
+Shutdown cancels delivery, closes lane queues and waits for lanes to finish
+owned failed-child cleanup (P2a).
 
 ## 6. Port map file
 
@@ -358,6 +357,8 @@ and an exotic umask could leave the file unreadable to its own writer.
 
 M2. Every read-modify-write is wrapped in an exclusive `flock` on
 `<map>.lock`, so concurrent `bridge`/`ensure`/`list` processes serialize.
+Acquisition uses nonblocking attempts separated by cancellable 10 ms waits.
+All three CLI commands install signal cancellation before reaching the lock.
 
 The write is therefore skipped when it would change nothing — the steady state,
 a warm worktree whose record is present and still answering. The `fsync` in M1
@@ -431,6 +432,7 @@ Records are swept concurrently (L6). Within one record the steps run in order:
      every record in the sweep at once.
 4. Identity, by `ps`: does that pid still run a `gopls` whose command line
    contains our listen address?
+   - ps failed or the operation was cancelled → keep the record; no signal
    - inconclusive **and** ours → alive; the record is kept, nothing is signalled
      → `TestRecordAlive` (cases "a server that only timed out is spared",
        "a server answering 503 is spared")
@@ -532,22 +534,19 @@ running. On timeout the child is signalled
 through its `*os.Process`, which knows whether the reaper already collected it;
 a bare `kill(pid)` could land on a recycled pid.
 
-P2a. **That `SIGTERM` is escalated to `SIGKILL` after 2 s.** Dropping the record
-(P5) is what makes the pid unfindable — no sweep can reach a process the map no
-longer names — so a gopls that sits in its `SIGTERM`, wedged in filesystem I/O
-being enough, would run unowned until reboot, holding its port and its 1–2 GB
-against a worktree whose next `ensure` starts a second one beside it. That is
-exactly the leak L2 exists to prevent, arrived at from the other side. The
-escalation is fired off a timer rather than waited for, so the lane is not
-parked for another 2 s on a path that has already spent the full readiness
-budget; the window it leaves is this process exiting first, which costs what
-the bare `SIGTERM` already cost. A process that has already gone answers with an
-`ESRCH` nobody hears, and P1's reaper turns the corpse into an exit status
-either way.
+P2a. **Failed-child cleanup completes before return.** Send SIGTERM, wait up to
+2 s for reaping, then SIGKILL and wait up to another 2 s. This uses the owned
+process handle and its reaper's done channel, independent of request cancellation.
+The CLI and bridge shutdown therefore cannot abandon a delayed escalation.
+If exit cannot be confirmed, return an error naming the pid and retain any
+existing registry record. Once exit is confirmed, forgetting has an independent
+2 s lock-acquisition budget; a failed forget leaves a dead record for a later sweep.
+→ `TestFailedChildIsReapedBeforeReturn`
 
-P3. `startGopls` returns the `*os.Process`, so `ensure`'s write-failure path
-signals the handle it holds instead of re-deriving identity through `ps` — a
-check that could only refuse and leak the process it just started.
+P3. `startGopls` returns a child handle containing `*os.Process` and proof of
+reaping. Map-write failure uses the same termination procedure, since the child
+has no persisted record. Cancellation is checked before spawn; the running
+shared server is not tied to the request context.
 
 P4. **The map lock is released before the readiness wait.** Held across it, one
 cold start made every other `gopls-mcp-manager` process — and so every other
@@ -557,7 +556,8 @@ is dropped is what makes this safe: it reserves the port, and L7 keeps another
 process's sweep off the server until it has bound.
 → `TestClaimPortReturnsBeforeItsGoplsIsReady`
 
-P5. A gopls that never becomes ready has its record **dropped explicitly**,
+P5. An owned gopls that never becomes ready has its record **dropped after
+confirmed exit**,
 under the lock again, rather than left for the next sweep: L7 would spare it for
 a whole grace window, during which every `ensure` for that worktree would be
 answered with a port nothing listens on. Dropped by identity rather than by
@@ -581,7 +581,8 @@ to do for this caller, and skipping it hands the very next dial an
 the process that started it — that one signals and forgets — so this caller only
 reports it.
 → `TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`,
-  `TestEnsureLeavesAnotherProcessesFailedStartAlone`
+  `TestEnsureLeavesAnotherProcessesFailedStartAlone`,
+  `TestCancelledReadinessLeavesAnotherProcessesServerAlone`
 
 P7. Concurrent `ensure` calls for one worktree start **one** gopls between them:
 M2's `flock` covers the sweep, the allocation, the spawn and the record write as
@@ -590,13 +591,12 @@ one step, so no second caller can see the port free while a spawn is in flight.
 
 ## 10. Known limits
 
-- A cold start no longer blocks anyone (P4, R3a), but the `flock` it does take
-  is still unbounded: `flock` has no context form, so a lane parked on it is
-  parked until whoever holds the lock lets go. The readiness poll behind it
-  takes no context either, so a cancelled session leaves that lane polling out
-  its budget. That is one worktree's lane rather than the whole session, and it
-  is why `closeLanes` does not wait for its lanes to finish — nothing does, so
-  the wait costs the exit nothing.
+- Delivery waits observe cancellation, but filesystem operations such as stat,
+  open, fsync and rename cannot be interrupted by a Go context. Path resolution
+  still runs before queue admission on the shared reader. Failed-child cleanup
+  can take up to 4 s for termination/reaping plus 2 s for the registry lock,
+  beyond the delivery deadline. If the OS cannot reap a killed child in that
+  window, the error names its pid; an existing record is retained.
 - **A worktree path must be valid UTF-8.** A Unix path is arbitrary bytes, but
   the map file is JSON, and `json.Marshal` replaces invalid UTF-8 with U+FFFD
   rather than failing. Such a record would read back naming a worktree nobody
@@ -615,9 +615,10 @@ one step, so no second caller can see the port free while a spawn is in flight.
   that far, and neither ends the record. What the bounds buy is that the lane
   fails each call and stays usable, rather than parking on the first one for the
   rest of the session.
-- A worktree with more than 64 calls outstanding fills its lane's queue, and the
-  reader waits on it — the one case where one worktree can still hold up
-  another.
+- Delivery and control queues each hold 64 pending messages per lane. Excess
+  requests fail with overload; excess notifications are dropped. Control
+  forwarding remains advisory and can time out. A client that stops reading
+  responses can still backpressure the shared output queue.
 - **Nothing bounds a call once it has been written.** H5 covers the handshake
   only; past it, the answer is whatever `readFromUpstream` reads, under the
   session context alone. An upstream that takes a `tools/call` and then neither

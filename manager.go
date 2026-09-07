@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -64,11 +65,12 @@ type record struct {
 
 type manager struct {
 	mapPath string
-	alive   func(record) bool // recordAlive; replaced by tests, and called concurrently — see cleanRecords
+	alive   func(context.Context, record) bool // called concurrently by cleanRecords
 	// ready is awaitReady, replaced by tests: what it waits out is readyTimeout,
 	// and ensure's failure path is otherwise ten seconds of sleeping away from
 	// every assertion about it.
-	ready func(port int) error
+	ready func(context.Context, int) error
+	start func(context.Context, string, int) (*childProcess, error)
 }
 
 // gopls is resolved by startGopls, not here: list's whole job is to find and
@@ -81,11 +83,13 @@ func newManager() (*manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &manager{
+	m := &manager{
 		mapPath: filepath.Join(home, ".local", "share", "gopls-ports.map"),
 		alive:   recordAlive,
 		ready:   awaitReady,
-	}, nil
+	}
+	m.start = m.startGopls
+	return m, nil
 }
 
 func basePort(worktree string) int {
@@ -242,7 +246,10 @@ func writeMap(path string, records []record) error {
 	return os.Rename(tmpPath, path)
 }
 
-func withFileLock(path string, fn func() error) error {
+func withFileLock(ctx context.Context, path string, fn func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -251,11 +258,37 @@ func withFileLock(path string, fn func() error) error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return err
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+		if err := waitContext(ctx, 10*time.Millisecond); err != nil {
+			return err
+		}
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return fn()
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 // Short, because waiting longer buys nothing: an answer that never comes is not
@@ -269,9 +302,9 @@ var probeClient = &http.Client{Timeout: 500 * time.Millisecond}
 // endpointProbe reports whether the MCP endpoint on port answered, and whether
 // a negative answer is conclusive. Only a refused connection is, because only
 // that one means nobody is listening; §8 has the rest of the argument.
-func endpointProbe(port int) (alive, conclusive bool) {
+func endpointProbe(ctx context.Context, port int) (alive, conclusive bool) {
 	// The url is ours and fixed, so NewRequest cannot reject it.
-	req, _ := http.NewRequest(http.MethodGet, mcpURL(port), nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, mcpURL(port), nil)
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := probeClient.Do(req)
 	if err != nil {
@@ -314,7 +347,10 @@ func withinStartGrace(r record) bool {
 // Every caller sweeps every record, so this runs against other worktrees'
 // servers too, and an unsure verdict keeps its server rather than killing it: a
 // wrong kill costs a full re-index of a tree nobody was even asking about.
-func recordAlive(r record) bool {
+func recordAlive(ctx context.Context, r record) bool {
+	if ctx.Err() != nil {
+		return true // cancellation is no evidence against a shared server
+	}
 	err := syscall.Kill(r.PID, 0)
 	if err != nil && !errors.Is(err, syscall.EPERM) {
 		return false // already gone, nothing to kill
@@ -326,7 +362,7 @@ func recordAlive(r record) bool {
 	if withinStartGrace(r) {
 		return true
 	}
-	alive, conclusive := endpointProbe(r.Port)
+	alive, conclusive := endpointProbe(ctx, r.Port)
 	if alive {
 		return true
 	}
@@ -337,7 +373,10 @@ func recordAlive(r record) bool {
 	// kept as alive: a port some unrelated listener took over, after a reboot
 	// recycled the pid too, would leave this worktree pointed at it until the
 	// map is edited by hand.
-	ours := isOurGopls(r.PID, r.Port)
+	ours, identityErr := isOurGopls(ctx, r.PID, r.Port)
+	if identityErr != nil || ctx.Err() != nil {
+		return true
+	}
 	if !conclusive {
 		return ours // merely busy or answering oddly, or a stale number
 	}
@@ -361,9 +400,11 @@ func recordAlive(r record) bool {
 // (BenchmarkSweepProbes), inside the map's flock. `ps -p` takes a list, so the
 // whole sweep is one fork if that ever matters; it costs cleanRecords a batching
 // pass before the fan-out, and it only runs when a gopls has actually died.
-func isOurGopls(pid, port int) bool {
-	out, err := exec.Command("ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
-	return err == nil && strings.Contains(string(out), goplsBinary) && strings.Contains(string(out), mcpAddress(port))
+func isOurGopls(ctx context.Context, pid, port int) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	return strings.Contains(string(out), goplsBinary) && strings.Contains(string(out), mcpAddress(port)), err
 }
 
 func portUnavailable(port int) bool {
@@ -382,8 +423,14 @@ func portUnavailable(port int) bool {
 // so a caller that returned without writing would leave the file claiming ports
 // nothing holds. One write, so the caller that adds a record does not fsync
 // twice under the same lock — a cost every other process's ensure queues behind.
-func (m *manager) withRecords(body func([]record) ([]record, error)) ([]record, error) {
-	return m.withMap(func(stored []record) ([]record, error) { return body(cleanRecords(stored, m.alive)) })
+func (m *manager) withRecords(ctx context.Context, body func([]record) ([]record, error)) ([]record, error) {
+	return m.withMap(ctx, func(stored []record) ([]record, error) {
+		live := cleanRecords(stored, func(r record) bool { return m.alive(ctx, r) })
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return body(live)
+	})
 }
 
 // withMap runs body under the map's flock, over what the file holds, and writes
@@ -404,11 +451,14 @@ func (m *manager) withRecords(body func([]record) ([]record, error)) ([]record, 
 // otherwise compare its result against itself, find no change, and leave the map
 // saying what it said before. Cloning here rather than asking every body to is
 // what keeps that from being a rule each caller has to know and none can test.
-func (m *manager) withMap(body func([]record) ([]record, error)) ([]record, error) {
+func (m *manager) withMap(ctx context.Context, body func([]record) ([]record, error)) ([]record, error) {
 	var updated []record
-	err := withFileLock(m.mapPath, func() error {
+	err := withFileLock(ctx, m.mapPath, func() error {
 		stored, intact, err := readMap(m.mapPath)
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if updated, err = body(slices.Clone(stored)); err != nil {
@@ -434,8 +484,8 @@ func (m *manager) withMap(body func([]record) ([]record, error)) ([]record, erro
 // precisely the case worktree isolation produces. The record written before the
 // lock is dropped is what makes that safe: it reserves the port, and startGrace
 // keeps a concurrent sweep from reaping a server that has not bound yet.
-func (m *manager) ensure(worktree string) (int, error) {
-	claimed, started, err := m.claimPort(worktree)
+func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
+	claimed, started, err := m.claimPort(ctx, worktree)
 	if err != nil {
 		return 0, err
 	}
@@ -450,7 +500,7 @@ func (m *manager) ensure(worktree string) (int, error) {
 	if started == nil && !withinStartGrace(claimed) {
 		return claimed.Port, nil
 	}
-	if err := m.ready(claimed.Port); err != nil {
+	if err := m.ready(ctx, claimed.Port); err != nil {
 		// Wrapped here rather than in awaitReady, which knows only a port: the
 		// worktree is in hand here, and the success path still does not hash it
 		// for a message nobody reads.
@@ -460,25 +510,14 @@ func (m *manager) ensure(worktree string) (int, error) {
 			// process signals and forgets. This only reports it.
 			return 0, err
 		}
-		// Signalled through the process we hold rather than by pid: identity is
-		// not in doubt here, and the isOurGopls check could only refuse.
-		_ = started.Signal(syscall.SIGTERM)
-		// Escalated, because forgetting the record makes this pid unfindable: no
-		// sweep reaches a process the map no longer names, so a gopls sitting in
-		// its SIGTERM — wedged in filesystem I/O is enough — would run unowned
-		// until reboot, holding its port and its 1-2GB. SIGKILL is the one signal
-		// it cannot ignore; startGopls' reaper collects the corpse either way.
-		//
-		// ponytail: fired off the clock rather than waited for, so this does not
-		// park the lane for exitGrace on a path that has already spent
-		// readyTimeout. The window it leaves is this process exiting first, which
-		// costs exactly what today costs. Wait for it — startGopls would have to
-		// hand its reaper's channel back — if a stranded gopls is ever observed.
-		time.AfterFunc(exitGrace, func() { _ = started.Kill() })
-		// The record now names a port with nothing on it, and its own grace
-		// would spare it from the next sweep — so it is dropped here rather
-		// than left for one.
-		return 0, errors.Join(err, m.forget(claimed))
+		// Cleanup survives request cancellation and completes before the CLI
+		// can exit. If exit cannot be confirmed, keep the record discoverable.
+		if stopErr := started.stop(); stopErr != nil {
+			return 0, errors.Join(err, stopErr)
+		}
+		cleanup, cancel := context.WithTimeout(context.Background(), exitGrace)
+		defer cancel()
+		return 0, errors.Join(err, m.forget(cleanup, claimed))
 	}
 	return claimed.Port, nil
 }
@@ -487,10 +526,10 @@ func (m *manager) ensure(worktree string) (int, error) {
 // when the map has none. A process comes back only when this call is what
 // started it, which is how ensure tells its own readiness wait from the one it
 // may still owe another process's start.
-func (m *manager) claimPort(worktree string) (record, *os.Process, error) {
+func (m *manager) claimPort(ctx context.Context, worktree string) (record, *childProcess, error) {
 	var claimed record
-	var started *os.Process
-	_, err := m.withRecords(func(records []record) ([]record, error) {
+	var started *childProcess
+	_, err := m.withRecords(ctx, func(records []record) ([]record, error) {
 		for _, r := range records {
 			if r.Worktree == worktree {
 				claimed = r
@@ -501,7 +540,7 @@ func (m *manager) claimPort(worktree string) (record, *os.Process, error) {
 		if err != nil {
 			return nil, err
 		}
-		started, err = m.startGopls(worktree, port)
+		started, err = m.start(ctx, worktree, port)
 		if err != nil {
 			return nil, err
 		}
@@ -517,7 +556,7 @@ func (m *manager) claimPort(worktree string) (record, *os.Process, error) {
 		if started != nil {
 			// The write is the only step that can fail past the spawn, and it
 			// left the record unrecorded — so nothing would ever find it again.
-			_ = started.Signal(syscall.SIGTERM)
+			err = errors.Join(err, started.stop())
 		}
 		return record{}, nil, err
 	}
@@ -536,8 +575,8 @@ func (m *manager) claimPort(worktree string) (record, *os.Process, error) {
 // Not routed through withRecords, which sweeps: this drops exactly the record
 // named and nothing else, on an error path that has already spent readyTimeout
 // and should not also probe every other worktree under the lock.
-func (m *manager) forget(started record) error {
-	_, err := m.withMap(func(records []record) ([]record, error) {
+func (m *manager) forget(ctx context.Context, started record) error {
+	_, err := m.withMap(ctx, func(records []record) ([]record, error) {
 		return slices.DeleteFunc(records, func(r record) bool { return r == started }), nil
 	})
 	return err
@@ -546,8 +585,8 @@ func (m *manager) forget(started record) error {
 // list prints the surviving records. Printed after the lock is dropped, so a
 // client that stopped reading cannot hold it, and so that the sweep's result is
 // already on disk whatever stdout does.
-func (m *manager) list(w io.Writer) error {
-	records, err := m.withRecords(func(records []record) ([]record, error) { return records, nil })
+func (m *manager) list(ctx context.Context, w io.Writer) error {
+	records, err := m.withRecords(ctx, func(records []record) ([]record, error) { return records, nil })
 	if err != nil {
 		return err
 	}
@@ -570,7 +609,7 @@ func (m *manager) logPath(worktree string) string {
 // startGopls spawns a gopls for worktree and returns as soon as the child
 // exists. Whether it ever serves its endpoint is awaitReady's question, and the
 // caller's to ask outside the map lock — see ensure.
-func (m *manager) startGopls(worktree string, port int) (*os.Process, error) {
+func (m *manager) startGopls(ctx context.Context, worktree string, port int) (*childProcess, error) {
 	logPath := m.logPath(worktree)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		return nil, err
@@ -588,6 +627,10 @@ func (m *manager) startGopls(worktree string, port int) (*os.Process, error) {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Do not tie the child lifetime to ctx: other clients share this server.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start gopls: %w", err)
 	}
@@ -595,24 +638,63 @@ func (m *manager) startGopls(worktree string, port int) (*os.Process, error) {
 	// unwaited gopls stays a zombie child of this process for the whole session
 	// — and kill(pid, 0) succeeds against a zombie, which would make the PID
 	// half of recordAlive report a dead server as alive.
-	go func() { _ = cmd.Wait() }()
-	return cmd.Process, nil
+	child := &childProcess{Process: cmd.Process, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		close(child.done)
+	}()
+	return child, nil
+}
+
+// childProcess retains both identity and proof of exit for our own starts.
+type childProcess struct {
+	*os.Process
+	done chan struct{}
+}
+
+func (p *childProcess) stop() error {
+	select {
+	case <-p.done:
+		return nil
+	default:
+	}
+	_ = p.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(exitGrace)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+		return nil
+	case <-timer.C:
+	}
+	if err := p.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("kill gopls pid %d: %w", p.Pid, err)
+	}
+	timer.Reset(exitGrace)
+	select {
+	case <-p.done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("gopls pid %d has not exited after SIGKILL", p.Pid)
+	}
 }
 
 // awaitReady polls until the gopls just spawned on port serves its endpoint.
 // The caller signals the process it holds when this gives up, rather than the
 // recorded pid — see isOurGopls for why a bare pid is not enough.
-func awaitReady(port int) error {
-	deadline := time.Now().Add(readyTimeout)
+func awaitReady(ctx context.Context, port int) error {
+	ctx, cancel := context.WithTimeout(ctx, readyTimeout)
+	defer cancel()
 	// Backed off rather than polled flat: a gopls that binds 15ms after the fork
 	// is not noticed for the rest of the tick, and this wait is on the lane's
 	// goroutine with the send budget running. Doubling to a 100ms ceiling costs
 	// a handful of extra probes on a slow start and nothing on a failed one.
-	for wait := 10 * time.Millisecond; time.Now().Before(deadline); wait = min(2*wait, 100*time.Millisecond) {
-		if alive, _ := endpointProbe(port); alive {
+	for wait := 10 * time.Millisecond; ctx.Err() == nil; wait = min(2*wait, 100*time.Millisecond) {
+		if alive, _ := endpointProbe(ctx, port); alive {
 			return nil
 		}
-		time.Sleep(wait)
+		if err := waitContext(ctx, wait); err != nil {
+			break
+		}
 	}
-	return fmt.Errorf("gopls did not become ready on %s", mcpAddress(port))
+	return fmt.Errorf("gopls did not become ready on %s: %w", mcpAddress(port), ctx.Err())
 }

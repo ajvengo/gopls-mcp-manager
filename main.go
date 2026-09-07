@@ -43,26 +43,23 @@ func run(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Cover startup and list's lock wait as well as the running bridge.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if command == "list" {
-		return m.list(stdout)
+		return m.list(ctx, stdout)
 	}
 	worktreeArg := "."
 	if len(args) > 2 {
 		worktreeArg = args[2]
 	}
-	// Installed before the first thing that can block, not just around the
-	// session: resolving the worktree shells out to git, and a git on a dead
-	// mount would otherwise sit out its own timeout with ^C doing nothing.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	worktree, err := worktreePath(ctx, worktreeArg)
 	if err != nil {
 		return err
 	}
 	// Starting the home gopls up front keeps a broken install a startup error
 	// rather than a failed initialize halfway into a session.
-	port, err := m.ensure(worktree)
+	port, err := m.ensure(ctx, worktree)
 	if err != nil {
 		return err
 	}

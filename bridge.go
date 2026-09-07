@@ -89,6 +89,11 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	_ = stdio.Close()
 	<-readerDone
 	r.closeLanes()
+	// Lanes may be finishing cleanup of a failed child. Let them confirm exit
+	// before main can terminate the process and abandon that cleanup.
+	for _, l := range r.lanes {
+		<-l.done
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, mcp.ErrConnectionClosed) {
 		return nil
 	}
@@ -145,6 +150,8 @@ type router struct {
 type owed struct {
 	conn     mcp.Connection
 	worktree string
+	cancel   context.CancelFunc // stops queued/dialling delivery, never the shared server
+	placed   <-chan struct{}    // closes when the write returns, before cancellation is forwarded
 }
 
 func newRouter(ctx context.Context, m *manager, home string) *router {
@@ -163,11 +170,9 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 	return r
 }
 
-// laneQueue is how far one worktree may run ahead before the reader waits for
-// it. Deep enough that a client pipelining calls at a cold worktree still gets
-// them all taken while it starts; a full queue is the one case where a slow
-// worktree can still hold the reader up, and it takes 64 outstanding calls to
-// the same tree to reach.
+// laneQueue bounds each worktree's pending deliveries and advisory controls.
+// Excess requests are refused; excess notifications are dropped. Neither queue
+// can hold up routing to another worktree.
 const laneQueue = 64
 
 // lane is one worktree's upstream and the goroutine that owns it.
@@ -183,7 +188,9 @@ const laneQueue = 64
 type lane struct {
 	r        *router
 	worktree string
-	reqs     chan *jsonrpc.Request
+	reqs     chan delivery
+	controls chan cancellation
+	done     chan struct{}
 
 	// ctx is this lane's own child of the session context, and the parent every
 	// per-request budget in send is derived from. One child per lane rather than
@@ -206,7 +213,9 @@ func newLane(r *router, worktree string) *lane {
 	return &lane{
 		r:        r,
 		worktree: worktree,
-		reqs:     make(chan *jsonrpc.Request, laneQueue),
+		reqs:     make(chan delivery, laneQueue),
+		controls: make(chan cancellation, laneQueue),
+		done:     make(chan struct{}),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -225,12 +234,14 @@ func (r *router) laneFor(worktree string) *lane {
 }
 
 func (l *lane) run() {
+	defer close(l.done)
 	// Releases this lane's registration on the session context. The connections
 	// it dialled keep contexts of their own, rooted at the session rather than
 	// here, so this ends the lane's budgets and nothing else — see dialBounded.
 	defer l.cancel()
+	go l.runControls()
 draining:
-	for req := range l.reqs {
+	for call := range l.reqs {
 		// Whatever is left in the queue when the session ends is not worth an
 		// upstream: dialling would run ensure, spawning a whole gopls for a client
 		// that has already gone away, and the answer would have nowhere to go.
@@ -240,19 +251,28 @@ draining:
 		// contention lane.ctx exists to keep off the session context.
 		select {
 		case <-l.r.ctx.Done():
+			call.cancel()
 			break draining
 		default:
 		}
-		l.send(req)
+		l.send(call.ctx, call.req)
+		call.cancel()
+	}
+	for call := range l.reqs {
+		call.cancel()
 	}
 	if l.conn != nil {
 		_ = l.conn.Close()
 	}
 }
 
-// route hands req to the lane that should answer it, giving up once the session
-// is over so that a stopped lane cannot strand the reader.
+// route admits req without waiting for lane capacity. Its budget starts here,
+// so waiting in the queue does not buy another delivery budget.
 func (r *router) route(req *jsonrpc.Request) {
+	if req.Method == "notifications/cancelled" && !req.ID.IsValid() {
+		r.cancelCall(req)
+		return
+	}
 	worktree, err := r.target(req)
 	if err != nil {
 		r.refuse(req, jsonrpc.CodeInvalidParams, "%s", err)
@@ -262,11 +282,84 @@ func (r *router) route(req *jsonrpc.Request) {
 	// the call is still queued must find it owed, or cancelTarget would send it
 	// home naming an id home never issued. Both messages pass through here in
 	// the client's own order, so here the answer always exists.
-	r.track(req.ID, nil, worktree)
 	l := r.laneFor(worktree)
+	ctx, cancel := context.WithTimeout(l.ctx, sendBudget)
+	r.mu.Lock()
+	if req.ID.IsValid() {
+		r.awaitingUpstream[req.ID] = owed{worktree: worktree, cancel: cancel}
+	}
+	r.mu.Unlock()
 	select {
-	case l.reqs <- req:
+	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel}:
 	case <-r.ctx.Done():
+		cancel()
+	default:
+		cancel()
+		r.refuse(req, -32000, "gopls for %s is overloaded: delivery queue is full", worktree)
+	}
+}
+
+type delivery struct {
+	req    *jsonrpc.Request
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// A control carries the exact connection that owes its id. It cannot dial or
+// accidentally cancel a call on a replacement connection.
+type cancellation struct {
+	req      *jsonrpc.Request
+	conn     mcp.Connection
+	deadline time.Time
+	placed   <-chan struct{}
+}
+
+func (r *router) cancelCall(req *jsonrpc.Request) {
+	var params mcp.CancelledParams
+	if json.Unmarshal(req.Params, &params) != nil {
+		return
+	}
+	id, err := jsonrpc.MakeID(params.RequestID)
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	owner := r.awaitingUpstream[id]
+	if owner.conn == nil && owner.cancel != nil {
+		owner.cancel()
+	}
+	r.mu.Unlock()
+	if owner.conn == nil {
+		return
+	}
+	// Notifications are advisory and have no response id. If this separate
+	// bounded queue is full, drop the notification rather than block routing.
+	if l := r.lanes[owner.worktree]; l != nil {
+		select {
+		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, deadline: time.Now().Add(sendBudget)}:
+		default:
+		}
+	}
+}
+
+func (l *lane) runControls() {
+	for {
+		select {
+		case <-l.ctx.Done():
+			return
+		case control := <-l.controls:
+			ctx, cancel := context.WithDeadline(l.ctx, control.deadline)
+			if control.placed != nil {
+				select {
+				case <-control.placed:
+				case <-ctx.Done():
+				}
+			}
+			if ctx.Err() == nil {
+				_ = control.conn.Write(ctx, control.req)
+			}
+			cancel()
+		}
 	}
 }
 
@@ -276,9 +369,8 @@ func (r *router) route(req *jsonrpc.Request) {
 // sender on l.reqs, so closing these channels is safe because that goroutine is
 // provably gone. bridge waits for readerDone first, and is the only caller.
 //
-// Not waited for: a lane inside m.ensure is parked on an flock and a readiness
-// poll that take no context, so waiting would hang the exit on another
-// process's cold start.
+// serve waits for lane completion after closing all queues. Manager waits are
+// cancellable; failed-child cleanup has its own short termination budget.
 func (r *router) closeLanes() {
 	for _, l := range r.lanes {
 		close(l.reqs)
@@ -468,7 +560,7 @@ func (r *router) cancelTarget(params json.RawMessage) string {
 	return r.awaitingUpstream[id].worktree
 }
 
-func (l *lane) send(req *jsonrpc.Request) {
+func (l *lane) send(parent context.Context, req *jsonrpc.Request) {
 	// Derived here rather than passed in, so that the id and the message it is
 	// sent with cannot disagree; see upstream for the one-initialize rule.
 	id, initial := req.ID, req.Method == "initialize"
@@ -481,10 +573,28 @@ func (l *lane) send(req *jsonrpc.Request) {
 	// takes the POST and never completes it is what this exists for — §8 keeps
 	// exactly such a server alive — and under r.ctx alone it would park this
 	// lane for the rest of the session.
-	ctx, cancel := context.WithTimeout(l.ctx, sendBudget)
+	ctx, cancel := context.WithTimeout(parent, sendBudget)
 	defer cancel()
+	// Retain the delivery cancellation even across a retry's private handshake.
+	register := func(conn mcp.Connection, placed <-chan struct{}) {
+		if id.IsValid() {
+			l.r.mu.Lock()
+			l.r.awaitingUpstream[id] = owed{conn: conn, worktree: l.worktree, cancel: cancel, placed: placed}
+			l.r.mu.Unlock()
+		}
+	}
+	register(nil, nil)
 	var err error
 	for range 2 {
+		if err = ctx.Err(); err != nil {
+			break
+		}
+		// A deadline can have passed before its timer callback is scheduled.
+		// Check the clock too, so queued work cannot sneak into a dial then.
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			err = context.DeadlineExceeded
+			break
+		}
 		// A message nobody awaits an answer to never opens a connection:
 		// dialling would run ensure — flock, spawn, handshake — to hand a brand
 		// new process a notification about work it never did. Dropping it
@@ -504,8 +614,11 @@ func (l *lane) send(req *jsonrpc.Request) {
 		// before Write returns, and a registration landing after its response
 		// was already deleted would outlive the call and produce a second,
 		// contradictory reply to the same id later on.
-		l.r.track(id, conn, l.worktree)
-		if err = conn.Write(ctx, req); err == nil {
+		placed := make(chan struct{})
+		register(conn, placed)
+		err = conn.Write(ctx, req)
+		close(placed)
+		if err == nil {
 			// Cached only once the connection has taken a write: a dial
 			// handing back an already-dead upstream then fails above, on this
 			// goroutine, and the retry is reached. A reader started before the
@@ -517,6 +630,9 @@ func (l *lane) send(req *jsonrpc.Request) {
 		// A failed write and conn's own reader seeing the upstream die are the
 		// same event racing, and whoever claims the id owns the reply.
 		claimed := l.r.claim(id)
+		if claimed {
+			register(nil, nil)
+		}
 		// Forgotten unconditionally: a write can only fail on the connection the
 		// lane just used, so l.conn is either conn itself or already nil.
 		l.conn = nil
@@ -528,7 +644,11 @@ func (l *lane) send(req *jsonrpc.Request) {
 			return
 		}
 	}
-	l.r.refuse(req, jsonrpc.CodeInternalError, "gopls for %s: %v", l.worktree, err)
+	code := int64(jsonrpc.CodeInternalError)
+	if errors.Is(err, context.Canceled) {
+		code = -32800
+	}
+	l.r.refuse(req, code, "gopls for %s: %v", l.worktree, err)
 }
 
 // track records a request as being in flight to worktree, and with conn once an
@@ -543,7 +663,9 @@ func (r *router) track(id jsonrpc.ID, conn mcp.Connection, worktree string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.awaitingUpstream[id] = owed{conn: conn, worktree: worktree}
+	owner := r.awaitingUpstream[id]
+	owner.conn, owner.worktree = conn, worktree
+	r.awaitingUpstream[id] = owner
 }
 
 // claim ends id's flight, reporting whether this caller is the party that got
@@ -620,8 +742,8 @@ func (l *lane) upstream(ctx context.Context, initial bool) (mcp.Connection, erro
 		return l.conn, nil
 	}
 	// The first attempt can burn the whole budget in the handshake. Dialling
-	// again would spend an unbounded flock wait, and possibly a spawn, on a
-	// handshake guaranteed to expire on its first write.
+	// again would attempt manager work for a handshake guaranteed to expire
+	// on its first write.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -649,8 +771,8 @@ func (l *lane) upstream(ctx context.Context, initial bool) (mcp.Connection, erro
 // cancellable context of its own, cancelled only by a watchdog that is disarmed
 // the moment the dial returns.
 //
-// This bounds the connect, not the whole of dialGopls: ensure's flock and
-// readiness poll take no context and stay unbounded (§10).
+// ensure also observes this cancellation during lock acquisition, probes and
+// readiness. Failed-child cleanup can outlive the delivery budget briefly.
 func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 	ctx, cancel := context.WithCancel(l.r.ctx)
 	watchdog := context.AfterFunc(budget, cancel)
@@ -689,7 +811,7 @@ func (c *boundedConn) Close() error {
 }
 
 func (r *router) dialGopls(ctx context.Context, worktree string) (mcp.Connection, error) {
-	port, err := r.m.ensure(worktree)
+	port, err := r.m.ensure(ctx, worktree)
 	if err != nil {
 		return nil, err
 	}
@@ -947,13 +1069,22 @@ func (r *router) worktreeOf(path string) string {
 // and a path that does not exist yet must still resolve through its parent
 // (R2) — a file created moments ago is the ordinary case.
 func containingDir(input string) string {
-	if resolved, err := filepath.EvalSymlinks(input); err == nil {
+	resolved, err := filepath.EvalSymlinks(input)
+	if err == nil {
 		input = resolved
 	}
 	if info, err := os.Stat(input); err == nil && info.IsDir() {
 		return filepath.Clean(input)
 	}
-	return filepath.Dir(input)
+	dir := filepath.Dir(input)
+	// A missing file cannot be resolved as a whole, but its existing parent
+	// still has a physical spelling. Never climb past a missing parent (R2).
+	if err != nil {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return resolved
+		}
+	}
+	return dir
 }
 
 // worktreePath resolves a file or directory to the root of the worktree holding
