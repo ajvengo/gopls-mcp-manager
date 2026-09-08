@@ -130,10 +130,15 @@ func BenchmarkCallRoundTrip(b *testing.B) {
 
 	client := make(chan jsonrpc.Message, laneQueue)
 	sink := &fakeConn{writes: make(chan jsonrpc.Message, laneQueue)}
-	go r.readFromClient(&fakeConn{reads: client})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.readFromClient(&fakeConn{reads: client})
+	}()
 	go r.writeToClient(sink)
 	b.Cleanup(func() {
 		close(client)
+		<-done
 		r.closeLanes()
 	})
 
@@ -254,12 +259,9 @@ func testRecords(n int) []record {
 	return records
 }
 
-// The other half of what the map lock holds, and the half BenchmarkWithRecords
-// stubs out: every record on the machine is probed on every sweep, and a sweep
-// runs on every cold start and every redial. The probes fan out, so the cost is
-// the slowest one — but they run under a flock every process on this machine
-// shares, so that slowest one is what every other worktree's cold start queues
-// behind.
+// Probe-only microbenchmark. Full maintenance probes every record outside the
+// flock; acquisition probes only the requested worktree. See
+// BenchmarkAcquisitionVersusSweep for those production paths.
 //
 // The rows are the verdicts a probe can reach. "live" is the steady state, one
 // local round trip. "refused" is conclusively dead; "odd" answers but not like

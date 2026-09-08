@@ -24,6 +24,7 @@ type manager struct {
 	mapPath string
 	alive   func(context.Context, record) probeVerdict // read-only; called concurrently
 	observe func(lockTiming)                           // optional, concurrency-safe observer
+	measure func(string, time.Duration)                // optional operation timings
 	limits  callLimits
 	// ready is awaitReady, replaced by tests: what it waits out is readyTimeout,
 	// and ensure's failure path is otherwise ten seconds of sleeping away from
@@ -53,6 +54,9 @@ func newManager() (*manager, error) {
 		return nil, err
 	}
 	if os.Getenv("GOPLS_MANAGER_METRICS") == "1" {
+		m.measure = func(stage string, elapsed time.Duration) {
+			fmt.Fprintf(os.Stderr, "{\"event\":\"manager_operation\",\"stage\":%q,\"elapsed_ns\":%d}\n", stage, elapsed.Nanoseconds())
+		}
 		m.observe = func(t lockTiming) {
 			fmt.Fprintf(os.Stderr, "{\"event\":\"registry_lock\",\"wait_ns\":%d,\"held_ns\":%d}\n", t.Wait, t.Held)
 		}
@@ -114,6 +118,7 @@ func portUnavailable(port int) bool {
 // lock is dropped is what makes that safe: it reserves the port, and startGrace
 // keeps a concurrent sweep from reaping a server that has not bound yet.
 func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
+	defer m.timed("ensure", time.Now())
 	claimed, started, err := m.claimPort(ctx, worktree)
 	if err != nil {
 		return 0, err
@@ -129,7 +134,10 @@ func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
 	if started == nil && !withinStartGrace(claimed) {
 		return claimed.Port, nil
 	}
-	if err := m.ready(ctx, claimed.Port); err != nil {
+	readyStart := time.Now()
+	readyErr := m.ready(ctx, claimed.Port)
+	m.timed("readiness", readyStart)
+	if err := readyErr; err != nil {
 		// Wrapped here rather than in awaitReady, which knows only a port: the
 		// worktree is in hand here, and the success path still does not hash it
 		// for a message nobody reads.
@@ -151,6 +159,12 @@ func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
 	return claimed.Port, nil
 }
 
+func (m *manager) timed(stage string, start time.Time) {
+	if m.measure != nil {
+		m.measure(stage, time.Since(start))
+	}
+}
+
 // claimPort reserves worktree's record under the map lock, spawning a gopls
 // when the map has none. A process comes back only when this call is what
 // started it, which is how ensure tells its own readiness wait from the one it
@@ -158,7 +172,7 @@ func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
 func (m *manager) claimPort(ctx context.Context, worktree string) (record, *childProcess, error) {
 	var claimed record
 	var started *childProcess
-	_, err := m.withRecords(ctx, func(records []record) ([]record, error) {
+	_, err := m.withSelectedRecords(ctx, worktree, func(records []record) ([]record, error) {
 		for _, r := range records {
 			if r.Worktree == worktree {
 				if r.Terminating {

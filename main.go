@@ -25,8 +25,12 @@ func run(args []string, stdout io.Writer) error {
 	if len(args) > 1 {
 		command = args[1]
 	}
-	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | list | status", args[0])
+	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | list | status", args[0])
 	switch command {
+	case "http":
+		if len(args) > 4 {
+			return usage
+		}
 	case "list", "status":
 		if len(args) != 2 {
 			return usage
@@ -53,7 +57,11 @@ func run(args []string, stdout io.Writer) error {
 		return m.list(ctx, stdout)
 	}
 	worktreeArg := "."
-	if len(args) > 2 {
+	if command == "http" {
+		if len(args) > 3 {
+			worktreeArg = args[3]
+		}
+	} else if len(args) > 2 {
 		worktreeArg = args[2]
 	}
 	worktree, err := worktreePath(ctx, worktreeArg)
@@ -69,6 +77,13 @@ func run(args []string, stdout io.Writer) error {
 	if command == "ensure" {
 		_, err := fmt.Fprintln(stdout, port)
 		return err
+	}
+	if command == "http" {
+		address := "127.0.0.1:6099"
+		if len(args) > 2 {
+			address = args[2]
+		}
+		return serveHTTP(ctx, m, worktree, address, stdout)
 	}
 
 	return bridge(ctx, m, worktree)

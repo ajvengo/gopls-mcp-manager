@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -11,19 +12,41 @@ import (
 )
 
 type callLimits struct {
-	PerLane, Session int
-	Execution        time.Duration
+	PerLane, Session    int
+	Lanes, CacheEntries int
+	Execution           time.Duration
 }
 
-func defaultCallLimits() callLimits { return callLimits{PerLane: 128, Session: 1024} }
+func defaultCallLimits() callLimits {
+	return callLimits{PerLane: 128, Session: 1024, Lanes: 64, CacheEntries: 4096}
+}
 
 // The state pointer is a generation token. An expired timer cannot complete a
 // later request that happens to use the same wire id.
 type callState struct{ timer *time.Timer }
 
 type requestUsage struct {
-	Event                                            string
-	Admitted, Completed, Rejected, Peak, Outstanding int
+	Event                                                                 string
+	Admitted, Completed, Rejected, Peak, Outstanding                      int
+	Rejections                                                            map[string]int
+	Stages                                                                map[string]stageTiming
+	Lanes, Paths, Directories, Cancelled, ExecutionExpired, RoutingFailed int
+}
+
+type stageTiming struct{ Count, TotalNS, MaxNS int64 }
+
+func (r *router) timed(stage string, start time.Time) {
+	if start.IsZero() {
+		return
+	}
+	elapsed := time.Since(start).Nanoseconds()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t := r.usage.Stages[stage]
+	t.Count++
+	t.TotalNS += elapsed
+	t.MaxNS = max(t.MaxNS, elapsed)
+	r.usage.Stages[stage] = t
 }
 
 func (r *router) requestUsage() requestUsage {
@@ -32,6 +55,14 @@ func (r *router) requestUsage() requestUsage {
 	usage := r.usage
 	usage.Event = "session_requests"
 	usage.Outstanding = len(r.awaitingUpstream)
+	usage.Rejections = maps.Clone(r.usage.Rejections)
+	usage.Stages = maps.Clone(r.usage.Stages)
+	r.lanesMu.Lock()
+	usage.Lanes = len(r.lanes)
+	r.lanesMu.Unlock()
+	r.memoMu.Lock()
+	usage.Paths, usage.Directories = len(r.paths), len(r.worktrees)
+	r.memoMu.Unlock()
 	return usage
 }
 
@@ -43,23 +74,23 @@ func (r *router) admit(id jsonrpc.ID, worktree string, cancel func()) error {
 	defer r.mu.Unlock()
 	if _, exists := r.awaitingUpstream[id]; exists {
 		r.usage.Rejected++
+		r.usage.Rejections["duplicate_id"]++
 		return fmt.Errorf("request id %v is already outstanding", id)
 	}
 	if len(r.awaitingUpstream) >= r.limits.Session {
 		r.usage.Rejected++
+		r.usage.Rejections["session_outstanding"]++
 		return fmt.Errorf("session outstanding request limit reached")
 	}
-	count := 0
-	for _, owner := range r.awaitingUpstream {
-		if owner.worktree == worktree {
-			count++
-		}
-	}
-	if count >= r.limits.PerLane {
+	if worktree != "" && r.perWorktree[worktree] >= r.limits.PerLane {
 		r.usage.Rejected++
+		r.usage.Rejections["lane_outstanding"]++
 		return fmt.Errorf("gopls for %s reached its outstanding request limit", worktree)
 	}
 	r.awaitingUpstream[id] = owed{worktree: worktree, cancel: cancel, state: &callState{}}
+	if worktree != "" {
+		r.perWorktree[worktree]++
+	}
 	r.usage.Admitted++
 	r.usage.Peak = max(r.usage.Peak, len(r.awaitingUpstream))
 	return nil
@@ -76,6 +107,12 @@ func (r *router) removeLocked(id jsonrpc.ID, owner owed) {
 		owner.state.timer.Stop()
 	}
 	delete(r.awaitingUpstream, id)
+	if owner.worktree != "" {
+		r.perWorktree[owner.worktree]--
+		if r.perWorktree[owner.worktree] <= 0 {
+			delete(r.perWorktree, owner.worktree)
+		}
+	}
 	r.usage.Completed++
 }
 
@@ -133,6 +170,9 @@ func (r *router) startExecution(id jsonrpc.ID) {
 	state := owner.state
 	state.timer = time.AfterFunc(r.limits.Execution, func() {
 		if _, ok := r.finish(id, nil, state); ok {
+			r.mu.Lock()
+			r.usage.ExecutionExpired++
+			r.mu.Unlock()
 			// Timer callbacks must not accumulate behind a client that stopped
 			// reading. If the bounded output cannot accept a terminal answer,
 			// fail the session instead of leaving an unbounded blocked callback.
@@ -163,9 +203,8 @@ func (r *router) clearRequests() {
 // owed is a request in flight: the worktree it was routed to, and the upstream
 // that has taken it, once one has.
 //
-// The worktree is known strictly earlier than the connection — route picks a
-// destination before any lane has one to name — so conn is nil for a call still
-// queued. A cancellation arriving in that window still has to find where its
+// Ingress records the call before its worktree is known; routing fills in
+// the worktree before delivery assigns the connection. conn is nil while queued. A cancellation arriving in that window still has to find where its
 // call went (R7), which is why one record covers both stages rather than the
 // route appearing only once an upstream owes an answer.
 //
@@ -174,11 +213,65 @@ func (r *router) clearRequests() {
 // would let the dead one's reader fail calls the reconnect had already placed
 // successfully.
 type owed struct {
+	ingress  context.Context // distinguishes cancelled ingress from reused IDs
 	conn     mcp.Connection
 	worktree string
 	cancel   context.CancelFunc // stops queued/dialling delivery, never the shared server
 	placed   <-chan struct{}    // closes when the write returns, before cancellation is forwarded
 	state    *callState
+}
+
+func (r *router) rejected(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.usage.Rejected++
+	r.usage.Rejections[reason]++
+}
+
+func (r *router) failIngress(call delivery, code int64, message string) {
+	r.mu.Lock()
+	owner, ok := r.awaitingUpstream[call.req.ID]
+	if ok && owner.ingress == call.ctx {
+		r.removeLocked(call.req.ID, owner)
+		r.usage.RoutingFailed++
+	} else {
+		ok = false
+	}
+	r.mu.Unlock()
+	if ok {
+		r.forward(errorResponse(call.req.ID, code, "%s", message))
+	}
+}
+
+// Transfer accounting and cancellation atomically after ordered resolution.
+func (r *router) bindWorktree(call delivery, worktree string, cancel context.CancelFunc) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	owner, ok := r.awaitingUpstream[call.req.ID]
+	if call.ctx.Err() != nil || (call.req.ID.IsValid() && (!ok || owner.ingress != call.ctx)) {
+		return context.Canceled
+	}
+	r.lanesMu.Lock()
+	_, exists := r.lanes[worktree]
+	full := r.limits.Lanes > 0 && len(r.lanes) >= r.limits.Lanes
+	r.lanesMu.Unlock()
+	if !exists && full {
+		r.usage.Rejected++
+		r.usage.Rejections["lanes"]++
+		return fmt.Errorf("session retained lane limit reached")
+	}
+	if !call.req.ID.IsValid() {
+		return nil
+	}
+	if r.perWorktree[worktree] >= r.limits.PerLane {
+		r.usage.Rejected++
+		r.usage.Rejections["lane_outstanding"]++
+		return fmt.Errorf("gopls for %s reached its outstanding request limit", worktree)
+	}
+	owner.worktree, owner.cancel = worktree, cancel
+	r.awaitingUpstream[call.req.ID] = owner
+	r.perWorktree[worktree]++
+	return nil
 }
 
 func (r *router) cancelCall(req *jsonrpc.Request) {
@@ -194,6 +287,9 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 	if !ok {
 		return
 	}
+	r.mu.Lock()
+	r.usage.Cancelled++
+	r.mu.Unlock()
 	if owner.conn == nil && owner.cancel != nil {
 		owner.cancel()
 	}
@@ -203,7 +299,10 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 	}
 	// Notifications are advisory and have no response id. If this separate
 	// bounded queue is full, drop the notification rather than block routing.
-	if l := r.lanes[owner.worktree]; l != nil {
+	r.lanesMu.Lock()
+	l := r.lanes[owner.worktree]
+	r.lanesMu.Unlock()
+	if l != nil {
 		select {
 		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, deadline: time.Now().Add(sendBudget)}:
 		default:

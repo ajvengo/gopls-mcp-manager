@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,10 +27,7 @@ import (
 // routable evidence. They follow the most recent path-bearing call, falling back
 // to the worktree the bridge was started in.
 func bridge(ctx context.Context, m *manager, home string) error {
-	stdio, err := (&mcp.StdioTransport{}).Connect(ctx)
-	if err != nil {
-		return err
-	}
+	stdio := newStdioConn(os.Stdin, os.Stdout)
 	return serve(ctx, m, home, stdio)
 }
 
@@ -50,6 +48,7 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	r := newRouter(ctx, m, home)
 	if os.Getenv("GOPLS_MANAGER_METRICS") == "1" {
 		defer func() { _ = json.NewEncoder(os.Stderr).Encode(r.requestUsage()) }()
+		go r.reportUsage()
 	}
 	if m != nil && m.limits.Session > 0 {
 		r.limits = m.limits
@@ -84,6 +83,21 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	return err
 }
 
+// One reporter bounds blocked metric output to one goroutine per session.
+// Snapshots contain fixed stage/reason names, never worktree labels.
+func (r *router) reportUsage() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-ticker.C:
+			_ = json.NewEncoder(os.Stderr).Encode(r.requestUsage())
+		}
+	}
+}
+
 // closeLanes ends every lane and lets it close its own connection.
 //
 // Only ever after readFromClient has stopped: it owns r.lanes and is the only
@@ -113,6 +127,19 @@ func (r *router) writeToClient(stdio mcp.Connection) {
 }
 
 func (r *router) readFromClient(stdio mcp.Connection) {
+	// The ingress reader handles cancellation immediately. This goroutine alone
+	// commits routing and sticky state, preserving the order of ordinary calls.
+	incoming := make(chan delivery, laneQueue)
+	go func() {
+		defer close(incoming)
+		r.readIngress(stdio, incoming)
+	}()
+	for call := range incoming {
+		r.routePrepared(call)
+	}
+}
+
+func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 	for {
 		msg, err := stdio.Read(r.ctx)
 		if err != nil {
@@ -138,7 +165,24 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 			r.refuse(req, jsonrpc.CodeInvalidRequest, "%s arrived before the client sent initialize", req.Method)
 			continue
 		}
-		r.route(req)
+		if req.Method == "notifications/cancelled" && !req.ID.IsValid() {
+			r.cancelCall(req)
+			continue
+		}
+		call, ok := r.prepare(req)
+		if !ok {
+			continue
+		}
+		select {
+		case incoming <- call:
+		case <-r.ctx.Done():
+			call.cancel()
+			return
+		default:
+			call.cancel()
+			r.rejected("routing_queue")
+			r.failIngress(call, -32000, "routing queue is full")
+		}
 	}
 }
 

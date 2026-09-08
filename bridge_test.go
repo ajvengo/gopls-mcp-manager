@@ -207,9 +207,14 @@ func forbidDial(t *testing.T, r *router, whatWouldBeWrong string) {
 func startClient(t *testing.T, r *router, depth int) chan<- jsonrpc.Message {
 	t.Helper()
 	reads := make(chan jsonrpc.Message, depth)
-	go r.readFromClient(&fakeConn{reads: reads})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.readFromClient(&fakeConn{reads: reads})
+	}()
 	t.Cleanup(func() {
 		close(reads)
+		<-done
 		r.closeLanes()
 	})
 	return reads
@@ -394,6 +399,8 @@ func wantWireError(t *testing.T, resp *jsonrpc.Response, code int64) *jsonrpc.Er
 // wantOneRoot reads a roots/list answer, which names exactly one root — the
 // tree the upstream that asked belongs to, and never any other. Callers assert
 // on the root itself; that there is only the one is the shared part.
+//
+//nolint:staticcheck // Verify the roots contract required by legacy gopls SSE sessions.
 func wantOneRoot(t *testing.T, resp *jsonrpc.Response) *mcp.Root {
 	t.Helper()
 	var got mcp.ListRootsResult

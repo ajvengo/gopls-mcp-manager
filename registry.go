@@ -155,6 +155,12 @@ func withFileLock(ctx context.Context, path string, fn func() error) error {
 // Termination is committed separately so a failed body cannot erase the evidence
 // required before a signal. The caller must not return a terminating endpoint.
 func (m *manager) withRecords(ctx context.Context, body func([]record) ([]record, error)) ([]record, error) {
+	return m.withSelectedRecords(ctx, "", body)
+}
+
+// An empty worktree requests explicit whole-registry maintenance. Acquisition
+// observes only its own worktree; unrelated records still reserve their ports.
+func (m *manager) withSelectedRecords(ctx context.Context, worktree string, body func([]record) ([]record, error)) ([]record, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -165,11 +171,16 @@ func (m *manager) withRecords(ctx context.Context, body func([]record) ([]record
 		return nil, err
 	}
 	verdicts := make([]probeVerdict, len(snapshot))
+	probeStart := time.Now()
 	var probes sync.WaitGroup
 	for i, r := range snapshot {
+		if worktree != "" && r.Worktree != worktree {
+			continue
+		}
 		probes.Go(func() { verdicts[i] = m.alive(ctx, r) })
 	}
 	probes.Wait()
+	m.timed("probes", probeStart)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

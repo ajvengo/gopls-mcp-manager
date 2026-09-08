@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -14,6 +15,8 @@ import (
 // laneFor returns worktree's lane, opening one on first use. Called only from
 // readFromClient, which owns r.lanes.
 func (r *router) laneFor(worktree string) *lane {
+	r.lanesMu.Lock()
+	defer r.lanesMu.Unlock()
 	l, ok := r.lanes[worktree]
 	if !ok {
 		l = newLane(r, worktree)
@@ -30,32 +33,65 @@ func (r *router) route(req *jsonrpc.Request) {
 		r.cancelCall(req)
 		return
 	}
-	worktree, err := r.target(req)
+	if call, ok := r.prepare(req); ok {
+		r.routePrepared(call)
+	}
+}
+
+// prepare tracks calls before they wait for routing, so cancellation can finish
+// both queued and resolving work without racing admission.
+func (r *router) prepare(req *jsonrpc.Request) (delivery, bool) {
+	ctx, cancel := context.WithTimeout(r.ctx, routingBudget+sendBudget)
+	if err := r.admit(req.ID, "", cancel); err != nil {
+		cancel()
+		r.refuse(req, -32000, "%s", err)
+		return delivery{}, false
+	}
+	r.mu.Lock()
+	owner := r.awaitingUpstream[req.ID]
+	owner.ingress = ctx
+	if req.ID.IsValid() {
+		r.awaitingUpstream[req.ID] = owner
+	}
+	r.mu.Unlock()
+	return delivery{req: req, ctx: ctx, cancel: cancel, queued: time.Now()}, true
+}
+
+func (r *router) routePrepared(call delivery) {
+	r.timed("routing_queue", call.queued)
+	start := time.Now()
+	defer r.timed("routing", start)
+	req := call.req
+	if call.ctx.Err() != nil {
+		r.failIngress(call, jsonrpc.CodeInternalError, "routing queue deadline exceeded")
+		call.cancel()
+		return
+	}
+	worktree, err := r.targetContext(call.ctx, req)
 	if err != nil {
 		code := int64(jsonrpc.CodeInvalidParams)
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			code = jsonrpc.CodeInternalError
 		}
-		r.refuse(req, code, "%s", err)
+		r.failIngress(call, code, err.Error())
+		call.cancel()
 		return
 	}
-	// Recorded here, not where the lane writes it: a cancellation arriving while
-	// the call is still queued must find it owed, or cancelTarget would send it
-	// home naming an id home never issued. Both messages pass through here in
-	// the client's own order, so here the answer always exists.
-	l := r.laneFor(worktree)
-	ctx, cancel := context.WithTimeout(l.ctx, sendBudget)
-	if err := r.admit(req.ID, worktree, cancel); err != nil {
+	ctx, stop := context.WithTimeout(call.ctx, sendBudget)
+	cancel := func() { stop(); call.cancel() }
+	if err := r.bindWorktree(call, worktree, cancel); err != nil {
 		cancel()
-		r.refuse(req, -32000, "%s", err)
+		r.failIngress(call, -32000, err.Error())
 		return
 	}
+	l := r.laneFor(worktree)
 	select {
-	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel}:
+	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, queued: time.Now()}:
 	case <-r.ctx.Done():
 		cancel()
 	default:
 		cancel()
+		r.rejected("delivery_queue")
 		r.fail(req.ID, -32000, "gopls for %s is overloaded: delivery queue is full", worktree)
 	}
 }
@@ -63,9 +99,13 @@ func (r *router) route(req *jsonrpc.Request) {
 // target picks the worktree that should answer req, or reports why no single
 // one can — see toolCallWorktrees.
 func (r *router) target(req *jsonrpc.Request) (string, error) {
+	return r.targetContext(r.ctx, req)
+}
+
+func (r *router) targetContext(ctx context.Context, req *jsonrpc.Request) (string, error) {
 	switch req.Method {
 	case "tools/call":
-		worktrees, err := r.resolveWorktrees(req.Params)
+		worktrees, err := r.resolveWorktrees(ctx, req.Params)
 		if err != nil {
 			return "", err
 		}
@@ -76,10 +116,12 @@ func (r *router) target(req *jsonrpc.Request) (string, error) {
 				len(worktrees), strings.Join(worktrees, ", "))
 		}
 		if len(worktrees) == 1 {
-			r.sticky = worktrees[0]
+			if !r.stateless {
+				r.sticky = worktrees[0]
+			}
 			return worktrees[0], nil
 		}
-		if r.sticky != "" {
+		if !r.stateless && r.sticky != "" {
 			return r.sticky, nil
 		}
 	case "notifications/cancelled":

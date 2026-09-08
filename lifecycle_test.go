@@ -277,7 +277,7 @@ func TestRoutingBudgetDoesNotMultiplyOrGrowWorkers(t *testing.T) {
 		go r.resolver.run(t.Context())
 		for range 2 {
 			start := time.Now()
-			_, err := r.target(&jsonrpc.Request{Method: "tools/call"})
+			_, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: json.RawMessage(`{"arguments":{"file":"/uncached/file.go"}}`)})
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("routing returned %v", err)
 			}

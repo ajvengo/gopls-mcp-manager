@@ -11,8 +11,8 @@ outside that tree and it does not route the question anywhere; it answers
 workspace. So a single gopls cannot serve an agent that works across linked
 worktrees — which is exactly what worktree isolation produces.
 
-`gopls-mcp-manager` sits between the MCP client and gopls. It speaks stdio MCP
-to the client, and routes each tool call to the gopls that owns the file the
+`gopls-mcp-manager` sits between the MCP client and gopls. It speaks stateless
+Streamable HTTP or stdio MCP to the client, and routes each tool call to the gopls that owns the file the
 call names, starting that gopls on demand. The client sees one server and
 performs one handshake.
 
@@ -41,6 +41,7 @@ Commands:
 
 | Command | Effect |
 | --- | --- |
+| `gopls-mcp-manager http [address [path]]` | Serve stateless MCP at `/mcp`; defaults to `127.0.0.1:6099` and home `.` |
 | `gopls-mcp-manager [bridge [path]]` | Run the stdio bridge. Default; `path` defaults to `.` and needs the `bridge` word before it |
 | `gopls-mcp-manager ensure [path]` | Start (or find) the gopls for `path`'s worktree, print its port |
 | `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
@@ -48,6 +49,45 @@ Commands:
 
 `path` is resolved to the root of the worktree containing it, with symlinks
 removed. The worktree the bridge starts in is its **home**.
+
+### Stateless HTTP
+
+Start the manager as a long-running local service:
+
+```sh
+gopls-mcp-manager http 127.0.0.1:6099 /absolute/path/to/repo
+```
+
+Configure your MCP client's Streamable HTTP server URL as
+`http://127.0.0.1:6099/mcp`. The endpoint accepts MCP POST requests and returns
+JSON responses. It issues no session ID and ignores supplied session IDs;
+GET and DELETE return 405. The listener is restricted to loopback.
+
+HTTP requests route independently: absolute `file`, `dir`, and `files`
+arguments select a worktree; **pathless calls always use home**. There is no
+sticky routing between HTTP requests or clients. Run a separate manager with
+a different home and listening port when pathless tools must target another
+worktree. The routing description below describes the stdio bridge's sticky mode.
+
+Internally, the manager keeps bounded, reusable legacy SSE-over-HTTP connections
+to gopls, including private initialization and worktree roots. Tool listing,
+schemas, pagination, results and upstream errors are forwarded. Client request
+IDs are translated to unique internal IDs, so concurrent clients cannot collide.
+The frontend advertises tools; it does not relay unsolicited notifications,
+progress streams, or client roots to the shared upstream sessions.
+
+Cancel the HTTP request to cancel its internal call. A separate
+`notifications/cancelled` POST cannot identify another client's call in stateless
+mode and has no cross-request effect. Cancellation still completes locally first;
+an advisory SSE cancellation does not prove gopls stopped its work.
+
+Existing outstanding-call, lane and memo limits apply across the HTTP service.
+Concurrent HTTP exchanges are also capped by the session outstanding limit;
+excess exchanges receive HTTP 503. Bodies are limited to 4 MiB, header/body reads
+to 5/30 seconds, and response writes to 30 seconds after the response starts.
+Long tool execution uses the existing optional execution timeout. Shutdown closes
+internal SSE connections and cancels calls, while shared gopls processes remain
+available to other managers. The default command still runs stdio.
 
 ## Routing
 
@@ -69,11 +109,13 @@ Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
 - Everything else that is not a `tools/call` goes to home.
 
 Resolution shells out to `git rev-parse --show-toplevel`, so successful answers
-are memoized per path and directory. One resolver worker gives the entire routing
-operation a 10 s budget, shared by all paths in a call. Late results cannot change
-sticky state. A stuck filesystem syscall occupies at most that one worker;
-subsequent routing can time out while it remains stuck. The reader preserves
-wire order, so cancellation behind resolution still waits for that bounded step.
+are memoized per path and directory. One resolver worker gives filesystem
+resolution a 10 s budget, shared by all paths in a call. Pathless calls and path
+memo hits bypass that worker. A separate reader admits calls into a bounded
+64-message routing queue and handles cancellation immediately, even while a
+lookup is stuck. Ordinary routing and sticky updates remain in wire order.
+Ingress queueing, routing and delivery share a 40 s ceiling; delivery additionally
+has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker.
 
 ## What the bridge handles for you
 
@@ -83,7 +125,8 @@ wire order, so cancellation behind resolution still waits for that bounded step.
   watch that tree and notice files created after it started. Your client need
   not advertise the optional `roots` capability — the bridge adds it and answers
   `roots/list` itself. Any other server-initiated request is refused with
-  `method not found`.
+  `method not found`. Replies have a 30 s write ceiling (or the shorter remaining
+  handshake deadline); a failed reply closes that connection and fails its calls.
 - **A dying gopls does not end the session**, not even home. The bridge redials,
   replays the handshake and retries once; calls that were in flight when it died
   come back as errors rather than hanging, since MCP clients have no timeout.
@@ -111,6 +154,8 @@ wire order, so cancellation behind resolution still waits for that bounded step.
 | --- | --- | --- |
 | GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Outstanding calls per session |
 | GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Outstanding calls per worktree |
+| GOPLS_MANAGER_MAX_LANES | 64 | Retained worktree lanes per session; existing lanes remain usable at capacity |
+| GOPLS_MANAGER_MAX_CACHE_ENTRIES | 4096 | Entries in each path/directory memo; a full memo clears before inserting |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
 
@@ -119,10 +164,13 @@ A timeout releases local tracking and suppresses late results; upstream work may
 continue. If the client output queue is full at expiry, the session fails rather
 than accumulating blocked timer callbacks. Choose it to accommodate long diagnostics and vulnerability scans.
 
-Metrics include registry lock wait/hold nanoseconds and per-session request
-counts. MCP stdout stays protocol-only. The status command reports RSS in KiB
-only when the process identity matches; missing values and active-client counts
-are null rather than guessed. Status never signals a process or rewrites the map.
+Metrics include registry lock wait/hold and manager probe, readiness and ensure
+durations. Session snapshots every 30 s and at exit report request counts,
+rejection reasons, cancellation/expiry counts, retained lanes and memo sizes,
+and count/total/max nanoseconds for routing, queue waits and handshake. MCP stdout stays protocol-only. The status command reports RSS in KiB
+only when the process identity matches; one bounded ps snapshot covers the
+recorded PIDs. Missing values and active-client counts are null rather than
+guessed. Status never signals a process or rewrites the map.
 
 There is no automatic eviction. [LEASES.md](LEASES.md) describes cross-client
 attachment and operation ownership, fencing, and the evidence required before
@@ -154,8 +202,11 @@ killing the process strands a full workspace index — routinely 1–2 GB reside
 that no longer appears in `list`, still holds its port, and lives until reboot.
 
 A record is therefore checked on several counts before it is dropped, and the
-process is signalled when it is. All records in an atomic snapshot are checked concurrently outside the global
-registry lock. Reconciliation applies verdicts only to unchanged record identities:
+process is signalled when it is. Acquisition checks only records for the requested
+worktree; unrelated records continue reserving their ports. Run `list` for a full
+maintenance sweep, including stale worktrees you no longer use. Probes run outside
+the global registry lock. Reconciliation applies verdicts only to unchanged
+record identities:
 
 1. `kill(pid, 0)` — is anything there at all?
 2. A record younger than 15 s is kept unprobed. A gopls between fork and bind

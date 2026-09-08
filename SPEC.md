@@ -39,22 +39,26 @@ lane, so a cold dial or handshake does not block delivery on another lane.
 
 R4. One total 10 s routing budget covers the resolver queue and every path in
 one message, rather than a fresh timeout per path. A single worker with an
-unbuffered job channel owns resolution and both memos. A non-cancellable
+unbuffered job channel owns filesystem resolution; memo access is synchronized. A non-cancellable
 filesystem syscall can occupy that worker after timeout, but cannot create
 unbounded replacement workers or commit a late sticky result. A routing timeout
 fails the call rather than falling back to a possibly wrong worktree.
 → `TestRoutingBudgetDoesNotMultiplyOrGrowWorkers`
 
-The reader waits for that bounded decision before reading the next message.
-Cancellation behind resolution therefore still waits up to the routing budget.
-Pathless tool calls currently use the same resolver worker. The delivery budget
-starts after successful routing; it does not reset the routing budget.
+A separate ingress reader admits calls before resolution and handles cancellation
+immediately, even when the 64-message routing queue is full. Ordinary requests
+commit routing in wire order. Pathless calls and complete path-memo hits bypass
+the filesystem worker. The 40 s ingress deadline includes routing queue time,
+resolution and delivery; delivery also has a 30 s ceiling after routing.
+→ `TestIngressCancellationBypassesBlockedResolution`,
+`TestFullIngressQueueStillAcceptsCancellation`
 
 R5. Successful resolutions are memoized by verbatim path and physical containing
-directory. Failures are not cached. Neither memo currently expires or has a size
-cap; retargeting a symlink or replacing a worktree can leave a stale hit until
-session restart.
-→ `TestWorktreeOfResolvesAndMemoizes`
+directory. Failures are not cached. Each memo defaults to at most 4096 entries;
+a full memo clears before inserting a new result. Evicted entries are resolved
+afresh. Retargeting a symlink or replacing a worktree can leave a stale hit until
+capacity rollover or session restart; there is no time-based expiry.
+→ `TestWorktreeOfResolvesAndMemoizes`, `TestMemoCapacityRevalidatesEvictedPaths`
 
 R6. Each delivery and control queue holds 64 messages. Admission never waits for
 space: excess requests receive overload error -32000; excess notifications are
@@ -81,7 +85,15 @@ worktree lane and 1024 per session by default. A server accepting writes without
 answering cannot bypass these limits by draining the delivery queue. Completion,
 failure, execution timeout, local cancellation and session teardown release
 tracking state. Retry retains the same admission slot.
-→ `TestOutstandingLimitsSurviveFastDelivery`
+Per-worktree counts are updated in constant time; all terminal paths remove
+accounting centrally. Retained lanes have a separate default ceiling of 64.
+Requests rejected by session or lane-retention limits do not create new lanes.
+Existing lanes remain usable at the retention ceiling. No shared server is
+evicted to make room.
+→ `TestOutstandingLimitsSurviveFastDelivery`,
+`TestRetentionLimitDoesNotAllocateRejectedLane`,
+`TestOutstandingLimitDoesNotAllocateNewLane`,
+`TestAccountingTerminalPathsAndSnapshots`
 
 R9. Execution deadlines are optional and disabled by default. When configured,
 the timer starts after successful delivery and competes with responses and
@@ -206,6 +218,12 @@ in whichever of them gopls did not take.
 S4. **Every other server-initiated request is answered with
 `CodeMethodNotFound`** on the connection it arrived on, and is not forwarded.
 → `TestUnroutableUpstreamRequestIsRefusedNotForwarded`
+
+S4a. Server-request replies have a 30 s ceiling, shortened by any existing
+handshake deadline. A failed reply closes the connection and explicitly fails
+its outstanding calls. The next call can reconnect using ordinary lane recovery.
+→ `TestServerReplyFailureCompletesOutstanding`,
+`TestServerReplyKeepsShorterHandshakeDeadline`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
 lane also writes to. The cancellation control worker is another writer. `mcp.Connection` documents `Write` as safe to call
@@ -361,8 +379,13 @@ that should stop and one confirmed gone.
 
 → `TestRecordAlive`, `FuzzWithinStartGrace`
 
-L1. Every snapshot record is probed concurrently, including duplicate worktree
-records. Probes run outside the global registry flock. Reconciliation rereads
+L1. Explicit full maintenance (`list`) probes every snapshot record concurrently,
+including duplicate worktree records. Acquisition (`ensure` and bridge dials)
+probes only records matching the requested worktree. All other records remain
+reserved, including stale and terminating ones; maintenance is explicit.
+→ `TestAcquisitionDoesNotProbeUnrelatedRecords`
+
+Probes run outside the global registry flock. Reconciliation rereads
 the current map under lock and applies a verdict only to an exactly matching
 record. New or replaced records are retained; a stale result cannot delete or
 mark a replacement.
@@ -484,7 +507,8 @@ one step, so no second caller can see the port free while a spawn is in flight.
 - With execution deadlines disabled, an accepted request can wait indefinitely;
   outstanding limits bound retained requests, not execution duration.
   Cancellation or timeout cannot prove that a gopls mutation stopped.
-- Live process count and routing memos are not capped. No idle eviction is
+- Live shared-process count is not capped. Lane and memo caps bound one bridge
+  session, not shared daemons or payload bytes. No idle process eviction is
   enabled. Cross-client attachment and operation ownership must be established
   first; see LEASES.md.
 - A terminating process that ignores SIGTERM remains recorded and blocks ensure
@@ -509,22 +533,62 @@ Environment variables are parsed when constructing the manager:
 | --- | --- | --- |
 | GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Session outstanding-request ceiling |
 | GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Per-worktree outstanding ceiling |
+| GOPLS_MANAGER_MAX_LANES | 64 | Retained worktree lanes per session |
+| GOPLS_MANAGER_MAX_CACHE_ENTRIES | 4096 | Entries per memo; clear on capacity rollover |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional post-delivery timeout |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON observations on stderr |
 
 Counts must be positive integers. Execution timeout must be a nonnegative Go
-duration. Metrics report registry lock wait and hold nanoseconds and session
-admitted/completed/rejected/peak/outstanding counts. Completed includes local
-termination and shutdown cleanup, not just successful upstream answers.
-→ `TestCallLimitConfiguration`
+duration. Manager metrics report lock wait/hold and probe, readiness and ensure
+durations. Session snapshots every 30 s and at shutdown report request counts,
+fixed rejection reasons, cancellation/expiry counts, retained lanes and memo
+sizes, and count/total/max nanoseconds for routing, queue waits and handshake.
+Snapshots copy mutable counters under their owning locks. Completed includes
+local termination and shutdown cleanup, not just successful upstream answers.
+→ `TestCallLimitConfiguration`, `TestNewRetentionSettings`,
+`TestAccountingTerminalPathsAndSnapshots`
 
 The status command is read-only, emits JSON and never invokes a sweep. It reports
 recorded server count, registry integrity, termination state and RSS in KiB when
-ps matches the recorded gopls identity. Missing measurements are null. Active
+one bounded ps snapshot matches the recorded gopls identity. Missing measurements are null. Active
 client count is always null until cross-client accounting exists.
 → `TestStatusMeasuresWithoutChangingRegistry`
+
+Stdio uses a direct, case-sensitive parser for complete scalar messages; the
+pinned SDK still handles writes, batch correlation and fallback validation.
+Raw fields are owned copies. SSE remains on the SDK transport.
+→ `TestStdioMatchesSDK`, `TestStdioPreservesBatchResponses`,
+`TestStdioCloseUnblocksRead`, `FuzzDecodeScalarMatchesSDK`
 
 Implementation remains one package. Session transport, routing, resolver/path
 logic, lanes, request accounting, upstream protocol handling, registry,
 process lifecycle and probes live in separate files. requests.go owns terminal
 request completion and generation checks; registry.go owns persistent mutation.
+
+## Stateless HTTP frontend
+
+`http [address [path]]` exposes `/mcp` using the SDK's stateless Streamable HTTP
+handler with JSON responses. Defaults are `127.0.0.1:6099` and home `.`; only
+loopback listeners are accepted. Existing stdio behavior remains available.
+
+The HTTP frontend terminates protocol negotiation locally and exposes gopls
+tools through `tools/list` and `tools/call`. Home initialization supplies gopls's
+instructions. A process-wide router owns bounded legacy SSE lanes, roots replies,
+private handshakes and internal request accounting. No frontend session identifier
+is issued or used. Internal request identifiers are unique across HTTP clients.
+
+Unlike stdio, HTTP routing never reads or writes sticky state. A pathless call
+always goes home; absolute path arguments retain the existing worktree resolution
+and multi-worktree rejection rules. Limits and caches are shared across requests,
+not recreated per POST. HTTP request cancellation completes the internal call and
+sends advisory cancellation to its owning SSE connection. Cross-request cancellation
+notifications and unsolicited upstream notifications are not relayed.
+
+HTTP exchanges have a separate capacity gate using the session request limit,
+4 MiB request bodies, 5 s header reads, 30 s body reads, and a 30 s response-write
+budget starting when response output begins. The SDK owns HTTP validation and
+stateless request lifecycle; gopls continues to use legacy SSE unchanged.
+
+Covered by `TestHTTPStatelessRoutingAndSSEReuse`, `TestHTTPProtocolAndErrors`,
+`TestHTTPCurrentSDKClient`, `TestHTTPDisconnectCancelsLegacySSECall`, and
+`TestHTTPBackendShutdownReleasesCalls`.

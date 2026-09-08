@@ -13,6 +13,22 @@ import (
 	"unicode/utf8"
 )
 
+type pathArguments struct {
+	File  string   `json:"file"`
+	Dir   string   `json:"dir"`
+	Files []string `json:"files"`
+}
+
+func parsePathArguments(params json.RawMessage) pathArguments {
+	var call struct {
+		Arguments pathArguments `json:"arguments"`
+	}
+	if json.Unmarshal(params, &call) != nil {
+		return pathArguments{}
+	}
+	return call.Arguments
+}
+
 // toolCallWorktrees reports the worktrees owning the path arguments of a
 // tools/call, in the order the arguments name them and without repeats. A call
 // naming no path we can resolve reports none.
@@ -26,25 +42,16 @@ import (
 // reported so that route can refuse it instead. The extra work is a memo lookup
 // per path on the hit that already covers the routing path (see worktreeOf).
 func (r *router) toolCallWorktrees(params json.RawMessage) []string {
-	var call struct {
-		Arguments struct {
-			File  string   `json:"file"`
-			Dir   string   `json:"dir"`
-			Files []string `json:"files"`
-		} `json:"arguments"`
-	}
-	if err := json.Unmarshal(params, &call); err != nil {
-		return nil
-	}
+	args := parsePathArguments(params)
 	// The scalar arguments are ranged over as an array rather than concatenated
 	// with Files into one slice: this runs on the goroutine that routes every
 	// worktree's calls, and the combined slice was a heap allocation on every
 	// tools/call — including the overwhelmingly common one naming a single file.
 	var found []string
-	for _, path := range [...]string{call.Arguments.File, call.Arguments.Dir} {
+	for _, path := range [...]string{args.File, args.Dir} {
 		found = r.appendWorktreeOf(found, path)
 	}
-	for _, path := range call.Arguments.Files {
+	for _, path := range args.Files {
 		found = r.appendWorktreeOf(found, path)
 	}
 	return found
@@ -82,26 +89,45 @@ func (r *router) appendWorktreeOf(found []string, path string) []string {
 // directory memo is not free: containingDir lstats every component of the
 // argument, and a profile put two thirds of the routing path there — time the
 // reader goroutine spends routing nobody else's call. Kept as a second map so
-// that the directory memo's entry count stays exactly the number of git forks
-// the session has paid for.
+// that a path-cache rollover need not discard cached directory resolutions.
 func (r *router) worktreeOf(path string) string {
+	r.memoMu.Lock()
 	if worktree, ok := r.paths[path]; ok {
+		r.memoMu.Unlock()
 		return worktree
 	}
+	r.memoMu.Unlock()
 	dir := containingDir(path)
+	r.memoMu.Lock()
 	worktree, ok := r.worktrees[dir]
+	r.memoMu.Unlock()
 	if !ok {
 		var err error
 		if worktree, err = worktreeOfDir(r.ctx, dir); err != nil {
 			return ""
 		}
-		r.worktrees[dir] = worktree
+		r.memoMu.Lock()
+		r.memoize(r.worktrees, dir, worktree)
+		r.memoMu.Unlock()
 	}
-	// ponytail: unbounded, like the directory memo it fronts — an entry is two
-	// strings and a session names the files it is working on, not the tree. Cap
-	// it if some caller ever walks a repository through here.
-	r.paths[path] = worktree
+	r.memoMu.Lock()
+	r.memoize(r.paths, path, worktree)
+	r.memoMu.Unlock()
 	return worktree
+}
+
+// Clear at capacity instead of retaining a second eviction index. A discarded
+// entry is resolved afresh, including symlinks; failures remain uncached.
+// Caller holds memoMu. Each of the two caches has its own entry bound.
+func (r *router) memoize(cache map[string]string, key, value string) {
+	limit := r.limits.CacheEntries
+	if limit <= 0 {
+		limit = defaultCallLimits().CacheEntries
+	}
+	if len(cache) >= limit {
+		clear(cache)
+	}
+	cache[key] = value
 }
 
 // containingDir is input itself when it names a directory, and its parent

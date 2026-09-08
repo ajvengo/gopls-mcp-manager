@@ -45,13 +45,9 @@ type lane struct {
 	controls chan cancellation
 	done     chan struct{}
 
-	// ctx is this lane's own child of the session context, and the parent every
-	// per-request budget in send is derived from. One child per lane rather than
-	// two per request: WithTimeout registers itself on its parent under that
-	// parent's own mutex, so deriving each budget straight from the session
-	// context put every lane on one process-wide lock twice a message — on the
-	// register and again on the cancel — which is contention that grows with
-	// exactly the concurrency the lanes were introduced to buy.
+	// ctx owns this lane's control worker and shutdown. Delivery contexts start
+	// at ingress so queueing and resolution share the request lifetime before
+	// its destination lane is known.
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -96,6 +92,7 @@ draining:
 			break draining
 		default:
 		}
+		l.r.timed("delivery_queue", call.queued)
 		l.send(call.ctx, call.req)
 		call.cancel()
 	}
@@ -108,6 +105,7 @@ draining:
 }
 
 type delivery struct {
+	queued time.Time
 	req    *jsonrpc.Request
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -345,6 +343,7 @@ func (r *router) dialGopls(ctx context.Context, worktree string) (mcp.Connection
 // nothing but the handshake — the connection keeps the context it was dialled
 // with, which outlives this one on purpose; see dialBounded.
 func (l *lane) handshake(ctx context.Context, conn mcp.Connection) error {
+	defer l.r.timed("handshake", time.Now())
 	initialize := l.r.initialize.Load()
 	if initialize == nil {
 		// The other half of upstream's rule: a connection gets exactly one
@@ -370,7 +369,9 @@ func (l *lane) handshake(ctx context.Context, conn mcp.Connection) error {
 		// gopls asks for its roots the moment it has seen the capability in
 		// initialize — which is inside this window, before the reader that
 		// normally fields the question is even running.
-		if l.r.answeredUpstream(ctx, conn, l.worktree, msg) {
+		if answered, err := l.r.answeredUpstream(ctx, conn, l.worktree, msg); err != nil {
+			return err
+		} else if answered {
 			continue
 		}
 		l.r.forward(msg) // anything else it volunteered is the client's

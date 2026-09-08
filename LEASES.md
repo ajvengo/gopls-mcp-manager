@@ -8,8 +8,10 @@ Keep shared gopls processes and measure their usage before choosing a process
 ceiling. `status` reports registered server count, identity-checked RSS in KiB,
 and termination state. `ActiveClients: null` means unknown, not zero.
 `GOPLS_MANAGER_METRICS=1` reports per-operation registry lock wait/hold durations
-and per-session admitted/completed/rejected/peak/outstanding request counts to
-stderr. Request counts describe the bridge, not all clients of a shared server.
+and manager operation timings to stderr. Session snapshots every 30 s and at
+exit include request counts, rejection reasons, stage timings and retention
+counts. Request counts describe the bridge, not all clients of a shared server.
+Lane and memo limits bound each bridge; they do not authorize process eviction.
 
 A per-bridge idle timer is insufficient: another bridge may still be executing
 a call against the same gopls. A timeout or terminal local cancellation does not
