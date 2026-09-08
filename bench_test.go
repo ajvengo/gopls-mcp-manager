@@ -232,7 +232,7 @@ func BenchmarkWithRecords(b *testing.B) {
 			m := newTestManager(b)
 			// Every record answers alive without a syscall: the probes are another
 			// benchmark's subject, and a real one here would drown the file work.
-			m.alive = func(context.Context, record) bool { return true }
+			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 			if err := writeMap(m.mapPath, records); err != nil {
 				b.Fatal(err)
 			}
@@ -294,7 +294,7 @@ func BenchmarkSweepProbes(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				cleanRecords(records, func(r record) bool { return recordAlive(b.Context(), r) })
+				cleanRecords(records, func(r record) bool { return recordAlive(b.Context(), r) != probeGone })
 			}
 		})
 	}

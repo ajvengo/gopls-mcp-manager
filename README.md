@@ -43,7 +43,8 @@ Commands:
 | --- | --- |
 | `gopls-mcp-manager [bridge [path]]` | Run the stdio bridge. Default; `path` defaults to `.` and needs the `bridge` word before it |
 | `gopls-mcp-manager ensure [path]` | Start (or find) the gopls for `path`'s worktree, print its port |
-| `gopls-mcp-manager list` | Print the live servers, dropping and reaping dead records |
+| `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
+| `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS and termination state |
 
 `path` is resolved to the root of the worktree containing it, with symlinks
 removed. The worktree the bridge starts in is its **home**.
@@ -61,14 +62,18 @@ Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
   own working directory rather than yours. gopls' schemas ask for absolute paths.
 - **Calls with no usable path** (`go_workspace`, `go_search`, `go_package_api`)
   follow the sticky worktree, falling back to home.
-- **A cancellation follows the call it names.** Queued or dialling calls are
-  cancelled locally. Delivered calls use a separate bounded control queue to
-  reach the exact connection that owes their request id.
+- **A cancellation completes the call locally** and releases its outstanding
+  slot. Queued or dialling delivery is cancelled. Delivered calls also use a
+  separate bounded control queue to notify the exact owning connection; a late
+  answer is suppressed. Local completion does not prove upstream work stopped.
 - Everything else that is not a `tools/call` goes to home.
 
-Resolution shells out to `git rev-parse --show-toplevel`, so answers are
-memoized for the session — per path argument, backed by a per-directory memo, so
-each directory costs one `git` fork however many files you name in it.
+Resolution shells out to `git rev-parse --show-toplevel`, so successful answers
+are memoized per path and directory. One resolver worker gives the entire routing
+operation a 10 s budget, shared by all paths in a call. Late results cannot change
+sticky state. A stuck filesystem syscall occupies at most that one worker;
+subsequent routing can time out while it remains stuck. The reader preserves
+wire order, so cancellation behind resolution still waits for that bounded step.
 
 ## What the bridge handles for you
 
@@ -88,18 +93,40 @@ each directory costs one `git` fork however many files you name in it.
   lock acquisition, readiness, handshake and retry. An expired queued call
   cannot start a server. Filesystem syscalls cannot be interrupted by a Go
   context, and failed-child cleanup has a separate short budget. The budget
-  does not bound the answer after delivery: a gopls that goes quiet without
-  dying still leaves its caller waiting.
+  is separate from the optional post-delivery execution timeout described below.
 - **A full worktree queue rejects requests** with an overload error instead of
   blocking other worktrees. Each delivery and cancellation queue holds 64
   messages. Notifications are advisory and are dropped when their queue is full.
+- **Outstanding calls have separate limits:** 128 per worktree and 1024 per
+  session by default. A server accepting writes but never answering cannot evade
+  those limits by draining its delivery queue.
 - The bridge stops when the stdio client goes away, or on `^C` / `SIGTERM`.
   It waits for owned failed-child cleanup before exiting: SIGTERM, up to 2 s,
   then SIGKILL and up to 2 s to confirm exit. A failed child's record is removed
   only after exit is confirmed, with up to 2 s to acquire the cleanup lock.
 
-SPEC.md §3–§5 has the rest: which party may answer a call, what the private
-handshake ids are for, and what the budget deliberately excludes.
+## Limits and measurements
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Outstanding calls per session |
+| GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Outstanding calls per worktree |
+| GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
+| GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
+
+Counts must be positive. Execution timeout accepts Go durations such as 2m.
+A timeout releases local tracking and suppresses late results; upstream work may
+continue. If the client output queue is full at expiry, the session fails rather
+than accumulating blocked timer callbacks. Choose it to accommodate long diagnostics and vulnerability scans.
+
+Metrics include registry lock wait/hold nanoseconds and per-session request
+counts. MCP stdout stays protocol-only. The status command reports RSS in KiB
+only when the process identity matches; missing values and active-client counts
+are null rather than guessed. Status never signals a process or rewrites the map.
+
+There is no automatic eviction. [LEASES.md](LEASES.md) describes cross-client
+attachment and operation ownership, fencing, and the evidence required before
+introducing a resource ceiling. SPEC.md contains the behavioral contract.
 
 ## State on disk
 
@@ -127,8 +154,8 @@ killing the process strands a full workspace index — routinely 1–2 GB reside
 that no longer appears in `list`, still holds its port, and lives until reboot.
 
 A record is therefore checked on several counts before it is dropped, and the
-process is signalled when it is. All the records are checked at once, because
-the map is locked for the whole sweep and each probe waits out its own timeout:
+process is signalled when it is. All records in an atomic snapshot are checked concurrently outside the global
+registry lock. Reconciliation applies verdicts only to unchanged record identities:
 
 1. `kill(pid, 0)` — is anything there at all?
 2. A record younger than 15 s is kept unprobed. A gopls between fork and bind
@@ -140,10 +167,16 @@ the map is locked for the whole sweep and each probe waits out its own timeout:
 4. `ps` must still show that pid running a gopls with *our* listen address, since
    the map survives reboots that recycle every pid in it.
 
-The rule throughout is that being unsure keeps the server: only a conclusively
-dead record is signalled. A record that is no longer ours is dropped either way
-but never signalled, since otherwise nothing would reap it. SPEC.md §8 has the
-verdict table and the reasoning behind each.
+Probes report live, uncertain, terminate or gone without signalling. Termination
+is persisted as `Terminating: true` before an action lock and fresh identity check
+permit SIGTERM. A successful signal does not remove the record: later sweeps must
+confirm that the old process is gone. Ensure refuses terminating endpoints and
+does not spawn beside them. A process ignoring SIGTERM stays discoverable.
+
+Update all manager binaries sharing the registry before relying on this field;
+older versions ignore it. Shared-process sweep cleanup does not escalate to
+SIGKILL. The manager's own failed children retain their bounded escalation and
+reaping behavior. SPEC.md §8 describes reconciliation and identity safeguards.
 
 ## Development
 

@@ -25,9 +25,9 @@ func run(args []string, stdout io.Writer) error {
 	if len(args) > 1 {
 		command = args[1]
 	}
-	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | list", args[0])
+	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | list | status", args[0])
 	switch command {
-	case "list":
+	case "list", "status":
 		if len(args) != 2 {
 			return usage
 		}
@@ -46,6 +46,9 @@ func run(args []string, stdout io.Writer) error {
 	// Cover startup and list's lock wait as well as the running bridge.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if command == "status" {
+		return m.status(ctx, stdout)
+	}
 	if command == "list" {
 		return m.list(ctx, stdout)
 	}

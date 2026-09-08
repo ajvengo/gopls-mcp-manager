@@ -152,6 +152,7 @@ func handshakeReady(r *router) {
 func sendCall(t *testing.T, l *lane, name string) jsonrpc.ID {
 	t.Helper()
 	id := mustID(t, name)
+	l.r.track(id, nil, l.worktree)
 	l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"})
 	return id
 }
@@ -638,6 +639,7 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 		initialize := &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)}
 		r.initialize.Store(initialize)
 
+		r.track(id, nil, home)
 		newLane(r, home).send(t.Context(), initialize)
 		// The retry is the whole point: with a reader racing the write for the id,
 		// send() finds the call already answered and this write never comes.
@@ -669,6 +671,7 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 		l := connectedLane(r, r.home, held)
 
 		id := mustID(t, "client-initialize")
+		r.track(id, nil, l.worktree)
 		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)})
 
 		wantClientError(t, r, id, "a second initialize was left unanswered")
@@ -934,6 +937,7 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 
 		// Not sendCall: this conn's onWrite is built around this exact id, and
 		// minting a second one from the same string would only hide that.
+		r.track(id, nil, l.worktree)
 		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"})
 		close(conn.reads) // the upstream dies once the call is long since answered
 		mustRecv(t, done, "the upstream reader to finish")

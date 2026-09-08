@@ -38,10 +38,10 @@ func TestCancelledSweepPreservesRecords(t *testing.T) {
 	mustWriteMap(t, m.mapPath, []record{r})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	m.alive = func(ctx context.Context, _ record) bool {
+	m.alive = func(ctx context.Context, _ record) probeVerdict {
 		cancel()
 		<-ctx.Done()
-		return false
+		return probeGone
 	}
 	_, err := m.withRecords(ctx, func([]record) ([]record, error) {
 		t.Error("cancelled sweep entered the mutation")

@@ -91,7 +91,8 @@ func TestCancellationBypassesFullDeliveryQueue(t *testing.T) {
 		if _, err := recvRequest(upstream.writes, "notifications/cancelled"); err != nil {
 			t.Fatal(err)
 		}
-		wantClientQuiet(t, r, "advisory cancellation produced a response")
+		_ = wantWireError(t, wantClientError(t, r, mustID(t, "sent"), "cancellation did not complete locally"), -32800)
+		wantClientQuiet(t, r, "cancellation replied twice")
 	})
 }
 
@@ -100,8 +101,11 @@ func TestFullControlQueueDoesNotBlockRouting(t *testing.T) {
 		r := newTestRouter(t, testHome)
 		l := pausedLane(t, r, testHome)
 		r.track(mustID(t, "sent"), newFakeConn(), testHome)
-		for range laneQueue + 1 {
-			r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"sent"}`)})
+		for i := range laneQueue + 1 {
+			id := fmt.Sprintf("sent-%d", i)
+			r.track(mustID(t, id), newFakeConn(), testHome)
+			r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(fmt.Sprintf(`{"requestId":%q}`, id))})
+			_ = wantWireError(t, wantClientError(t, r, mustID(t, id), "cancellation did not complete locally"), -32800)
 		}
 		queuedCall(t, r, "still-routes")
 		call := mustRecv(t, l.reqs, "delivery after a full cancellation queue")

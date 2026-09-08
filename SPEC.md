@@ -18,146 +18,77 @@ MCP client ──stdio──▶ gopls-mcp-manager ──SSE/HTTP──▶ gopls 
 
 ## 2. Routing
 
-For each message read from the client:
+R1. Only absolute file, dir and files arguments are routing evidence. Relative
+paths and ordinary resolution failures preserve sticky routing, falling back to
+home. Every resolvable path must identify the same worktree; a mixed-worktree
+call fails without changing sticky state.
+→ `TestToolCallRoutesToTheWorktreeOwningItsPath` (case "relative path"),
+`TestToolCallSpanningTwoWorktreesIsRefused`
 
-| Message | Destination |
-| --- | --- |
-| `tools/call` whose `file`, `dir` or `files[i]` resolves to a worktree | that worktree; it becomes sticky |
-| `tools/call` with no such argument | sticky, else home |
-| `notifications/cancelled` naming a request still in flight | cancel queued/dialling delivery locally, otherwise forward on the owning connection's control queue |
-| any other request or notification | home |
-| anything but `initialize`, before the client's `initialize` | refused, or dropped if it is a notification (H1a) |
-| a response | dropped |
+R2. A missing immediate parent is not climbed past. Symlinked files resolve to
+the worktree holding the target; existing and missing files under a symlinked
+directory share its physical directory memo key.
+→ `TestWorktreePathResolvesEachPathToItsOwnWorktree`,
+`TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles`
 
-R1. **Only absolute paths are evidence.** A relative path resolves against the
-manager's own working directory, which is home, so it would override correct
-sticky routing for every worktree but home.
-→ `TestToolCallRoutesToTheWorktreeOwningItsPath` (case "relative path")
+R3. Pathless calls follow the last successfully resolved single worktree.
+Routing decisions commit in client wire order. Each worktree has one delivery
+lane, so a cold dial or handshake does not block delivery on another lane.
+→ `TestTargetFallsBackToTheLastPathBearingCall`,
+`TestAColdWorktreeDoesNotHoldUpAnother`
 
-R2. **An unresolvable path is not evidence either** — the call keeps its current
-server, which then reports its own error for the path. A path under a directory
-that does not exist yet resolves to nothing, not to the repository above it.
-→ same test, case "unresolvable path";
-  `TestWorktreeOfResolvesAndMemoizes` (case "a missing directory is no evidence")
+R4. One total 10 s routing budget covers the resolver queue and every path in
+one message, rather than a fresh timeout per path. A single worker with an
+unbuffered job channel owns resolution and both memos. A non-cancellable
+filesystem syscall can occupy that worker after timeout, but cannot create
+unbounded replacement workers or commit a late sticky result. A routing timeout
+fails the call rather than falling back to a possibly wrong worktree.
+→ `TestRoutingBudgetDoesNotMultiplyOrGrowWorkers`
 
-R2a. **A call whose paths land in two worktrees is refused**, with
-`CodeInvalidParams` naming both, rather than answered by either. Every path
-argument is resolved, not just the first: tools like `go_diagnostics` take a
-`files` array, and one gopls only knows the tree it was started for, so routing
-such a call by its first path answers about that worktree while saying nothing
-at all about the files in the other — and what comes back is a well-formed
-result for the subset it did cover, an omission the client has no way to see. A
-refusal it can act on is worth more than an answer it cannot trust. Sticky is
-left untouched, since the call picked no worktree; a notification, having no id,
-is dropped as under H1a. One worktree named by several paths is one destination
-and is not affected.
-→ `TestToolCallRoutesToTheWorktreeOwningItsPath` (cases "one worktree named
-  twice", "paths in two worktrees"), `TestToolCallSpanningTwoWorktreesIsRefused`
+The reader waits for that bounded decision before reading the next message.
+Cancellation behind resolution therefore still waits up to the routing budget.
+Pathless tool calls currently use the same resolver worker. The delivery budget
+starts after successful routing; it does not reset the routing budget.
 
-R3. **Sticky survives calls that carry no path.**
-→ `TestTargetFallsBackToTheLastPathBearingCall`
+R5. Successful resolutions are memoized by verbatim path and physical containing
+directory. Failures are not cached. Neither memo currently expires or has a size
+cap; retargeting a symlink or replacing a worktree can leave a stale hit until
+session restart.
+→ `TestWorktreeOfResolvesAndMemoizes`
 
-R3a. **Each worktree has a lane**: a queue and the one goroutine that owns its
-upstream. The goroutine reading the client picks a destination and hands the
-message over; dialling, handshaking, retrying and replacing that upstream all
-happen on the lane. A cold worktree therefore costs only its own calls, where it
-used to block every worktree's for as long as an `flock` wait, a `gopls` spawn
-and a whole handshake took. Order within a worktree is the queue's; between
-worktrees there is none, and never was.
+R6. Each delivery and control queue holds 64 messages. Admission never waits for
+space: excess requests receive overload error -32000; excess notifications are
+dropped. Queue time counts against the delivery budget, and expired queued work
+cannot start a server.
+→ `TestFullLaneRejectsWithoutBlockingOtherWorktrees`,
+`TestQueuedDeliveryExpiresWithoutDialling`
 
-What stays on the reader is picking the destination, which R4's `git` fork is
-part of: a first-touch path on a stalled filesystem still costs every worktree
-up to that subprocess's 10 s. Choosing has to be serialized there — sticky (R3)
-and the cancel-behind-its-call ordering (R7) both depend on it — so what the
-lanes removed is the `flock` wait, the spawn and the handshake, not every way one
-worktree can delay another. A lane's queue is 64 deep; admission never waits for
-space. Requests exceeding that capacity receive overload error -32000, and
-notifications exceeding it are dropped. Queue time counts against H5's budget.
-Expired queued calls fail without dialling an upstream.
-→ `TestAColdWorktreeDoesNotHoldUpAnother`,
-  `TestFullLaneRejectsWithoutBlockingOtherWorktrees`,
-  `TestQueuedDeliveryExpiresWithoutDialling`
+R7. Cancellation completes the named outstanding request locally with -32800,
+releases its outstanding slot and suppresses a later upstream response. Queued
+or dialling delivery is cancelled. Once assigned to a connection, advisory
+cancellation carries that exact connection on the lane's control queue and waits
+for the original write to finish before forwarding. A full control queue can
+drop the advisory notification but cannot undo local completion. Unknown,
+already completed or malformed cancellation ids are dropped. A notification
+itself has no response; the terminal response belongs to the request it names.
+→ `TestQueuedCancellationPreventsDelivery`,
+`TestCancellationBypassesFullDeliveryQueue`,
+`TestCancellationCannotOvertakeItsCall`,
+`TestCancellationFollowsACallOntoItsRetryConnection`
 
-R4. **A linked worktree is a distinct destination**, and a nested directory
-resolves to the worktree containing it. Resolution goes through
-`git rev-parse --show-toplevel`, then `EvalSymlinks`, so two paths naming the
-same tree agree. The argument is resolved the same way *before* it is reduced
-to a directory, because that reduction is lexical: a symlinked file is not a
-directory, so its parent would be the link's own, and a link pointing into
-another worktree would route to the tree holding the link rather than the tree
-holding the code. A linked *directory* needs no help — `git -C` resolves its
-cwd physically — but a linked file never reaches git, since only its parent is
-passed. When the whole path cannot be resolved, its immediate parent is resolved
-if that parent exists. Existing and missing files under a symlinked directory
-therefore share one physical memo key. A missing parent is never climbed past,
-which preserves R2.
-→ `TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles`
+R8. Outstanding requests are bounded independently of queue depth: 128 per
+worktree lane and 1024 per session by default. A server accepting writes without
+answering cannot bypass these limits by draining the delivery queue. Completion,
+failure, execution timeout, local cancellation and session teardown release
+tracking state. Retry retains the same admission slot.
+→ `TestOutstandingLimitsSurviveFastDelivery`
 
- The subprocess is bounded at
-10 s, for the same reason H5 bounds the handshake: it runs on the goroutine that
-reads the client, so a `git` wedged on an unresponsive filesystem would otherwise
-stall the session for good. On expiry the path is simply unresolvable, which is
-R2.
-
-The 10 s sits on top of the **caller's own context** — the session's on the
-routing path — rather than on a fresh background one, so a `git` parked on a
-dead mount ends when the session does instead of outliving it by up to its own
-timeout, with nothing left to serve by the time it returns. The timeout stays,
-because the caller's context need carry no deadline of its own: on the CLI path
-it is the interrupt context, which is what makes `^C` reach a `git` that
-`bridge` and `ensure` both run before any session exists.
-→ `TestWorktreePathResolvesEachPathToItsOwnWorktree`
-
-R5. Successful resolutions are memoized for the session, **keyed by the
-directory** holding the path rather than by the path itself: every path in a
-directory has the same worktree, so one entry — one `git` fork — covers every
-file a session names under it. The key is also what gets resolved: the reduction
-to a directory happens once, at the top, and `worktreeOfDir` accepts nothing
-else, so a second one cannot be expressed — it would climb past the directory
-the key names, and R2 would stop holding. Failures are not cached, so a path
-that becomes resolvable later still gets its own lookup. Nothing invalidates a
-hit, so a worktree removed mid-session — or a directory that becomes part of a
-different worktree, by being replaced with a linked one at the same path — keeps
-answering with what it resolved to first, until the routed gopls reports the
-path itself.
-
-The verbatim path argument is memoized **in front** of that, because reaching
-the directory memo is not free: `containingDir` lstats every component, which a
-profile put at two thirds of the routing path — time the reader goroutine spends
-routing nobody else's call. Two maps rather than one, so the directory memo's
-entry count stays exactly the number of `git` forks the session has paid for,
-which is what the tests assert on. Neither memo is invalidated and neither is
-bounded; the front one carries its own `ponytail:` note.
-→ `TestWorktreeOfResolvesAndMemoizes` (cases "one directory, three spellings, one
-  fork", "two worktrees stay apart across a memo hit");
-  `TestWorktreePathResolvesEachPathToItsOwnWorktree`
-
-R6. **The client never sends a response the bridge needs.** `roots/list` is
-answered locally and every other server-initiated request is refused, so a
-response from the client answers nothing and is discarded.
-
-R7. **A cancellation follows its request, not the default route.** Ownership is
-recorded at queue admission. If delivery is still queued or dialling, cancellation
-ends its delivery context; the lane fails the call with error -32800 without
-sending it. Unknown or malformed cancellation ids are dropped.
-→ `TestCancellationFindsACallItsLaneHasNotSentYet`,
-  `TestQueuedCancellationPreventsDelivery`, `TestDeliveryCancellationStopsADial`
-
-Once a connection is assigned, cancellation uses a separate 64-message control
-queue carrying that exact connection. It cannot open a connection, block the
-client reader on lane capacity, or overtake the target call's write. A full
-control queue drops excess notifications; control delivery has a 30 s budget.
-→ `TestCancellationBypassesFullDeliveryQueue`,
-  `TestFullControlQueueDoesNotBlockRouting`, `TestCancellationCannotOvertakeItsCall`,
-  `TestCancellationForADisconnectedUpstreamIsDroppedNotDialled`
-
-A retry restores cancellable ownership before dialling. The brief interval
-between claiming the failed attempt and restoring the entry can still lose an
-advisory cancellation. A control already bound to the failed connection is not
-retargeted to the replacement. Delivered calls remain the upstream's to answer;
-cancellation does not synthesize their final response.
-→ `TestCancellationFollowsTheRequestToItsUpstream`,
-  `TestCancellationFollowsACallOntoItsRetryConnection`
+R9. Execution deadlines are optional and disabled by default. When configured,
+the timer starts after successful delivery and competes with responses and
+connection failure for one terminal completion. A timer carries a generation
+token so a delayed callback cannot complete a newer request with the same id.
+A timeout ends local waiting; it does not prove upstream work stopped.
+→ `TestExecutionDeadlineCompletesOnce`
 
 ## 3. Handshake
 
@@ -245,8 +176,8 @@ HTTP POST on a client carrying no timeout of its own, so under the session
 context alone a server that takes the POST and never completes it parks its lane
 on that one call. Subsequent calls can fill the bounded lane queue, at which
 point excess requests are refused rather than blocking other worktrees. Only the
-delivery is covered; how long gopls then takes to answer is its own business and
-stays unbounded (§10).
+delivery is covered by this budget. Post-delivery waiting is governed by the
+optional execution timeout and outstanding limits (R8–R9).
 
 ## 4. Server-initiated requests
 
@@ -316,8 +247,10 @@ answer before `Write` returns; recorded afterwards, the entry would outlive the
 answer and F2 would later emit a second, contradictory reply to the same id.
 → `TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed`
 
-F5. **Whoever takes an id off the pending list owns the reply.** F2, F4 and the
-retry all race for the same call: a failed write and
+F5. **Whoever takes an id off the pending list owns the reply.** Responses,
+connection failure, cancellation and execution timeout compete for completion.
+A retry atomically changes the owning connection to nil while retaining the
+admission slot and cancellation state; it cannot revive a completed call. In particular, a failed write and
 that connection's reader seeing the death are one event seen twice. If the
 reader wins it has already answered under F2, and a retry that then succeeded
 would produce a second reply to an id the client has closed — which the client
@@ -358,7 +291,7 @@ and an exotic umask could leave the file unreadable to its own writer.
 M2. Every read-modify-write is wrapped in an exclusive `flock` on
 `<map>.lock`, so concurrent `bridge`/`ensure`/`list` processes serialize.
 Acquisition uses nonblocking attempts separated by cancellable 10 ms waits.
-All three CLI commands install signal cancellation before reaching the lock.
+All CLI commands install signal cancellation before manager operations.
 
 The write is therefore skipped when it would change nothing — the steady state,
 a warm worktree whose record is present and still answering. The `fsync` in M1
@@ -410,108 +343,57 @@ fails, are skipped in order.
 
 ## 8. Liveness
 
-Records are swept concurrently (L6). Within one record the steps run in order:
+Probing is read-only and returns one of four verdicts: live, uncertain,
+terminate, or gone. A boolean cannot express the distinction between a process
+that should stop and one confirmed gone.
 
-1. `kill(pid, 0)` — any error but `EPERM` means gone; the record is dropped,
-   nothing to kill.
-2. **Start grace (L7).** A record younger than the readiness budget plus 5 s
-   (15 s today) is alive, full stop.
-3. HTTP probe of `127.0.0.1:<port>`, 500 ms, expecting `200` and
-   `Content-Type: text/event-stream`.
-   - answered → alive, done
-   - refused → dead; nobody is listening
-   - **timed out → inconclusive.** A gopls indexing a large tree under a GC
-     pause looks identical to a corpse.
-   - **answered something else → inconclusive.** A 503, or a path a later gopls
-     moved, still came from a process holding that port. Retrying would only
-     reach the same verdict a moment later, since a server answering wrongly
-     answers wrongly again.
-   - **anything else → inconclusive.** Only refusal is about the server; a
-     dial that fails for descriptors, an unreachable host or a cancelled
-     context is about this process, and reading death into it would condemn
-     every record in the sweep at once.
-4. Identity, by `ps`: does that pid still run a `gopls` whose command line
-   contains our listen address?
-   - ps failed or the operation was cancelled → keep the record; no signal
-   - inconclusive **and** ours → alive; the record is kept, nothing is signalled
-     → `TestRecordAlive` (cases "a server that only timed out is spared",
-       "a server answering 503 is spared")
-   - inconclusive **and** not ours → the record is dropped, nothing is signalled
-     → same test, case "an inconclusive record that is no longer ours is dropped
-       unsignalled"
-   - dead **and** ours → `SIGTERM`, and the record is dropped
-     → same test, case "a process with no MCP endpoint is killed"
-   - dead **and** not ours → the record is dropped, nothing is signalled
-     → same test, cases "not a gopls at all", "a gopls we did not run",
-       "a gopls on another port"
+1. Check process existence with kill(pid, 0). A missing process is gone.
+2. For a record already marked Terminating, check process identity. Keep it
+   terminating while it still belongs to us; an identity error is uncertainty.
+3. Otherwise, a living process inside the 15 s start grace is kept without an
+   HTTP probe. Future timestamps receive no grace.
+4. Probe the endpoint with a 500 ms ceiling. A valid SSE response is live;
+   connection refused is the only conclusive endpoint failure.
+5. On other results, check that ps still identifies our gopls and listen address.
+   Identity failure is uncertainty. A different process means our old record is
+   gone and is never signalled. Refusal plus matching identity requests
+   termination; other matching results remain uncertain.
 
-L1. **Every record is offered to the liveness check**, including a second record
-for a worktree that `ensure` will never answer with. The record is the only
-handle on that process, and its port really is taken.
-→ `TestCleanRecordsOffersEveryRecordAndDropsOnlyTheDead`, and `FuzzCleanRecords`
-  for the same two properties at any length: the probes run at once and write
-  into a shared slice by index, so what survives is assembled rather than
-  filtered, and the order has to survive too — `forget` matches a record by
-  value.
+→ `TestRecordAlive`, `FuzzWithinStartGrace`
 
-L2. **A dropped record's process is always signalled while it is still ours.**
-Otherwise a 1–2 GB index survives unreferenced, holding its port, until reboot,
-and the next `ensure` for that worktree starts a second one beside it. A record
-whose pid is no longer ours has no index behind it to strand.
+L1. Every snapshot record is probed concurrently, including duplicate worktree
+records. Probes run outside the global registry flock. Reconciliation rereads
+the current map under lock and applies a verdict only to an exactly matching
+record. New or replaced records are retained; a stale result cannot delete or
+mark a replacement.
+→ `TestSweepReconcilesOnlyTheProbedIdentity`
 
-L3. Identity is checked by listen address, not by process name. The process most
-likely to be called `gopls` after pid reuse is the one the user's editor
-started.
+L2. Before signalling, persist Terminating=true. This commit survives a later
+caller mutation failure. A separate per-record action flock serializes signal
+attempts. Recheck the atomic registry snapshot and process identity before
+SIGTERM, without holding the global registry lock.
+→ `TestSweepSignalsOnlyAfterPersistingTermination`
 
-L5. **No verdict is a one-way door.** Nothing revisits a record kept as alive,
-so a record kept on an inconclusive probe alone would send every later `ensure`
-to a port its gopls no longer holds, with no command able to reap it. Identity
-is what bounds this: an inconclusive probe buys a record another sweep only for
-as long as the pid is still ours.
-→ `TestRecordAlive` (case "an inconclusive record that is no longer ours is
-  dropped unsignalled")
+L3. Sending SIGTERM is not proof of exit. Retain the record on signal error,
+ignored SIGTERM or delayed exit; ensure refuses its endpoint and does not spawn
+another process for that worktree. A later sweep removes it only when the old
+process is gone or identity belongs to a different process. This cross-process
+path does not automatically escalate to SIGKILL; owned failed children use P2a.
+→ `TestSweepRetainsAProcessIgnoringTermination`
 
-L4. The sweep writes its own result back, so a dead record disappears from the
-file as a side effect of any command that reaches a port. A body that returns an
-error is the exception: nothing is written, so `ensure` returning early — no port
-allocatable, or `gopls` failing to start — leaves the swept records in the file.
-Only the file, since the sweep signalled them under L2 before the failure; the
-next command re-probes corpses that answer nothing and drops them again. A
-`gopls` missing from `PATH` therefore keeps the same dead lines in the map until
-a command succeeds.
-→ `TestListShowsLiveRecordsAndCleansDeadRecords`,
-`TestWithRecordsWritesNothingWhenTheBodyRefuses`
+L4. Ordinary reconciliation and caller mutation share a single atomic commit.
+When the body refuses and no termination action is required, nothing is written.
+A terminating transition is deliberately a separate prior commit: even if
+ensure then refuses that worktree, its cleanup record must stay discoverable.
+Cancelled probes do not reach reconciliation.
+→ `TestWithRecordsWritesNothingWhenTheBodyRefuses`,
+`TestCancelledSweepPreservesRecords`
 
-L6. **Records are swept concurrently**, so the liveness check has to be safe to
-call from several goroutines at once. The sweep runs inside M2's exclusive
-`flock` and each probe waits out its own 500 ms, so in sequence the lock would be
-held for the sum of the timeouts rather than the longest one — paid by every
-other `bridge`, `ensure` or `list` process, and so by another worktree's next
-tool call.
-→ `TestCleanRecordsProbesEveryRecordAtOnce`
-
-L7. **A record inside its start grace is alive without being probed.** Between
-fork and bind a starting gopls refuses every probe, and refusal is the one
-conclusive verdict above — so a sweep landing in that window would `SIGTERM` a
-server that is coming up exactly as it should. P4 is what puts that window in
-another process's reach: the readiness wait no longer holds the map lock. The
-grace is derived as the readiness budget plus 5 s, so that it outlasts it by
-construction — the two are spent in different processes, and one number must not
-be tunable without the other.
-
-The grace is asked **after** step 1, never before it. It covers a process that
-exists and has not bound yet, and a start that crashed instead is not that:
-spared until its timestamp expired, such a record would answer every `ensure`
-for its worktree with a dead port for the rest of the window. A timestamp in the
-future buys nothing either — this field is the only way to make a record
-immortal, and the file is meant to be hand-editable.
-→ `TestRecordAlive` (cases "a gopls still inside its start grace is spared",
-  "a start that died inside its grace is not spared", "a record dated in the
-  future gets no grace"), and `FuzzWithinStartGrace` for the claim across the
-  whole domain rather than three points of it — this is the one field M1 does
-  not range-check, since unlike the other three it is no argument to `kill(2)`,
-  and the arithmetic behind it both wraps (the conversion to Go's epoch) and
-  saturates (the subtraction into a nanosecond `Duration`).
+L5. Start grace is readyTimeout plus 5 s by construction. Existence is checked
+before grace, so an already dead start is not spared. The initial readiness wait
+is outside the flock, while the persisted record reserves its port.
+→ `TestClaimPortReturnsBeforeItsGoplsIsReady`,
+`TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`
 
 ## 9. Spawning
 
@@ -585,80 +467,64 @@ reports it.
   `TestCancelledReadinessLeavesAnotherProcessesServerAlone`
 
 P7. Concurrent `ensure` calls for one worktree start **one** gopls between them:
-M2's `flock` covers the sweep, the allocation, the spawn and the record write as
+M2's `flock` covers reconciliation, allocation, spawn and the record write as
 one step, so no second caller can see the port free while a spawn is in flight.
 → `TestConcurrentClaimPortSpawnsOnce`
 
 ## 10. Known limits
 
-- Delivery waits observe cancellation, but filesystem operations such as stat,
-  open, fsync and rename cannot be interrupted by a Go context. Path resolution
-  still runs before queue admission on the shared reader. Failed-child cleanup
-  can take up to 4 s for termination/reaping plus 2 s for the registry lock,
-  beyond the delivery deadline. If the OS cannot reap a killed child in that
-  window, the error names its pid; an existing record is retained.
-- **A worktree path must be valid UTF-8.** A Unix path is arbitrary bytes, but
-  the map file is JSON, and `json.Marshal` replaces invalid UTF-8 with U+FFFD
-  rather than failing. Such a record would read back naming a worktree nobody
-  asked for — never matching its own, so every `ensure` would start another
-  gopls beside the last and `forget` would never find the record to drop.
-  `writeMap` refuses it instead, so the failure is one error rather than a
-  process leak.
+- Routing waits are bounded even if the OS stalls a filesystem syscall, but the
+  single resolver worker can remain occupied until that syscall returns.
+  Session shutdown does not wait for that worker. Other filesystem operations,
+  including registry reads, fsync and rename, are not context-interruptible.
+- The shared stdout queue still backpressures forwarding when the client
+  stops reading. An execution-timeout callback finding this queue full fails
+  the session rather than parking an unbounded number of timer goroutines. Delivery/handshake code forwarding unsolicited messages can
+  also encounter that output backpressure.
+- With execution deadlines disabled, an accepted request can wait indefinitely;
+  outstanding limits bound retained requests, not execution duration.
+  Cancellation or timeout cannot prove that a gopls mutation stopped.
+- Live process count and routing memos are not capped. No idle eviction is
+  enabled. Cross-client attachment and operation ownership must be established
+  first; see LEASES.md.
+- A terminating process that ignores SIGTERM remains recorded and blocks ensure
+  for its worktree. This preserves operator visibility. Owned failed children
+  have bounded escalation; a sweeper has no owned process handle.
+- PID identity checks still race signals on POSIX. Per-record action locks
+  serialize cooperating managers but cannot make OS PID reuse atomic.
+- Old manager binaries ignore Terminating. Upgrade all managers sharing the map
+  before relying on termination retention; mixed-version safety is not promised.
+- Duplicate records for a worktree are preserved, and ensure uses the first.
+- Worktree paths must be valid UTF-8 to round-trip through JSON.
   → `FuzzMapRoundTrip`
-- A wedged server — accepting connections, answering nothing or answering
-  something that is not our endpoint — is our own gopls under §8 step 4, so it
-  is kept for as long as it runs, at one probe and one `ps` per sweep. Kept
-  deliberately: a timeout is also what a gopls indexing a large tree under a GC
-  pause looks like, and L5 would rather re-ask than kill a healthy 1-2GB index.
-  So its port keeps being handed back, and every call to that worktree pays the
-  budget again — H6 bounds the connect it stalls, H5 the handshake if it gets
-  that far, and neither ends the record. What the bounds buy is that the lane
-  fails each call and stays usable, rather than parking on the first one for the
-  rest of the session.
-- Delivery and control queues each hold 64 pending messages per lane. Excess
-  requests fail with overload; excess notifications are dropped. Control
-  forwarding remains advisory and can time out. A client that stops reading
-  responses can still backpressure the shared output queue.
-- **Nothing bounds a call once it has been written.** H5 covers the handshake
-  only; past it, the answer is whatever `readFromUpstream` reads, under the
-  session context alone. An upstream that takes a `tools/call` and then neither
-  answers nor dies leaves the client waiting forever — F2 fires on a connection
-  dying, not on one going quiet, and the §8 sweep asks a fresh probe whether the
-  server is up, not whether that call is progressing. Cancelling it (R7) reaches
-  the right gopls but does not release the caller either.
-- A cancellation for a call whose upstream is already gone is dropped by that
-  worktree's lane rather than dialling the worktree back (R7). The call itself
-  is not left hanging: the dead connection's reader fails it under F2.
-- A spawn that fails takes its own caller's call down, and briefly a concurrent
-  one's too: between the starter's `SIGTERM` and its `forget` landing, another
-  process can still find the record inside its grace, wait out P6's budget on a
-  port that will never answer, and report the same failure. It self-heals — once
-  `forget` lands, or once the process is gone and step 1 reaps the record, the
-  next `ensure` starts a fresh gopls — but that one call is lost where the
-  lock-across-readiness design would have made it wait and then succeed.
-- Duplicate records for one worktree are preserved rather than reconciled;
-  `ensure` answers with the first.
-- **Nothing caps how many gopls run at once, and nothing evicts an idle one.**
-  Every other quantity here is bounded — the lane queue, the handshake budget,
-  the port range — but the process count is not: a session that touches N
-  worktrees ends with N servers at 1–2 GB each, and the map outlives the
-  session, so a box that is not rebooted accumulates them across invocations.
-  Reaping is for servers that have already died (§8); a live one is never
-  gathered for being unused. Deliberate rather than overlooked, and it is L5's
-  position taken to its conclusion: the sweep would rather re-ask than kill a
-  healthy index, and an eviction clock cannot tell a worktree that is finished
-  from one between two calls — it would reclaim the memory by throwing away the
-  index the next call needs, paying a full cold start for it. What is missing is
-  a ceiling, not a clock: the operator's handle today is `list` plus killing the
-  ones they know are done. An LRU cap belongs here the day someone observes the
-  memory actually hurting, and it wants a real number, not a guess.
-- **The identity check races the signal it guards.** §8 asks `ps` whether a pid
-  is still our gopls and then calls `kill` on it, so a pid recycled between the
-  two receives a `SIGTERM` meant for its predecessor. Unfixable as written and
-  left alone rather than papered over: POSIX offers no "signal this pid only if
-  it is still that process", and the portable handle that would — holding the
-  child's own `*os.Process`, as P3 does — exists only in the process that
-  started it, which is precisely not the one sweeping. The window is the two
-  syscalls wide, it needs a pid to wrap around onto that exact number inside it,
-  and the check already removes the far larger risk it was written for: a pid
-  reused across a reboot, where the map's numbers are stale by definition.
+- A starter failing readiness can briefly cause another caller waiting on its
+  start-grace record to fail too. Once confirmed exit is forgotten, ensure can
+  start a fresh generation.
+
+## 11. Configuration and observation
+
+Environment variables are parsed when constructing the manager:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Session outstanding-request ceiling |
+| GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Per-worktree outstanding ceiling |
+| GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional post-delivery timeout |
+| GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON observations on stderr |
+
+Counts must be positive integers. Execution timeout must be a nonnegative Go
+duration. Metrics report registry lock wait and hold nanoseconds and session
+admitted/completed/rejected/peak/outstanding counts. Completed includes local
+termination and shutdown cleanup, not just successful upstream answers.
+→ `TestCallLimitConfiguration`
+
+The status command is read-only, emits JSON and never invokes a sweep. It reports
+recorded server count, registry integrity, termination state and RSS in KiB when
+ps matches the recorded gopls identity. Missing measurements are null. Active
+client count is always null until cross-client accounting exists.
+→ `TestStatusMeasuresWithoutChangingRegistry`
+
+Implementation remains one package. Session transport, routing, resolver/path
+logic, lanes, request accounting, upstream protocol handling, registry,
+process lifecycle and probes live in separate files. requests.go owns terminal
+request completion and generation checks; registry.go owns persistent mutation.

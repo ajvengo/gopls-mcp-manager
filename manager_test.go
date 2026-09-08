@@ -526,8 +526,11 @@ func TestRecordAlive(t *testing.T) {
 			if test.startedAt != nil {
 				r.StartedAt = test.startedAt()
 			}
-			if got := recordAlive(t.Context(), r); got != test.wantAlive {
+			if got := recordAlive(t.Context(), r); (got == probeLive || got == probeUncertain) != test.wantAlive {
 				t.Errorf("recordAlive() = %v, want %v", got, test.wantAlive)
+			}
+			if test.want == signalled && recordAlive(t.Context(), r) != probeTerminate {
+				t.Error("refused owned endpoint was not marked for termination")
 			}
 			if answered != nil && !answered() {
 				t.Fatal("the probe never reached the server, so this row's verdict was reached by the wrong route")
@@ -536,7 +539,7 @@ func TestRecordAlive(t *testing.T) {
 			case spared:
 				wantRunning(t, cmd, "a server that should have been spared was signalled")
 			case signalled:
-				wantSignalled(t, cmd, "the server declared dead was left running")
+				wantRunning(t, cmd, "a read-only probe signalled a process")
 			case alreadyGone:
 			}
 		})
@@ -597,7 +600,7 @@ func TestWithRecordsWritesOnlyWhenTheFileWouldChange(t *testing.T) {
 			// Every record alive, so the sweep hands back what it was given and the
 			// records are equal in both rows — leaving the intact flag as the only
 			// thing that differs between them.
-			m.alive = func(context.Context, record) bool { return true }
+			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 			mustWriteMap(t, m.mapPath, []record{kept})
 			if tc.damage != "" {
 				appendToMap(t, m.mapPath, tc.damage)
@@ -769,7 +772,7 @@ func TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady(t *testing.T)
 	m, worktree := newStubbedManager(t)
 	neighbour := record{Worktree: "/repo/other", Port: 62001, PID: 11}
 	mustWriteMap(t, m.mapPath, []record{neighbour})
-	m.alive = func(context.Context, record) bool { return true }
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 
 	// The pid is read while the readiness wait is still running, which is the
 	// last moment the map still names it: forget runs on the way out of the very
@@ -816,7 +819,7 @@ func TestEnsureLeavesAnotherProcessesFailedStartAlone(t *testing.T) {
 	// not create rather than answer with its port straight away.
 	theirs := record{Worktree: worktree, Port: 62001, PID: os.Getpid(), StartedAt: time.Now().Unix()}
 	mustWriteMap(t, m.mapPath, []record{theirs})
-	m.alive = func(context.Context, record) bool { return true }
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	m.ready = func(context.Context, int) error { return errors.New("never bound") }
 
 	if port, err := m.ensure(t.Context(), worktree); err == nil {
@@ -883,7 +886,7 @@ func TestListReportsAWriterThatStoppedReading(t *testing.T) {
 			m := newTestManager(t)
 			live := record{Worktree: "/repo/live", Port: 62001, PID: 11}
 			mustWriteMap(t, m.mapPath, []record{live})
-			m.alive = func(context.Context, record) bool { return true }
+			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 
 			if err := m.list(t.Context(), &failingWriter{after: tc.after}); !errors.Is(err, io.ErrClosedPipe) {
 				t.Fatalf("list() = %v for a writer that stopped reading, want its error", err)
@@ -918,7 +921,7 @@ func TestWithRecordsWritesNothingWhenTheBodyRefuses(t *testing.T) {
 	m := newTestManager(t)
 	stored := record{Worktree: "/repo/live", Port: 62001, PID: 11}
 	mustWriteMap(t, m.mapPath, []record{stored})
-	m.alive = func(context.Context, record) bool { return true }
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	refused := errors.New("no port left")
 
 	got, err := m.withRecords(t.Context(), func([]record) ([]record, error) { return nil, refused })
@@ -939,7 +942,12 @@ func TestListShowsLiveRecordsAndCleansDeadRecords(t *testing.T) {
 	mustWriteMap(t, m.mapPath, []record{live, dead})
 
 	var output bytes.Buffer
-	m.alive = func(_ context.Context, r record) bool { return r == live }
+	m.alive = func(_ context.Context, r record) probeVerdict {
+		if r == live {
+			return probeLive
+		}
+		return probeGone
+	}
 	if err := m.list(t.Context(), &output); err != nil {
 		t.Fatal(err)
 	}
