@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -78,6 +79,11 @@ func run(args []string, stdout io.Writer) error {
 	}
 	// Starting the home gopls up front keeps a broken install a startup error
 	// rather than a failed initialize halfway into a session.
+	// Reclaim stale slots before admission, including leftovers from an exited
+	// manager; otherwise a full registry prevents maintenance from ever starting.
+	if err := m.prepareAdmission(ctx, worktree); err != nil {
+		return err
+	}
 	port, err := m.ensure(ctx, worktree)
 	if err != nil {
 		return err
@@ -86,6 +92,16 @@ func run(args []string, stdout io.Writer) error {
 		_, err := fmt.Fprintln(stdout, port)
 		return err
 	}
+	maintenanceCtx, cancelMaintenance := context.WithCancel(ctx)
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		m.maintain(maintenanceCtx, 30*time.Second)
+	}()
+	defer func() {
+		cancelMaintenance()
+		<-maintenanceDone
+	}()
 	if command == "http" {
 		address := "127.0.0.1:6099"
 		if len(args) > 2 {
@@ -95,4 +111,22 @@ func run(args []string, stdout io.Writer) error {
 	}
 
 	return bridge(ctx, m, worktree)
+}
+
+// Acquisition probes only the requested worktree. Sweep independently of
+// traffic so deleted temporary worktrees cannot retain their servers forever.
+func (m *manager) maintain(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, err := m.sweepMaintenance(ctx)
+			if err != nil && ctx.Err() == nil {
+				fmt.Fprintln(os.Stderr, "gopls-mcp-manager maintenance:", err)
+			}
+		}
+	}
 }
