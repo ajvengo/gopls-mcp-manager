@@ -240,7 +240,7 @@ skips unrelated names and symlinks, and truncates in place without renaming or
 unlinking. Shared children keep their inherited `O_APPEND` descriptors and
 continue logging after the manager exits or a trim occurs. Output reports sizes
 observed before trimming and bytes observed in files cleared; concurrent writes
-make these snapshots approximate. There is no background maintenance or hard
+make these snapshots approximate. There is no background log trimming or hard
 disk ceiling: arrange an operator-controlled trim cadence if needed. No archives
 are retained, and files below the threshold are left alone.
 
@@ -259,8 +259,11 @@ that no longer appears in `list`, still holds its port, and lives until reboot.
 
 A record is therefore checked on several counts before it is dropped, and the
 process is signalled when it is. Acquisition checks only records for the requested
-worktree; unrelated records continue reserving their ports. Run `list` for a full
-maintenance sweep, including stale worktrees you no longer use. Probes run outside
+worktree; unrelated records continue reserving their ports. Startup performs a
+full sweep before admission, and running bridge/HTTP managers repeat it every
+30 seconds so deleted temporary worktrees do not strand indexes. Run `list` for
+an immediate full maintenance sweep. Existing worktrees with healthy servers
+remain shared; this is not idle eviction. Probes run outside
 the global registry lock. Reconciliation applies verdicts only to unchanged
 record identities:
 
