@@ -153,7 +153,7 @@ func sendCall(t *testing.T, l *lane, name string) jsonrpc.ID {
 	t.Helper()
 	id := mustID(t, name)
 	l.r.track(id, nil, l.worktree)
-	l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"})
+	l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"}, nil)
 	return id
 }
 
@@ -647,7 +647,7 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 		r.initialize.Store(initialize)
 
 		r.track(id, nil, home)
-		newLane(r, home).send(t.Context(), initialize)
+		newLane(r, home).send(t.Context(), initialize, nil)
 		// The retry is the whole point: with a reader racing the write for the id,
 		// send() finds the call already answered and this write never comes.
 		got := mustRecv(t, fresh.writes, "the retried initialize on a second connection").(*jsonrpc.Request)
@@ -679,7 +679,7 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 
 		id := mustID(t, "client-initialize")
 		r.track(id, nil, l.worktree)
-		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)})
+		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)}, nil)
 
 		wantClientError(t, r, id, "a second initialize was left unanswered")
 		select {
@@ -945,7 +945,7 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 		// Not sendCall: this conn's onWrite is built around this exact id, and
 		// minting a second one from the same string would only hide that.
 		r.track(id, nil, l.worktree)
-		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"})
+		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"}, nil)
 		close(conn.reads) // the upstream dies once the call is long since answered
 		mustRecv(t, done, "the upstream reader to finish")
 
@@ -1344,8 +1344,8 @@ func TestCancellationForADisconnectedUpstreamIsDroppedNotDialled(t *testing.T) {
 		// A lane that never dialled, and one whose connection dies under this
 		// very write — the retry starts from the same "no upstream to tell", so
 		// the refusal has to be asked on every attempt rather than on the way in.
-		newLane(r, "/tmp/gone").send(t.Context(), cancel)
-		connectedLane(r, "/tmp/dying", failingConn()).send(t.Context(), cancel)
+		newLane(r, "/tmp/gone").send(t.Context(), cancel, nil)
+		connectedLane(r, "/tmp/dying", failingConn()).send(t.Context(), cancel, nil)
 
 		wantClientQuiet(t, r, "a cancellation produced a message for the client")
 	})

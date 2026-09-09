@@ -1,10 +1,14 @@
-package main
+// Package transport implements bounded MCP stdio and legacy SSE connections.
+// It owns framing and buffer accounting, not routing or shared process lifetime.
+package transport
 
 import (
 	"context"
 	"encoding/json"
 	"io"
 	"sync"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,6 +26,7 @@ type stdioConn struct {
 	closed   chan struct{}
 	once     sync.Once
 	closeErr error
+	maxBytes int
 }
 
 type decodedMessage struct {
@@ -33,12 +38,17 @@ type writerOnly struct{ io.Writer }
 
 func (writerOnly) Close() error { return nil }
 
-func newStdioConn(input io.ReadCloser, output io.Writer) *stdioConn {
+// NewStdio starts a bounded stdio connection. Close closes input, not output.
+// An omitted or nonpositive limit uses the shipped default message size.
+func NewStdio(input io.ReadCloser, output io.Writer, messageLimit ...int) mcp.Connection {
 	reader, writer := io.Pipe()
 	// IOTransport.Connect cannot fail: it only constructs the connection.
 	sdk, _ := (&mcp.IOTransport{Reader: reader, Writer: writerOnly{output}}).Connect(context.Background())
 	c := &stdioConn{input: input, sdk: sdk, feed: writer,
-		incoming: make(chan decodedMessage), closed: make(chan struct{})}
+		incoming: make(chan decodedMessage), closed: make(chan struct{}), maxBytes: config.Default().MessageBytes}
+	if len(messageLimit) > 0 && messageLimit[0] > 0 {
+		c.maxBytes = messageLimit[0]
+	}
 	go c.read()
 	return c
 }
@@ -83,8 +93,10 @@ func (c *stdioConn) deliver(msg jsonrpc.Message, err error) bool {
 }
 
 func (c *stdioConn) read() {
-	dec := json.NewDecoder(c.input)
+	input := &messageReader{Reader: c.input, limit: int64(c.maxBytes)}
+	dec := json.NewDecoder(input)
 	for {
+		input.offset = dec.InputOffset()
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
 			c.deliver(nil, err)
@@ -118,6 +130,27 @@ func (c *stdioConn) read() {
 			}
 		}
 	}
+}
+
+// Account for decoder read-ahead when resetting the per-value budget. A large
+// or incomplete value is stopped before Decode can allocate an unbounded buffer.
+// Whitespace between values counts toward the next value's budget.
+type messageReader struct {
+	io.Reader
+	limit, read, offset int64
+}
+
+func (r *messageReader) Read(p []byte) (int, error) {
+	remaining := r.limit - (r.read - r.offset)
+	if remaining <= 0 {
+		return 0, ErrMessageTooLarge
+	}
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
+	n, err := r.Reader.Read(p)
+	r.read += int64(n)
+	return n, err
 }
 
 // The wire fields and conversion match jsonrpc.DecodeMessage at SDK v1.6.0.

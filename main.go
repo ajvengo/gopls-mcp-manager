@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -25,13 +26,13 @@ func run(args []string, stdout io.Writer) error {
 	if len(args) > 1 {
 		command = args[1]
 	}
-	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | list | status", args[0])
+	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | list | status | trim-logs", args[0])
 	switch command {
 	case "http":
 		if len(args) > 4 {
 			return usage
 		}
-	case "list", "status":
+	case "list", "status", "trim-logs":
 		if len(args) != 2 {
 			return usage
 		}
@@ -50,6 +51,13 @@ func run(args []string, stdout io.Writer) error {
 	// Cover startup and list's lock wait as well as the running bridge.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if command == "trim-logs" {
+		logs, err := m.logs(ctx, true)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(stdout).Encode(logs)
+	}
 	if command == "status" {
 		return m.status(ctx, stdout)
 	}

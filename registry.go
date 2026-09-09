@@ -173,11 +173,25 @@ func (m *manager) withSelectedRecords(ctx context.Context, worktree string, body
 	verdicts := make([]probeVerdict, len(snapshot))
 	probeStart := time.Now()
 	var probes sync.WaitGroup
+	// Acquire before starting a goroutine: a large maintenance snapshot must
+	// not allocate a goroutine (and potentially a ps process) for every record.
+	permits := make(chan struct{}, 8)
+probeLoop:
 	for i, r := range snapshot {
 		if worktree != "" && r.Worktree != worktree {
 			continue
 		}
-		probes.Go(func() { verdicts[i] = m.alive(ctx, r) })
+		select {
+		case permits <- struct{}{}:
+		case <-ctx.Done():
+			break probeLoop
+		}
+		probes.Go(func() {
+			defer func() { <-permits }()
+			if ctx.Err() == nil {
+				verdicts[i] = m.alive(ctx, r)
+			}
+		})
 	}
 	probes.Wait()
 	m.timed("probes", probeStart)

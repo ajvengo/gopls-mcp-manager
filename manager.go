@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
 const (
@@ -25,7 +27,7 @@ type manager struct {
 	alive   func(context.Context, record) probeVerdict // read-only; called concurrently
 	observe func(lockTiming)                           // optional, concurrency-safe observer
 	measure func(string, time.Duration)                // optional operation timings
-	limits  callLimits
+	limits  config.Limits
 	// ready is awaitReady, replaced by tests: what it waits out is readyTimeout,
 	// and ensure's failure path is otherwise ten seconds of sleeping away from
 	// every assertion about it.
@@ -49,7 +51,7 @@ func newManager() (*manager, error) {
 		ready:   awaitReady,
 	}
 	m.start = m.startGopls
-	m.limits, err = limitsFromEnv()
+	m.limits, err = config.FromEnv()
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +183,16 @@ func (m *manager) claimPort(ctx context.Context, worktree string) (record, *chil
 				claimed = r
 				return records, nil
 			}
+		}
+		limit := m.limits.SharedServers
+		if limit <= 0 {
+			limit = config.Default().SharedServers
+		}
+		// Checked under the same cross-process lock as spawn and reservation.
+		// Existing and terminating records consume capacity; never evict another
+		// manager's child to make room. Existing endpoints above remain reusable.
+		if len(records) >= limit {
+			return nil, fmt.Errorf("shared gopls server limit reached (%d recorded); run list to reconcile dead records or raise GOPLS_MANAGER_MAX_SERVERS", limit)
 		}
 		port, err := allocatePort(worktree, records, portUnavailable)
 		if err != nil {

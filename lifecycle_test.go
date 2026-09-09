@@ -15,6 +15,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
+
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
 
@@ -56,27 +58,6 @@ func TestStatusMeasuresWithoutChangingRegistry(t *testing.T) {
 		t.Fatal("status mutated registry")
 	}
 	wantRunning(t, cmd, "status signalled the server")
-}
-
-func TestCallLimitConfiguration(t *testing.T) {
-	for _, tc := range []struct {
-		name, value string
-		valid       bool
-	}{
-		{"GOPLS_MANAGER_EXECUTION_TIMEOUT", "0s", true},
-		{"GOPLS_MANAGER_EXECUTION_TIMEOUT", "2m", true},
-		{"GOPLS_MANAGER_EXECUTION_TIMEOUT", "-1s", false},
-		{"GOPLS_MANAGER_MAX_OUTSTANDING", "0", false},
-		{"GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE", "12", true},
-	} {
-		t.Run(tc.name+tc.value, func(t *testing.T) {
-			t.Setenv(tc.name, tc.value)
-			_, err := limitsFromEnv()
-			if (err == nil) != tc.valid {
-				t.Fatalf("configuration error = %v", err)
-			}
-		})
-	}
 }
 
 func BenchmarkRegistryProbeLockTime(b *testing.B) {
@@ -201,7 +182,7 @@ func TestSweepReconcilesOnlyTheProbedIdentity(t *testing.T) {
 func TestOutstandingLimitsSurviveFastDelivery(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		r := newTestRouter(t, testHome)
-		r.limits = callLimits{PerLane: 2, Session: 3}
+		r.limits = config.Limits{PerLane: 2, Session: 3}
 		pausedLane(t, r, testHome)
 		pausedLane(t, r, testWorktree)
 		for i := range 2 {
@@ -251,7 +232,7 @@ func TestExecutionTimeoutDoesNotParkCallbacksBehindOutput(t *testing.T) {
 		}
 		id := mustID(t, "timeout")
 		r.track(id, newFakeConn(), testHome)
-		r.startExecution(id)
+		r.startExecution(id, r.awaitingUpstream[id].state)
 		time.Sleep(time.Second)
 		if err := mustRecv(t, r.errs, "session failure instead of blocked timer"); err == nil {
 			t.Fatal("missing output failure")

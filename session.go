@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
+
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -27,7 +29,7 @@ import (
 // routable evidence. They follow the most recent path-bearing call, falling back
 // to the worktree the bridge was started in.
 func bridge(ctx context.Context, m *manager, home string) error {
-	stdio := newStdioConn(os.Stdin, os.Stdout)
+	stdio := transport.NewStdio(os.Stdin, os.Stdout, m.limits.MessageBytes)
 	return serve(ctx, m, home, stdio)
 }
 

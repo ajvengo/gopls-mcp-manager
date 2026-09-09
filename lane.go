@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
+
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -93,7 +95,7 @@ draining:
 		default:
 		}
 		l.r.timed("delivery_queue", call.queued)
-		l.send(call.ctx, call.req)
+		l.send(call.ctx, call.req, call.state)
 		call.cancel()
 	}
 	for call := range l.reqs {
@@ -106,6 +108,7 @@ draining:
 
 type delivery struct {
 	queued time.Time
+	state  *callState
 	req    *jsonrpc.Request
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -141,7 +144,7 @@ func (l *lane) runControls() {
 	}
 }
 
-func (l *lane) send(parent context.Context, req *jsonrpc.Request) {
+func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *callState) {
 	// Derived here rather than passed in, so that the id and the message it is
 	// sent with cannot disagree; see upstream for the one-initialize rule.
 	id, initial := req.ID, req.Method == "initialize"
@@ -157,7 +160,10 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request) {
 	ctx, cancel := context.WithTimeout(parent, sendBudget)
 	defer cancel()
 	// Retain the delivery cancellation even across a retry's private handshake.
-	l.r.place(id, nil, cancel, nil)
+	state, owned := l.r.placeDelivery(id, expected, cancel)
+	if !owned {
+		return
+	}
 	var err error
 	for range 2 {
 		if err = ctx.Err(); err != nil {
@@ -189,9 +195,27 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request) {
 		// was already deleted would outlive the call and produce a second,
 		// contradictory reply to the same id later on.
 		placed := make(chan struct{})
-		l.r.place(id, conn, cancel, placed)
+		if err := l.r.beginOperation(id, state, conn, l.worktree, cancel, placed); err != nil {
+			if conn != l.conn {
+				_ = conn.Close()
+			}
+			l.r.failDelivery(id, state, -32000, err.Error())
+			return
+		}
 		err = conn.Write(ctx, req)
 		close(placed)
+		if errors.Is(err, transport.ErrMessageTooLarge) {
+			// The bounded transport rejected before POST; unlike a write failure,
+			// this proves no upstream operation was started by this attempt.
+			l.r.mu.Lock()
+			l.r.endOperationLocked(operationKey{conn, id})
+			l.r.mu.Unlock()
+			if conn != l.conn {
+				_ = conn.Close()
+			}
+			l.r.failDelivery(id, state, -32000, err.Error())
+			return
+		}
 		if err == nil {
 			// Cached only once the connection has taken a write: a dial
 			// handing back an already-dead upstream then fails above, on this
@@ -199,12 +223,12 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request) {
 			// write would race it for the id instead, leaving scheduling order
 			// to decide whether the client saw a transparent retry or an error.
 			l.cache(conn)
-			l.r.startExecution(id)
+			l.r.startExecution(id, state)
 			return
 		}
 		// A failed write and conn's own reader seeing the upstream die are the
 		// same event racing, and whoever claims the id owns the reply.
-		claimed := l.r.retry(id, conn)
+		claimed := l.r.retry(id, conn, state)
 		// Forgotten unconditionally: a write can only fail on the connection the
 		// lane just used, so l.conn is either conn itself or already nil.
 		l.conn = nil
@@ -220,7 +244,7 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request) {
 	if errors.Is(err, context.Canceled) {
 		code = -32800
 	}
-	l.r.fail(id, code, "gopls for %s: %v", l.worktree, err)
+	l.r.failDelivery(id, state, code, fmt.Sprintf("gopls for %s: %v", l.worktree, err))
 }
 
 // cache adopts conn as this lane's upstream and starts the goroutine that reads
@@ -329,7 +353,7 @@ func (r *router) dialGopls(ctx context.Context, worktree string) (mcp.Connection
 	if err != nil {
 		return nil, err
 	}
-	conn, err := (&mcp.SSEClientTransport{Endpoint: mcpURL(port)}).Connect(ctx)
+	conn, err := transport.ConnectSSE(ctx, mcpURL(port), r.limits.MessageBytes, r.sseBudget)
 	if err != nil {
 		return nil, fmt.Errorf("connect to shared gopls MCP: %w", err)
 	}

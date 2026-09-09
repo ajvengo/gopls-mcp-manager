@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
+
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Exercise both real transports: stateless HTTP outside, SDK legacy SSE inside.
-func httpFixture(t *testing.T, capacity ...int) (*httpBackend, string, *atomic.Int32, <-chan struct{}, <-chan struct{}) {
+// Exercise both real transports: stateless HTTP outside, bounded SSE against the SDK server inside.
+func httpFixture(t testing.TB, capacity ...int) (*httpBackend, string, *atomic.Int32, <-chan struct{}, <-chan struct{}) {
 	t.Helper()
 	fixtureCtx, stopFixture := context.WithCancel(t.Context())
 	started, cancelled := make(chan struct{}, 8), make(chan struct{}, 8)
@@ -57,7 +59,7 @@ func httpFixture(t *testing.T, capacity ...int) (*httpBackend, string, *atomic.I
 	b.r.paths["/other/file.go"] = "/other"
 	b.r.dial = func(ctx context.Context, worktree string) (mcp.Connection, error) {
 		dials.Add(1)
-		return (&mcp.SSEClientTransport{Endpoint: endpoints[worktree]}).Connect(ctx)
+		return transport.ConnectSSE(ctx, endpoints[worktree], b.r.limits.MessageBytes, b.r.sseBudget)
 	}
 	b.start()
 	t.Cleanup(b.close)
@@ -70,7 +72,7 @@ func httpFixture(t *testing.T, capacity ...int) (*httpBackend, string, *atomic.I
 	return b, server.URL, &dials, started, cancelled
 }
 
-func postMCP(t *testing.T, endpoint, body string) *jsonrpc.Response {
+func postMCP(t testing.TB, endpoint, body string) *jsonrpc.Response {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {

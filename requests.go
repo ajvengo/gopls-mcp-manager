@@ -11,16 +11,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type callLimits struct {
-	PerLane, Session    int
-	Lanes, CacheEntries int
-	Execution           time.Duration
-}
-
-func defaultCallLimits() callLimits {
-	return callLimits{PerLane: 128, Session: 1024, Lanes: 64, CacheEntries: 4096}
-}
-
 // The state pointer is a generation token. An expired timer cannot complete a
 // later request that happens to use the same wire id.
 type callState struct{ timer *time.Timer }
@@ -31,6 +21,9 @@ type requestUsage struct {
 	Rejections                                                            map[string]int
 	Stages                                                                map[string]stageTiming
 	Lanes, Paths, Directories, Cancelled, ExecutionExpired, RoutingFailed int
+	MemoHits, MemoMisses, MemoExpirations, MemoRollovers                  int64
+	UpstreamOperations, AbandonedOperations                               int
+	SSEBufferBytes, PeakSSEBufferBytes                                    int
 }
 
 type stageTiming struct{ Count, TotalNS, MaxNS int64 }
@@ -55,13 +48,23 @@ func (r *router) requestUsage() requestUsage {
 	usage := r.usage
 	usage.Event = "session_requests"
 	usage.Outstanding = len(r.awaitingUpstream)
+	usage.SSEBufferBytes, usage.PeakSSEBufferBytes = r.sseBudget.Snapshot()
+	usage.UpstreamOperations = len(r.operations)
+	for _, op := range r.operations {
+		if op.abandoned {
+			usage.AbandonedOperations++
+		}
+	}
 	usage.Rejections = maps.Clone(r.usage.Rejections)
 	usage.Stages = maps.Clone(r.usage.Stages)
 	r.lanesMu.Lock()
 	usage.Lanes = len(r.lanes)
 	r.lanesMu.Unlock()
 	r.memoMu.Lock()
+	r.expireMemosLocked()
 	usage.Paths, usage.Directories = len(r.paths), len(r.worktrees)
+	usage.MemoHits, usage.MemoMisses = r.memo.hits, r.memo.misses
+	usage.MemoExpirations, usage.MemoRollovers = r.memo.expirations, r.memo.rollovers
 	r.memoMu.Unlock()
 	return usage
 }
@@ -100,6 +103,7 @@ func (r *router) admit(id jsonrpc.ID, worktree string, cancel func()) error {
 // cancelled before unlocking so a lane cannot revive it. Network output always
 // happens after unlocking, so a slow client cannot hold the tracker.
 func (r *router) removeLocked(id jsonrpc.ID, owner owed) {
+	r.abandonOperationLocked(operationKey{owner.conn, id})
 	if owner.conn == nil && owner.cancel != nil {
 		owner.cancel()
 	}
@@ -116,18 +120,12 @@ func (r *router) removeLocked(id jsonrpc.ID, owner owed) {
 	r.usage.Completed++
 }
 
-func (r *router) place(id jsonrpc.ID, conn mcp.Connection, cancel context.CancelFunc, placed <-chan struct{}) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if owner, ok := r.awaitingUpstream[id]; ok {
-		owner.conn, owner.cancel, owner.placed = conn, cancel, placed
-		r.awaitingUpstream[id] = owner
-	}
-}
-
 func (r *router) finish(id jsonrpc.ID, conn mcp.Connection, state *callState) (owed, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if conn != nil {
+		r.endOperationLocked(operationKey{conn, id})
+	}
 	owner, ok := r.awaitingUpstream[id]
 	if !ok || (conn != nil && owner.conn != conn) || (state != nil && owner.state != state) {
 		return owed{}, false
@@ -136,40 +134,36 @@ func (r *router) finish(id jsonrpc.ID, conn mcp.Connection, state *callState) (o
 	return owner, true
 }
 
-func (r *router) fail(id jsonrpc.ID, code int64, format string, args ...any) {
-	if _, ok := r.finish(id, nil, nil); ok {
-		r.forward(errorResponse(id, code, format, args...))
-	}
-}
-
-func (r *router) retry(id jsonrpc.ID, conn mcp.Connection) bool {
+func (r *router) retry(id jsonrpc.ID, conn mcp.Connection, state *callState) bool {
 	if !id.IsValid() {
 		return true
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	owner, ok := r.awaitingUpstream[id]
-	if !ok || owner.conn != conn {
+	if !ok || owner.conn != conn || owner.state != state {
 		return false
 	}
 	owner.conn = nil
+	r.abandonOperationLocked(operationKey{conn, id})
 	r.awaitingUpstream[id] = owner
 	return true
 }
 
-func (r *router) startExecution(id jsonrpc.ID) {
+func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 	if r.limits.Execution <= 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	owner, ok := r.awaitingUpstream[id]
-	if !ok {
+	if !ok || owner.state != state {
 		return
 	}
-	state := owner.state
 	state.timer = time.AfterFunc(r.limits.Execution, func() {
-		if _, ok := r.finish(id, nil, state); ok {
+		if owner, ok := r.finish(id, nil, state); ok {
+			params, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: "execution deadline exceeded"})
+			r.queueCancellation(owner, &jsonrpc.Request{Method: "notifications/cancelled", Params: params})
 			r.mu.Lock()
 			r.usage.ExecutionExpired++
 			r.mu.Unlock()
@@ -198,6 +192,8 @@ func (r *router) clearRequests() {
 			owner.cancel()
 		}
 	}
+	clear(r.operations)
+	clear(r.operationsPerWorktree)
 }
 
 // owed is a request in flight: the worktree it was routed to, and the upstream
@@ -294,6 +290,10 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 		owner.cancel()
 	}
 	r.forward(errorResponse(id, -32800, "request cancelled"))
+	r.queueCancellation(owner, req)
+}
+
+func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
 	if owner.conn == nil {
 		return
 	}

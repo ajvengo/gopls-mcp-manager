@@ -1,9 +1,10 @@
-package main
+package transport
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -13,6 +14,37 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestStdioMessageLimitAndReadAhead(t *testing.T) {
+	t.Parallel()
+	wire := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	for _, tc := range []struct {
+		name, input  string
+		limit, count int
+		oversize     bool
+	}{
+		{"exact", wire + "\n", len(wire), 1, false},
+		{"read-ahead", strings.Repeat(wire+"\n", 100), len(wire) + 1, 100, false},
+		{"too-large", wire + "\n", len(wire) - 1, 1, true},
+		{"incomplete", `{"jsonrpc":"` + strings.Repeat("x", 1024), 128, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			conn := NewStdio(io.NopCloser(strings.NewReader(tc.input)), io.Discard, tc.limit)
+			defer func() { _ = conn.Close() }()
+			for range tc.count {
+				_, err := conn.Read(t.Context())
+				if tc.oversize {
+					if !errors.Is(err, ErrMessageTooLarge) {
+						t.Fatalf("error = %v, want byte limit", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 func TestStdioMatchesSDK(t *testing.T) {
 	t.Parallel()
@@ -43,7 +75,7 @@ func TestStdioMatchesSDK(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = sdk.Close() }()
-			fast := newStdioConn(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard)
+			fast := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard)
 			defer func() { _ = fast.Close() }()
 			want, wantErr := sdk.Read(ctx)
 			got, gotErr := fast.Read(ctx)
@@ -66,7 +98,7 @@ func TestStdioPreservesBatchResponses(t *testing.T) {
 	t.Parallel()
 	var output bytes.Buffer
 	wire := `[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":"b","method":"tools/list"}]` + "\n"
-	c := newStdioConn(io.NopCloser(strings.NewReader(wire)), &output)
+	c := NewStdio(io.NopCloser(strings.NewReader(wire)), &output)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
@@ -76,7 +108,8 @@ func TestStdioPreservesBatchResponses(t *testing.T) {
 		}
 	}
 	for _, id := range []string{"b", "a"} {
-		if err := c.Write(ctx, &jsonrpc.Response{ID: mustID(t, id), Result: json.RawMessage(`{}`)}); err != nil {
+		requestID, _ := jsonrpc.MakeID(id)
+		if err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: json.RawMessage(`{}`)}); err != nil {
 			t.Fatal(err)
 		}
 		if id == "b" && output.Len() != 0 {
@@ -93,14 +126,19 @@ func TestStdioCloseUnblocksRead(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
 	defer func() { _ = writer.Close() }()
-	c := newStdioConn(reader, io.Discard)
+	c := NewStdio(reader, io.Discard)
 	done := make(chan error, 1)
 	go func() { _, err := c.Read(t.Context()); done <- err }()
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := mustRecv(t, done, "closed stdio read"); err == nil {
-		t.Fatal("closed read succeeded")
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("closed read succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed stdio read remained blocked")
 	}
 }
 
@@ -142,7 +180,7 @@ func BenchmarkStdioTransport(b *testing.B) {
 			}
 			var reader mcp.Connection
 			if fast {
-				reader = newStdioConn(right, right)
+				reader = NewStdio(right, right)
 			} else {
 				reader, err = (&mcp.IOTransport{Reader: right, Writer: right}).Connect(b.Context())
 				if err != nil {
@@ -150,7 +188,8 @@ func BenchmarkStdioTransport(b *testing.B) {
 				}
 			}
 			b.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
-			req := &jsonrpc.Request{ID: mustID(b, float64(1)), Method: "tools/call", Params: fileCallParams("/repo/main.go")}
+			id, _ := jsonrpc.MakeID(float64(1))
+			req := &jsonrpc.Request{ID: id, Method: "tools/call", Params: json.RawMessage(`{"name":"go_file_context","arguments":{"file":"/repo/main.go"}}`)}
 			go func() {
 				for b.Context().Err() == nil {
 					if writer.Write(b.Context(), req) != nil {

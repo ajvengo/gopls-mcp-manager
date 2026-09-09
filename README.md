@@ -45,7 +45,8 @@ Commands:
 | `gopls-mcp-manager [bridge [path]]` | Run the stdio bridge. Default; `path` defaults to `.` and needs the `bridge` word before it |
 | `gopls-mcp-manager ensure [path]` | Start (or find) the gopls for `path`'s worktree, print its port |
 | `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
-| `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS and termination state |
+| `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS, termination state and log sizes |
+| `gopls-mcp-manager trim-logs` | Discard contents of managed log files above the configured threshold, preserving append descriptors |
 
 `path` is resolved to the root of the worktree containing it, with symlinks
 removed. The worktree the bridge starts in is its **home**.
@@ -82,8 +83,14 @@ mode and has no cross-request effect. Cancellation still completes locally first
 an advisory SSE cancellation does not prove gopls stopped its work.
 
 Existing outstanding-call, lane and memo limits apply across the HTTP service.
-Concurrent HTTP exchanges are also capped by the session outstanding limit;
-excess exchanges receive HTTP 503. Bodies are limited to 4 MiB, header/body reads
+HTTP cache misses wait on a separate bounded 64-message resolution queue.
+Pathless and fully cached HTTP calls proceed while a filesystem lookup is stuck;
+lane creation still has one owner and filesystem work still has one worker.
+Concurrent HTTP exchanges are capped by both the session outstanding limit and
+the body budget divided by the maximum message size (16 exchanges by default).
+Each exchange reserves a maximum-size body allowance until its response finishes,
+including chunked and slow requests; excess exchanges receive HTTP 503.
+Bodies are limited to 4 MiB by default, header/body reads
 to 5/30 seconds, and response writes to 30 seconds after the response starts.
 Long tool execution uses the existing optional execution timeout. Shutdown closes
 internal SSE connections and cancels calls, while shared gopls processes remain
@@ -143,6 +150,11 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 - **Outstanding calls have separate limits:** 128 per worktree and 1024 per
   session by default. A server accepting writes but never answering cannot evade
   those limits by draining its delivery queue.
+- **Delivered operations retain a separate credit until an upstream response.**
+  Local cancellation, execution timeout and connection failure release client
+  tracking but retain that credit. Both sets use the outstanding limits above;
+  uncertain retries consume another operation credit. A cancellation-ignoring
+  server therefore cannot accept unlimited replacements through one router.
 - The bridge stops when the stdio client goes away, or on `^C` / `SIGTERM`.
   It waits for owned failed-child cleanup before exiting: SIGTERM, up to 2 s,
   then SIGKILL and up to 2 s to confirm exit. A failed child's record is removed
@@ -155,26 +167,58 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 | GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Outstanding calls per session |
 | GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Outstanding calls per worktree |
 | GOPLS_MANAGER_MAX_LANES | 64 | Retained worktree lanes per session; existing lanes remain usable at capacity |
+| GOPLS_MANAGER_MAX_SERVERS | 64 | Recorded shared servers allowed before a new spawn; existing servers remain reusable |
 | GOPLS_MANAGER_MAX_CACHE_ENTRIES | 4096 | Entries in each path/directory memo; a full memo clears before inserting |
+| GOPLS_MANAGER_CACHE_TTL | 5m | Positive duration; both memo levels expire together, lazily on access or metrics snapshots |
+| GOPLS_MANAGER_MAX_MESSAGE_BYTES | 4194304 | Maximum stdio JSON value (including preceding whitespace), HTTP body, upstream POST and complete SSE event |
+| GOPLS_MANAGER_HTTP_BODY_BUDGET | 67108864 | Maximum reserved HTTP request-body bytes; must hold at least one maximum-size message |
+| GOPLS_MANAGER_SSE_BUFFER_BUDGET | 67108864 | Shared live SSE frame capacity, including replacement buffers during growth; at least one maximum-size message |
+| GOPLS_MANAGER_LOG_TRIM_BYTES | 67108864 | `trim-logs` clears files larger than this; no automatic trimming |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
 
 Counts must be positive. Execution timeout accepts Go durations such as 2m.
+A stdio value that exceeds the message limit ends the transport with an error;
+HTTP oversized bodies receive 413. An oversized SSE event or exhausted SSE
+budget closes that upstream connection and fails its pending calls. Oversized
+upstream POSTs fail before delivery. SSE framing uses an unbuffered handoff;
+there is no SDK 100-event queue. The SDK still owns JSON-RPC validation.
+The HTTP and SSE budgets cover wire bodies and live frame capacity, respectively,
+not total heap, decoded objects, queued results, HTTP overhead or child indexes.
+Decoded messages use the existing bounded queues; even rejected frames can leave
+unreachable allocations awaiting GC. Increasing message size also increases the
+possible memory retained by those queues. Large diagnostics may require higher limits.
 A timeout releases local tracking and suppresses late results; upstream work may
 continue. If the client output queue is full at expiry, the session fails rather
 than accumulating blocked timer callbacks. Choose it to accommodate long diagnostics and vulnerability scans.
 
+Late terminal results release abandoned-operation credits. A lost connection
+cannot supply such proof, so its credits remain charged until this router shuts
+down. Same-ID reuse on that connection is rejected while the old operation is
+unresolved. Restarting a manager resets its accounting; it does **not** prove old
+work stopped. These limits do not coordinate operations across multiple managers.
+An exhausted router may need operator recovery after establishing upstream state.
+
 Metrics include registry lock wait/hold and manager probe, readiness and ensure
 durations. Session snapshots every 30 s and at exit report request counts,
 rejection reasons, cancellation/expiry counts, retained lanes and memo sizes,
+path-memo hits/misses, capacity rollovers and expiry epochs, unresolved/abandoned
+operation counts and current/peak SSE frame capacity,
 and count/total/max nanoseconds for routing, queue waits and handshake. MCP stdout stays protocol-only. The status command reports RSS in KiB
 only when the process identity matches; one bounded ps snapshot covers the
 recorded PIDs. Missing values and active-client counts are null rather than
 guessed. Status never signals a process or rewrites the map.
 
-There is no automatic eviction. [LEASES.md](LEASES.md) describes cross-client
+New shared spawns are refused at the configured recorded-server ceiling under
+the registry lock. Terminating and stale unrelated records consume capacity;
+run `list` to reconcile dead records. All managers sharing the map must run this
+version with the same ceiling. Older binaries, unrecorded servers and differing
+settings can bypass the policy. The ceiling bounds cooperating recorded spawns,
+not RSS. Existing records remain reusable even above a lowered ceiling.
+
+There is no automatic lane or process eviction. [LEASES.md](LEASES.md) describes cross-client
 attachment and operation ownership, fencing, and the evidence required before
-introducing a resource ceiling. SPEC.md contains the behavioral contract.
+introducing automatic reclamation. SPEC.md contains the behavioral contract.
 
 ## State on disk
 
@@ -187,6 +231,18 @@ introducing a resource ceiling. SPEC.md contains the behavioral contract.
 The map is written atomically (temp file, `fsync`, rename) with mode `0600`.
 Ports are picked from 61100–65100, seeded by a hash of the worktree path so the
 same tree tends to get the same port, then probed forward until one is free.
+
+`status` reports per-record log sizes and aggregate bytes, largest file, file
+count and oversized count, including logs left after a record disappears.
+`trim-logs` clears the **entire contents** of managed regular `.log` files above
+64 MiB by default; save wanted diagnostics first. It scans in bounded batches,
+skips unrelated names and symlinks, and truncates in place without renaming or
+unlinking. Shared children keep their inherited `O_APPEND` descriptors and
+continue logging after the manager exits or a trim occurs. Output reports sizes
+observed before trimming and bytes observed in files cleared; concurrent writes
+make these snapshots approximate. There is no background maintenance or hard
+disk ceiling: arrange an operator-controlled trim cadence if needed. No archives
+are retained, and files below the threshold are left alone.
 
 The file is meant to be readable and repairable by hand. A line that cannot be
 parsed, or whose fields are out of range, is skipped rather than fatal — every
@@ -231,8 +287,22 @@ reaping behavior. SPEC.md §8 describes reconciliation and identity safeguards.
 
 ## Development
 
+The repository is one Go module with two internal packages:
+
+- `internal/config` owns resource limits, defaults and environment validation.
+  Defaults are plain values; importing the package does not read the environment.
+- `internal/transport` owns stdio/SSE connections, JSON-RPC framing and buffer
+  accounting. Constructors return SDK connections; frame-budget observations
+  use a synchronized snapshot. Codec and connection implementation types stay private.
+
+The root command owns routing, request generations, lanes and shared-process
+lifecycle. Both frontends reuse the transport package and the same configuration.
+Transport depends on config for default sizes; neither package imports the command.
+Package-specific tests and transport benchmarks live beside their implementations;
+integration and shared-process tests remain at the root.
+
 ```sh
-go test -race ./...
+go test -race . ./internal/config ./internal/transport
 golangci-lint run ./...
 ```
 
