@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"slices"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -353,24 +352,6 @@ func BenchmarkAcquisitionVersusSweep(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-			}
-		})
-	}
-}
-
-// Keep the expected set explicit: this benchmark measures production
-// acquisition/reconciliation, unlike the old cleanRecords-only probe fixture.
-func TestNewRetentionSettings(t *testing.T) {
-	for _, name := range []string{"GOPLS_MANAGER_MAX_LANES", "GOPLS_MANAGER_MAX_CACHE_ENTRIES"} {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv(name, "2")
-			limits, err := limitsFromEnv()
-			if err != nil || !slices.Contains([]int{limits.Lanes, limits.CacheEntries}, 2) {
-				t.Fatalf("limits: %+v, %v", limits, err)
-			}
-			t.Setenv(name, "0")
-			if _, err := limitsFromEnv(); err == nil {
-				t.Fatal("zero retention limit accepted")
 			}
 		})
 	}

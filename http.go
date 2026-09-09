@@ -14,12 +14,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
+
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // httpBackend shares bounded legacy SSE lanes across independent HTTP calls.
-// Only the routing goroutine owns lane creation and filesystem resolution.
+// Only the routing goroutine owns lanes; one separate coordinator waits for
+// filesystem resolution so independent warm HTTP requests can pass it.
 // External IDs never enter this backend: different clients can reuse any ID.
 type httpBackend struct {
 	r        *router
@@ -47,6 +50,31 @@ func newHTTPBackend(parent context.Context, m *manager, home string) *httpBacken
 }
 
 func (b *httpBackend) start() {
+	cold := make(chan delivery, laneQueue)
+	type resolved struct {
+		call      delivery
+		worktrees []string
+		err       error
+	}
+	ready := make(chan resolved)
+	go func() {
+		for {
+			select {
+			case <-b.r.ctx.Done():
+				return
+			case call := <-cold:
+				start := time.Now()
+				worktrees, err := b.r.resolveWorktrees(call.ctx, call.req.Params)
+				b.r.timed("resolution", start)
+				select {
+				case ready <- resolved{call, worktrees, err}:
+				case <-b.r.ctx.Done():
+					call.cancel()
+					return
+				}
+			}
+		}
+	}()
 	go func() {
 		defer close(b.done)
 		defer b.r.clearRequests()
@@ -60,8 +88,30 @@ func (b *httpBackend) start() {
 			select {
 			case <-b.r.ctx.Done():
 				return
+			case result := <-ready:
+				worktree, err := b.r.targetWorktrees(result.worktrees)
+				if result.err != nil {
+					err = result.err
+				}
+				b.r.routeResolved(result.call, worktree, err)
 			case call := <-b.queue:
-				b.r.routePrepared(call)
+				if call.req.Method != "tools/call" {
+					b.r.routePrepared(call)
+					continue
+				}
+				b.r.timed("routing_queue", call.queued)
+				if worktrees, complete := b.r.cachedWorktrees(call.req.Params); complete {
+					worktree, err := b.r.targetWorktrees(worktrees)
+					b.r.routeResolved(call, worktree, err)
+					continue
+				}
+				select {
+				case cold <- call:
+				default:
+					call.cancel()
+					b.r.rejected("resolution_queue")
+					b.r.failIngress(call, -32000, "resolution queue is full")
+				}
 			}
 		}
 	}()
@@ -200,9 +250,19 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 		}
 	})
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s },
-		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, PropagateRequestCancellation: true})
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, PropagateRequestCancellation: true,
+			MaxRequestBodyBytes: int64(b.r.limits.MessageBytes)})
 	// Bound request bodies and concurrent HTTP exchanges, including slow writers.
-	slots := make(chan struct{}, b.r.limits.Session)
+	// Reserve the maximum body size until the exchange ends, including chunked
+	// requests. This bounds admitted wire bytes, not decoded result/heap overhead.
+	messageBytes, budget := b.r.limits.MessageBytes, b.r.limits.HTTPBytes
+	if messageBytes <= 0 {
+		messageBytes = config.Default().MessageBytes
+	}
+	if budget <= 0 {
+		budget = config.Default().HTTPBytes
+	}
+	slots := make(chan struct{}, min(b.r.limits.Session, budget/messageBytes))
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w = &httpReplyWriter{ResponseWriter: w}
 		select {

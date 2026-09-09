@@ -11,12 +11,41 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
 type pathArguments struct {
 	File  string   `json:"file"`
 	Dir   string   `json:"dir"`
 	Files []string `json:"files"`
+}
+
+// Whole-memo epochs avoid a timestamp or eviction node for every path. Both
+// levels expire together so a directory hit cannot renew a stale path forever.
+type memoState struct {
+	expires                              time.Time
+	generation                           uint64
+	hits, misses, expirations, rollovers int64
+}
+
+// Caller holds memoMu. Expiry is lazy; metrics snapshots also sweep idle memos.
+func (r *router) expireMemosLocked() {
+	now := time.Now()
+	if !r.memo.expires.IsZero() && now.Before(r.memo.expires) {
+		return
+	}
+	if !r.memo.expires.IsZero() {
+		clear(r.paths)
+		clear(r.worktrees)
+		r.memo.expirations++
+	}
+	ttl := r.limits.CacheTTL
+	if ttl <= 0 {
+		ttl = config.Default().CacheTTL
+	}
+	r.memo.expires = now.Add(ttl)
+	r.memo.generation++
 }
 
 func parsePathArguments(params json.RawMessage) pathArguments {
@@ -82,8 +111,8 @@ func (r *router) appendWorktreeOf(found []string, path string) []string {
 // git at ~13ms a call, every path in one directory has the same answer, and a
 // session names many files under the same handful of directories. Only
 // successes are cached, so a path that becomes resolvable later still gets its
-// own lookup; a worktree removed mid-session keeps answering until the routed
-// gopls reports the path itself.
+// own lookup. Successful resolutions are revalidated after the shared memo
+// epoch expires, including worktrees removed or symlinks retargeted mid-session.
 //
 // The verbatim path is memoized in front of that, because reaching the
 // directory memo is not free: containingDir lstats every component of the
@@ -92,6 +121,8 @@ func (r *router) appendWorktreeOf(found []string, path string) []string {
 // that a path-cache rollover need not discard cached directory resolutions.
 func (r *router) worktreeOf(path string) string {
 	r.memoMu.Lock()
+	r.expireMemosLocked()
+	generation := r.memo.generation
 	if worktree, ok := r.paths[path]; ok {
 		r.memoMu.Unlock()
 		return worktree
@@ -106,12 +137,14 @@ func (r *router) worktreeOf(path string) string {
 		if worktree, err = worktreeOfDir(r.ctx, dir); err != nil {
 			return ""
 		}
-		r.memoMu.Lock()
-		r.memoize(r.worktrees, dir, worktree)
-		r.memoMu.Unlock()
 	}
 	r.memoMu.Lock()
-	r.memoize(r.paths, path, worktree)
+	// A cancelled/slow lookup must not repopulate a newer cache epoch.
+	r.expireMemosLocked()
+	if r.ctx.Err() == nil && generation == r.memo.generation {
+		r.memoize(r.worktrees, dir, worktree)
+		r.memoize(r.paths, path, worktree)
+	}
 	r.memoMu.Unlock()
 	return worktree
 }
@@ -122,10 +155,11 @@ func (r *router) worktreeOf(path string) string {
 func (r *router) memoize(cache map[string]string, key, value string) {
 	limit := r.limits.CacheEntries
 	if limit <= 0 {
-		limit = defaultCallLimits().CacheEntries
+		limit = config.Default().CacheEntries
 	}
-	if len(cache) >= limit {
+	if _, exists := cache[key]; !exists && len(cache) >= limit {
 		clear(cache)
+		r.memo.rollovers++
 	}
 	cache[key] = value
 }

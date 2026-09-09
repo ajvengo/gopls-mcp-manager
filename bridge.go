@@ -5,6 +5,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
+	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
+
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -21,6 +24,7 @@ type router struct {
 	worktrees map[string]string // containing directory -> worktree, see worktreeOf
 	paths     map[string]string // path argument, verbatim -> worktree, see worktreeOf
 	memoMu    *sync.Mutex       // shared with the single filesystem worker
+	memo      *memoState        // shared expiry epoch and observations, under memoMu
 	// ctx bounds the dial, and only the dial: the connection it hands back is
 	// read under this same context for the rest of its life, so the caller
 	// cancels it on expiry rather than passing a deadline down. See dialBounded.
@@ -30,11 +34,14 @@ type router struct {
 	// Client requests still in flight, so that a dying gopls fails its callers
 	// instead of leaving them hanging. Holding an id is also what confers the
 	// right to answer it: see finish in requests.go.
-	awaitingUpstream map[jsonrpc.ID]owed
-	perWorktree      map[string]int
-	limits           callLimits
-	usage            requestUsage
-	resolver         *pathResolver
+	awaitingUpstream      map[jsonrpc.ID]owed
+	perWorktree           map[string]int
+	operations            map[operationKey]operation
+	operationsPerWorktree map[string]int
+	limits                config.Limits
+	usage                 requestUsage
+	resolver              *pathResolver
+	sseBudget             *transport.Budget
 
 	out  chan jsonrpc.Message
 	errs chan error
@@ -52,20 +59,28 @@ type router struct {
 
 func newRouter(ctx context.Context, m *manager, home string) *router {
 	r := &router{
-		ctx:              ctx,
-		m:                m,
-		home:             home,
-		lanes:            make(map[string]*lane),
-		worktrees:        make(map[string]string),
-		paths:            make(map[string]string),
-		memoMu:           new(sync.Mutex),
-		awaitingUpstream: make(map[jsonrpc.ID]owed),
-		perWorktree:      make(map[string]int),
-		usage:            requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
-		limits:           defaultCallLimits(),
-		out:              make(chan jsonrpc.Message, 64),
-		errs:             make(chan error, 4),
+		ctx:                   ctx,
+		m:                     m,
+		home:                  home,
+		lanes:                 make(map[string]*lane),
+		worktrees:             make(map[string]string),
+		paths:                 make(map[string]string),
+		memoMu:                new(sync.Mutex),
+		memo:                  new(memoState),
+		awaitingUpstream:      make(map[jsonrpc.ID]owed),
+		perWorktree:           make(map[string]int),
+		operations:            make(map[operationKey]operation),
+		operationsPerWorktree: make(map[string]int),
+		usage:                 requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
+		limits:                config.Default(),
+		out:                   make(chan jsonrpc.Message, 64),
+		errs:                  make(chan error, 4),
 	}
 	r.dial = r.dialGopls
+	budget := r.limits.SSEBytes
+	if m != nil && m.limits.SSEBytes > 0 {
+		budget = m.limits.SSEBytes
+	}
+	r.sseBudget = transport.NewBudget(budget)
 	return r
 }

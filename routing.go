@@ -54,7 +54,7 @@ func (r *router) prepare(req *jsonrpc.Request) (delivery, bool) {
 		r.awaitingUpstream[req.ID] = owner
 	}
 	r.mu.Unlock()
-	return delivery{req: req, ctx: ctx, cancel: cancel, queued: time.Now()}, true
+	return delivery{req: req, ctx: ctx, cancel: cancel, state: owner.state, queued: time.Now()}, true
 }
 
 func (r *router) routePrepared(call delivery) {
@@ -68,6 +68,15 @@ func (r *router) routePrepared(call delivery) {
 		return
 	}
 	worktree, err := r.targetContext(call.ctx, req)
+	r.routeResolved(call, worktree, err)
+}
+
+// Only the routing owner calls this, including after asynchronous HTTP lookup.
+func (r *router) routeResolved(call delivery, worktree string, err error) {
+	req := call.req
+	if call.ctx.Err() != nil {
+		err = call.ctx.Err()
+	}
 	if err != nil {
 		code := int64(jsonrpc.CodeInvalidParams)
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -86,13 +95,13 @@ func (r *router) routePrepared(call delivery) {
 	}
 	l := r.laneFor(worktree)
 	select {
-	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, queued: time.Now()}:
+	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, state: call.state, queued: time.Now()}:
 	case <-r.ctx.Done():
 		cancel()
 	default:
 		cancel()
 		r.rejected("delivery_queue")
-		r.fail(req.ID, -32000, "gopls for %s is overloaded: delivery queue is full", worktree)
+		r.failIngress(call, -32000, fmt.Sprintf("gopls for %s is overloaded: delivery queue is full", worktree))
 	}
 }
 
@@ -109,25 +118,28 @@ func (r *router) targetContext(ctx context.Context, req *jsonrpc.Request) (strin
 		if err != nil {
 			return "", err
 		}
-		if len(worktrees) > 1 {
-			// Sticky is deliberately left alone: this call picked no worktree,
-			// so the one before it is still the best guess for the one after.
-			return "", fmt.Errorf("call names paths in %d worktrees (%s); one gopls answers for one tree, so split the call",
-				len(worktrees), strings.Join(worktrees, ", "))
-		}
-		if len(worktrees) == 1 {
-			if !r.stateless {
-				r.sticky = worktrees[0]
-			}
-			return worktrees[0], nil
-		}
-		if !r.stateless && r.sticky != "" {
-			return r.sticky, nil
-		}
+		return r.targetWorktrees(worktrees)
 	case "notifications/cancelled":
 		if worktree := r.cancelTarget(req.Params); worktree != "" {
 			return worktree, nil
 		}
+	}
+	return r.home, nil
+}
+
+func (r *router) targetWorktrees(worktrees []string) (string, error) {
+	if len(worktrees) > 1 {
+		return "", fmt.Errorf("call names paths in %d worktrees (%s); one gopls answers for one tree, so split the call",
+			len(worktrees), strings.Join(worktrees, ", "))
+	}
+	if len(worktrees) == 1 {
+		if !r.stateless {
+			r.sticky = worktrees[0]
+		}
+		return worktrees[0], nil
+	}
+	if !r.stateless && r.sticky != "" {
+		return r.sticky, nil
 	}
 	return r.home, nil
 }

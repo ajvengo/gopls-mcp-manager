@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -12,41 +11,13 @@ import (
 	"time"
 )
 
-func limitsFromEnv() (callLimits, error) {
-	limits := defaultCallLimits()
-	for _, setting := range []struct {
-		name   string
-		target *int
-	}{
-		{"GOPLS_MANAGER_MAX_OUTSTANDING", &limits.Session},
-		{"GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE", &limits.PerLane},
-		{"GOPLS_MANAGER_MAX_LANES", &limits.Lanes},
-		{"GOPLS_MANAGER_MAX_CACHE_ENTRIES", &limits.CacheEntries},
-	} {
-		if raw := os.Getenv(setting.name); raw != "" {
-			value, err := strconv.Atoi(raw)
-			if err != nil || value <= 0 {
-				return limits, fmt.Errorf("%s must be a positive integer", setting.name)
-			}
-			*setting.target = value
-		}
-	}
-	if raw := os.Getenv("GOPLS_MANAGER_EXECUTION_TIMEOUT"); raw != "" {
-		value, err := time.ParseDuration(raw)
-		if err != nil || value < 0 {
-			return limits, fmt.Errorf("GOPLS_MANAGER_EXECUTION_TIMEOUT must be a nonnegative duration")
-		}
-		limits.Execution = value
-	}
-	return limits, nil
-}
-
 type serverUsage struct {
 	record
 	RSSKiB   *int64
 	Identity string
 	// Null is deliberate: process existence is not proof of client activity.
 	ActiveClients *int
+	LogBytes      *int64
 }
 
 // status is observational: unlike list it never sweeps, signals or writes the
@@ -83,6 +54,10 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 	}
 	for _, r := range records {
 		usage := serverUsage{record: r, Identity: "unknown"}
+		if info, err := os.Lstat(m.logPath(r.Worktree)); err == nil && info.Mode().IsRegular() {
+			size := info.Size()
+			usage.LogBytes = &size
+		}
 		if command, ok := commands[r.PID]; ok {
 			fields := strings.Fields(command)
 			usage.Identity = "different process"
@@ -95,9 +70,14 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 		}
 		servers = append(servers, usage)
 	}
+	logs, err := m.logs(ctx, false)
+	if err != nil {
+		return err
+	}
 	return json.NewEncoder(w).Encode(struct {
 		RecordedServers int
 		RegistryIntact  bool
 		Servers         []serverUsage
-	}{len(servers), intact, servers})
+		Logs            logUsage
+	}{len(servers), intact, servers, logs})
 }
