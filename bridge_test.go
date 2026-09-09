@@ -152,7 +152,8 @@ func handshakeReady(r *router) {
 func sendCall(t *testing.T, l *lane, name string) jsonrpc.ID {
 	t.Helper()
 	id := mustID(t, name)
-	l.send(&jsonrpc.Request{ID: id, Method: "tools/call"})
+	l.r.track(id, nil, l.worktree)
+	l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"})
 	return id
 }
 
@@ -206,9 +207,14 @@ func forbidDial(t *testing.T, r *router, whatWouldBeWrong string) {
 func startClient(t *testing.T, r *router, depth int) chan<- jsonrpc.Message {
 	t.Helper()
 	reads := make(chan jsonrpc.Message, depth)
-	go r.readFromClient(&fakeConn{reads: reads})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.readFromClient(&fakeConn{reads: reads})
+	}()
 	t.Cleanup(func() {
 		close(reads)
+		<-done
 		r.closeLanes()
 	})
 	return reads
@@ -393,6 +399,8 @@ func wantWireError(t *testing.T, resp *jsonrpc.Response, code int64) *jsonrpc.Er
 // wantOneRoot reads a roots/list answer, which names exactly one root — the
 // tree the upstream that asked belongs to, and never any other. Callers assert
 // on the root itself; that there is only the one is the shared part.
+//
+//nolint:staticcheck // Verify the roots contract required by legacy gopls SSE sessions.
 func wantOneRoot(t *testing.T, resp *jsonrpc.Response) *mcp.Root {
 	t.Helper()
 	var got mcp.ListRootsResult
@@ -638,7 +646,8 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 		initialize := &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)}
 		r.initialize.Store(initialize)
 
-		newLane(r, home).send(initialize)
+		r.track(id, nil, home)
+		newLane(r, home).send(t.Context(), initialize)
 		// The retry is the whole point: with a reader racing the write for the id,
 		// send() finds the call already answered and this write never comes.
 		got := mustRecv(t, fresh.writes, "the retried initialize on a second connection").(*jsonrpc.Request)
@@ -669,7 +678,8 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 		l := connectedLane(r, r.home, held)
 
 		id := mustID(t, "client-initialize")
-		l.send(&jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)})
+		r.track(id, nil, l.worktree)
+		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)})
 
 		wantClientError(t, r, id, "a second initialize was left unanswered")
 		select {
@@ -934,7 +944,8 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 
 		// Not sendCall: this conn's onWrite is built around this exact id, and
 		// minting a second one from the same string would only hide that.
-		l.send(&jsonrpc.Request{ID: id, Method: "tools/call"})
+		r.track(id, nil, l.worktree)
+		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"})
 		close(conn.reads) // the upstream dies once the call is long since answered
 		mustRecv(t, done, "the upstream reader to finish")
 
@@ -1333,8 +1344,8 @@ func TestCancellationForADisconnectedUpstreamIsDroppedNotDialled(t *testing.T) {
 		// A lane that never dialled, and one whose connection dies under this
 		// very write — the retry starts from the same "no upstream to tell", so
 		// the refusal has to be asked on every attempt rather than on the way in.
-		newLane(r, "/tmp/gone").send(cancel)
-		connectedLane(r, "/tmp/dying", failingConn()).send(cancel)
+		newLane(r, "/tmp/gone").send(t.Context(), cancel)
+		connectedLane(r, "/tmp/dying", failingConn()).send(t.Context(), cancel)
 
 		wantClientQuiet(t, r, "a cancellation produced a message for the client")
 	})

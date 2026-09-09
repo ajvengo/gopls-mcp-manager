@@ -11,8 +11,8 @@ outside that tree and it does not route the question anywhere; it answers
 workspace. So a single gopls cannot serve an agent that works across linked
 worktrees — which is exactly what worktree isolation produces.
 
-`gopls-mcp-manager` sits between the MCP client and gopls. It speaks stdio MCP
-to the client, and routes each tool call to the gopls that owns the file the
+`gopls-mcp-manager` sits between the MCP client and gopls. It speaks stateless
+Streamable HTTP or stdio MCP to the client, and routes each tool call to the gopls that owns the file the
 call names, starting that gopls on demand. The client sees one server and
 performs one handshake.
 
@@ -41,12 +41,53 @@ Commands:
 
 | Command | Effect |
 | --- | --- |
+| `gopls-mcp-manager http [address [path]]` | Serve stateless MCP at `/mcp`; defaults to `127.0.0.1:6099` and home `.` |
 | `gopls-mcp-manager [bridge [path]]` | Run the stdio bridge. Default; `path` defaults to `.` and needs the `bridge` word before it |
 | `gopls-mcp-manager ensure [path]` | Start (or find) the gopls for `path`'s worktree, print its port |
-| `gopls-mcp-manager list` | Print the live servers, dropping and reaping dead records |
+| `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
+| `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS and termination state |
 
 `path` is resolved to the root of the worktree containing it, with symlinks
 removed. The worktree the bridge starts in is its **home**.
+
+### Stateless HTTP
+
+Start the manager as a long-running local service:
+
+```sh
+gopls-mcp-manager http 127.0.0.1:6099 /absolute/path/to/repo
+```
+
+Configure your MCP client's Streamable HTTP server URL as
+`http://127.0.0.1:6099/mcp`. The endpoint accepts MCP POST requests and returns
+JSON responses. It issues no session ID and ignores supplied session IDs;
+GET and DELETE return 405. The listener is restricted to loopback.
+
+HTTP requests route independently: absolute `file`, `dir`, and `files`
+arguments select a worktree; **pathless calls always use home**. There is no
+sticky routing between HTTP requests or clients. Run a separate manager with
+a different home and listening port when pathless tools must target another
+worktree. The routing description below describes the stdio bridge's sticky mode.
+
+Internally, the manager keeps bounded, reusable legacy SSE-over-HTTP connections
+to gopls, including private initialization and worktree roots. Tool listing,
+schemas, pagination, results and upstream errors are forwarded. Client request
+IDs are translated to unique internal IDs, so concurrent clients cannot collide.
+The frontend advertises tools; it does not relay unsolicited notifications,
+progress streams, or client roots to the shared upstream sessions.
+
+Cancel the HTTP request to cancel its internal call. A separate
+`notifications/cancelled` POST cannot identify another client's call in stateless
+mode and has no cross-request effect. Cancellation still completes locally first;
+an advisory SSE cancellation does not prove gopls stopped its work.
+
+Existing outstanding-call, lane and memo limits apply across the HTTP service.
+Concurrent HTTP exchanges are also capped by the session outstanding limit;
+excess exchanges receive HTTP 503. Bodies are limited to 4 MiB, header/body reads
+to 5/30 seconds, and response writes to 30 seconds after the response starts.
+Long tool execution uses the existing optional execution timeout. Shutdown closes
+internal SSE connections and cancels calls, while shared gopls processes remain
+available to other managers. The default command still runs stdio.
 
 ## Routing
 
@@ -61,13 +102,20 @@ Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
   own working directory rather than yours. gopls' schemas ask for absolute paths.
 - **Calls with no usable path** (`go_workspace`, `go_search`, `go_package_api`)
   follow the sticky worktree, falling back to home.
-- **A cancellation follows the call it names**, reaching the gopls that owes that
-  request id rather than home.
+- **A cancellation completes the call locally** and releases its outstanding
+  slot. Queued or dialling delivery is cancelled. Delivered calls also use a
+  separate bounded control queue to notify the exact owning connection; a late
+  answer is suppressed. Local completion does not prove upstream work stopped.
 - Everything else that is not a `tools/call` goes to home.
 
-Resolution shells out to `git rev-parse --show-toplevel`, so answers are
-memoized for the session — per path argument, backed by a per-directory memo, so
-each directory costs one `git` fork however many files you name in it.
+Resolution shells out to `git rev-parse --show-toplevel`, so successful answers
+are memoized per path and directory. One resolver worker gives filesystem
+resolution a 10 s budget, shared by all paths in a call. Pathless calls and path
+memo hits bypass that worker. A separate reader admits calls into a bounded
+64-message routing queue and handles cancellation immediately, even while a
+lookup is stuck. Ordinary routing and sticky updates remain in wire order.
+Ingress queueing, routing and delivery share a 40 s ceiling; delivery additionally
+has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker.
 
 ## What the bridge handles for you
 
@@ -77,21 +125,56 @@ each directory costs one `git` fork however many files you name in it.
   watch that tree and notice files created after it started. Your client need
   not advertise the optional `roots` capability — the bridge adds it and answers
   `roots/list` itself. Any other server-initiated request is refused with
-  `method not found`.
+  `method not found`. Replies have a 30 s write ceiling (or the shorter remaining
+  handshake deadline); a failed reply closes that connection and fails its calls.
 - **A dying gopls does not end the session**, not even home. The bridge redials,
   replays the handshake and retries once; calls that were in flight when it died
   come back as errors rather than hanging, since MCP clients have no timeout.
 - **Each worktree gets its own lane**, so starting a cold worktree — a lock wait,
   a `gopls` spawn, a handshake — costs that worktree's calls and nobody else's.
-- **Each client message is bounded** at 30 s (the readiness budget plus 20 s),
-  retry included, so a gopls that accepts the connection and then says nothing
-  fails that call instead of wedging the worktree for the session. It does not
-  bound the answer: a gopls that takes a call and then goes quiet *without*
-  dying still leaves its caller waiting.
+- **Each admitted message has a 30 s delivery budget**, including queue time,
+  lock acquisition, readiness, handshake and retry. An expired queued call
+  cannot start a server. Filesystem syscalls cannot be interrupted by a Go
+  context, and failed-child cleanup has a separate short budget. The budget
+  is separate from the optional post-delivery execution timeout described below.
+- **A full worktree queue rejects requests** with an overload error instead of
+  blocking other worktrees. Each delivery and cancellation queue holds 64
+  messages. Notifications are advisory and are dropped when their queue is full.
+- **Outstanding calls have separate limits:** 128 per worktree and 1024 per
+  session by default. A server accepting writes but never answering cannot evade
+  those limits by draining its delivery queue.
 - The bridge stops when the stdio client goes away, or on `^C` / `SIGTERM`.
+  It waits for owned failed-child cleanup before exiting: SIGTERM, up to 2 s,
+  then SIGKILL and up to 2 s to confirm exit. A failed child's record is removed
+  only after exit is confirmed, with up to 2 s to acquire the cleanup lock.
 
-SPEC.md §3–§5 has the rest: which party may answer a call, what the private
-handshake ids are for, and what the budget deliberately excludes.
+## Limits and measurements
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Outstanding calls per session |
+| GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Outstanding calls per worktree |
+| GOPLS_MANAGER_MAX_LANES | 64 | Retained worktree lanes per session; existing lanes remain usable at capacity |
+| GOPLS_MANAGER_MAX_CACHE_ENTRIES | 4096 | Entries in each path/directory memo; a full memo clears before inserting |
+| GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
+| GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
+
+Counts must be positive. Execution timeout accepts Go durations such as 2m.
+A timeout releases local tracking and suppresses late results; upstream work may
+continue. If the client output queue is full at expiry, the session fails rather
+than accumulating blocked timer callbacks. Choose it to accommodate long diagnostics and vulnerability scans.
+
+Metrics include registry lock wait/hold and manager probe, readiness and ensure
+durations. Session snapshots every 30 s and at exit report request counts,
+rejection reasons, cancellation/expiry counts, retained lanes and memo sizes,
+and count/total/max nanoseconds for routing, queue waits and handshake. MCP stdout stays protocol-only. The status command reports RSS in KiB
+only when the process identity matches; one bounded ps snapshot covers the
+recorded PIDs. Missing values and active-client counts are null rather than
+guessed. Status never signals a process or rewrites the map.
+
+There is no automatic eviction. [LEASES.md](LEASES.md) describes cross-client
+attachment and operation ownership, fencing, and the evidence required before
+introducing a resource ceiling. SPEC.md contains the behavioral contract.
 
 ## State on disk
 
@@ -119,8 +202,11 @@ killing the process strands a full workspace index — routinely 1–2 GB reside
 that no longer appears in `list`, still holds its port, and lives until reboot.
 
 A record is therefore checked on several counts before it is dropped, and the
-process is signalled when it is. All the records are checked at once, because
-the map is locked for the whole sweep and each probe waits out its own timeout:
+process is signalled when it is. Acquisition checks only records for the requested
+worktree; unrelated records continue reserving their ports. Run `list` for a full
+maintenance sweep, including stale worktrees you no longer use. Probes run outside
+the global registry lock. Reconciliation applies verdicts only to unchanged
+record identities:
 
 1. `kill(pid, 0)` — is anything there at all?
 2. A record younger than 15 s is kept unprobed. A gopls between fork and bind
@@ -132,10 +218,16 @@ the map is locked for the whole sweep and each probe waits out its own timeout:
 4. `ps` must still show that pid running a gopls with *our* listen address, since
    the map survives reboots that recycle every pid in it.
 
-The rule throughout is that being unsure keeps the server: only a conclusively
-dead record is signalled. A record that is no longer ours is dropped either way
-but never signalled, since otherwise nothing would reap it. SPEC.md §8 has the
-verdict table and the reasoning behind each.
+Probes report live, uncertain, terminate or gone without signalling. Termination
+is persisted as `Terminating: true` before an action lock and fresh identity check
+permit SIGTERM. A successful signal does not remove the record: later sweeps must
+confirm that the old process is gone. Ensure refuses terminating endpoints and
+does not spawn beside them. A process ignoring SIGTERM stays discoverable.
+
+Update all manager binaries sharing the registry before relying on this field;
+older versions ignore it. Shared-process sweep cleanup does not escalate to
+SIGKILL. The manager's own failed children retain their bounded escalation and
+reaping behavior. SPEC.md §8 describes reconciliation and identity safeguards.
 
 ## Development
 

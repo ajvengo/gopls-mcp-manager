@@ -19,8 +19,12 @@ import (
 func benchRouter(b *testing.B) (*router, string) {
 	b.Helper()
 	dir := b.TempDir()
-	// TempDir on darwin hands back /var/... which is a symlink to /private/var,
-	// so a real EvalSymlinks walk happens here just as it does in a session.
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	// Use the same physical spelling for existing and nonexistent fixture files.
+	// Symlink memo consistency is covered separately by the routing tests.
 	file := filepath.Join(dir, "main.go")
 	mustWriteFile(b, file, "package main\n")
 	r := newTestRouter(b, dir)
@@ -126,10 +130,15 @@ func BenchmarkCallRoundTrip(b *testing.B) {
 
 	client := make(chan jsonrpc.Message, laneQueue)
 	sink := &fakeConn{writes: make(chan jsonrpc.Message, laneQueue)}
-	go r.readFromClient(&fakeConn{reads: client})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.readFromClient(&fakeConn{reads: client})
+	}()
 	go r.writeToClient(sink)
 	b.Cleanup(func() {
 		close(client)
+		<-done
 		r.closeLanes()
 	})
 
@@ -228,13 +237,13 @@ func BenchmarkWithRecords(b *testing.B) {
 			m := newTestManager(b)
 			// Every record answers alive without a syscall: the probes are another
 			// benchmark's subject, and a real one here would drown the file work.
-			m.alive = func(record) bool { return true }
+			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 			if err := writeMap(m.mapPath, records); err != nil {
 				b.Fatal(err)
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := m.withRecords(bench.body); err != nil {
+				if _, err := m.withRecords(b.Context(), bench.body); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -250,12 +259,9 @@ func testRecords(n int) []record {
 	return records
 }
 
-// The other half of what the map lock holds, and the half BenchmarkWithRecords
-// stubs out: every record on the machine is probed on every sweep, and a sweep
-// runs on every cold start and every redial. The probes fan out, so the cost is
-// the slowest one — but they run under a flock every process on this machine
-// shares, so that slowest one is what every other worktree's cold start queues
-// behind.
+// Probe-only microbenchmark. Full maintenance probes every record outside the
+// flock; acquisition probes only the requested worktree. See
+// BenchmarkAcquisitionVersusSweep for those production paths.
 //
 // The rows are the verdicts a probe can reach. "live" is the steady state, one
 // local round trip. "refused" is conclusively dead; "odd" answers but not like
@@ -290,7 +296,7 @@ func BenchmarkSweepProbes(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				cleanRecords(records, recordAlive)
+				cleanRecords(records, func(r record) bool { return recordAlive(b.Context(), r) != probeGone })
 			}
 		})
 	}

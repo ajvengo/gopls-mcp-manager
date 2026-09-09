@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -143,7 +144,9 @@ func wantRecords(t *testing.T, path string, whatWouldBeWrong string, want ...rec
 // newTestManager returns a manager over a map file of its own.
 func newTestManager(tb testing.TB) manager {
 	tb.Helper()
-	return manager{mapPath: filepath.Join(tb.TempDir(), "gopls-ports.map"), alive: recordAlive, ready: awaitReady}
+	m := manager{mapPath: filepath.Join(tb.TempDir(), "gopls-ports.map"), alive: recordAlive, ready: awaitReady}
+	m.start = m.startGopls
+	return m
 }
 
 // newStubbedManager adds what the claimPort tests need on top: a gopls stub on
@@ -523,8 +526,11 @@ func TestRecordAlive(t *testing.T) {
 			if test.startedAt != nil {
 				r.StartedAt = test.startedAt()
 			}
-			if got := recordAlive(r); got != test.wantAlive {
+			if got := recordAlive(t.Context(), r); (got == probeLive || got == probeUncertain) != test.wantAlive {
 				t.Errorf("recordAlive() = %v, want %v", got, test.wantAlive)
+			}
+			if test.want == signalled && recordAlive(t.Context(), r) != probeTerminate {
+				t.Error("refused owned endpoint was not marked for termination")
 			}
 			if answered != nil && !answered() {
 				t.Fatal("the probe never reached the server, so this row's verdict was reached by the wrong route")
@@ -533,7 +539,7 @@ func TestRecordAlive(t *testing.T) {
 			case spared:
 				wantRunning(t, cmd, "a server that should have been spared was signalled")
 			case signalled:
-				wantSignalled(t, cmd, "the server declared dead was left running")
+				wantRunning(t, cmd, "a read-only probe signalled a process")
 			case alreadyGone:
 			}
 		})
@@ -594,7 +600,7 @@ func TestWithRecordsWritesOnlyWhenTheFileWouldChange(t *testing.T) {
 			// Every record alive, so the sweep hands back what it was given and the
 			// records are equal in both rows — leaving the intact flag as the only
 			// thing that differs between them.
-			m.alive = func(record) bool { return true }
+			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 			mustWriteMap(t, m.mapPath, []record{kept})
 			if tc.damage != "" {
 				appendToMap(t, m.mapPath, tc.damage)
@@ -606,7 +612,7 @@ func TestWithRecordsWritesOnlyWhenTheFileWouldChange(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, err := m.withRecords(func(rs []record) ([]record, error) { return rs, nil }); err != nil {
+			if _, err := m.withRecords(t.Context(), func(rs []record) ([]record, error) { return rs, nil }); err != nil {
 				t.Fatal(err)
 			}
 
@@ -647,7 +653,7 @@ func TestClaimPortReturnsBeforeItsGoplsIsReady(t *testing.T) {
 	m, worktree := newStubbedManager(t)
 
 	start := time.Now()
-	claimed, started, err := m.claimPort(worktree)
+	claimed, started, err := m.claimPort(t.Context(), worktree)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,15 +687,15 @@ func TestConcurrentClaimPortSpawnsOnce(t *testing.T) {
 
 	const callers = 16
 	claims := make([]record, callers)
-	spawned := make([]*os.Process, callers)
+	spawned := make([]*childProcess, callers)
 	errs := make([]error, callers)
 	var racing sync.WaitGroup
 	for i := range callers {
-		racing.Go(func() { claims[i], spawned[i], errs[i] = m.claimPort(worktree) })
+		racing.Go(func() { claims[i], spawned[i], errs[i] = m.claimPort(t.Context(), worktree) })
 	}
 	racing.Wait()
 
-	var starter *os.Process
+	var starter *childProcess
 	for i := range callers {
 		if errs[i] != nil {
 			t.Fatalf("caller %d: claimPort() = %v", i, errs[i])
@@ -742,7 +748,7 @@ func TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting(t *testing.T) {
 	serveEndpoint(t, listener, binding)
 
 	start := time.Now()
-	got, err := m.ensure(worktree)
+	got, err := m.ensure(t.Context(), worktree)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -766,13 +772,13 @@ func TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady(t *testing.T)
 	m, worktree := newStubbedManager(t)
 	neighbour := record{Worktree: "/repo/other", Port: 62001, PID: 11}
 	mustWriteMap(t, m.mapPath, []record{neighbour})
-	m.alive = func(record) bool { return true }
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 
 	// The pid is read while the readiness wait is still running, which is the
 	// last moment the map still names it: forget runs on the way out of the very
 	// call this hook is standing in for.
 	var pid int
-	m.ready = func(int) error {
+	m.ready = func(context.Context, int) error {
 		for _, r := range mustReadMap(t, m.mapPath) {
 			if r.Worktree == worktree {
 				pid = r.PID
@@ -781,7 +787,7 @@ func TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady(t *testing.T)
 		return errors.New("never bound")
 	}
 
-	if port, err := m.ensure(worktree); err == nil {
+	if port, err := m.ensure(t.Context(), worktree); err == nil {
 		t.Fatalf("ensure() = %d for a gopls that never became ready, want an error", port)
 	}
 
@@ -813,10 +819,10 @@ func TestEnsureLeavesAnotherProcessesFailedStartAlone(t *testing.T) {
 	// not create rather than answer with its port straight away.
 	theirs := record{Worktree: worktree, Port: 62001, PID: os.Getpid(), StartedAt: time.Now().Unix()}
 	mustWriteMap(t, m.mapPath, []record{theirs})
-	m.alive = func(record) bool { return true }
-	m.ready = func(int) error { return errors.New("never bound") }
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
+	m.ready = func(context.Context, int) error { return errors.New("never bound") }
 
-	if port, err := m.ensure(worktree); err == nil {
+	if port, err := m.ensure(t.Context(), worktree); err == nil {
 		t.Fatalf("ensure() = %d for a gopls that never became ready, want an error", port)
 	}
 
@@ -842,7 +848,7 @@ func TestForgetDropsOnlyTheNamedRecord(t *testing.T) {
 	}
 	mustWriteMap(t, m.mapPath, []record{kept[0], failed, kept[1], kept[2]})
 
-	if err := m.forget(failed); err != nil {
+	if err := m.forget(t.Context(), failed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -880,9 +886,9 @@ func TestListReportsAWriterThatStoppedReading(t *testing.T) {
 			m := newTestManager(t)
 			live := record{Worktree: "/repo/live", Port: 62001, PID: 11}
 			mustWriteMap(t, m.mapPath, []record{live})
-			m.alive = func(record) bool { return true }
+			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 
-			if err := m.list(&failingWriter{after: tc.after}); !errors.Is(err, io.ErrClosedPipe) {
+			if err := m.list(t.Context(), &failingWriter{after: tc.after}); !errors.Is(err, io.ErrClosedPipe) {
 				t.Fatalf("list() = %v for a writer that stopped reading, want its error", err)
 			}
 		})
@@ -915,10 +921,10 @@ func TestWithRecordsWritesNothingWhenTheBodyRefuses(t *testing.T) {
 	m := newTestManager(t)
 	stored := record{Worktree: "/repo/live", Port: 62001, PID: 11}
 	mustWriteMap(t, m.mapPath, []record{stored})
-	m.alive = func(record) bool { return true }
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	refused := errors.New("no port left")
 
-	got, err := m.withRecords(func([]record) ([]record, error) { return nil, refused })
+	got, err := m.withRecords(t.Context(), func([]record) ([]record, error) { return nil, refused })
 	if !errors.Is(err, refused) {
 		t.Fatalf("withRecords() = %v, want the body's own error", err)
 	}
@@ -936,8 +942,13 @@ func TestListShowsLiveRecordsAndCleansDeadRecords(t *testing.T) {
 	mustWriteMap(t, m.mapPath, []record{live, dead})
 
 	var output bytes.Buffer
-	m.alive = func(r record) bool { return r == live }
-	if err := m.list(&output); err != nil {
+	m.alive = func(_ context.Context, r record) probeVerdict {
+		if r == live {
+			return probeLive
+		}
+		return probeGone
+	}
+	if err := m.list(t.Context(), &output); err != nil {
 		t.Fatal(err)
 	}
 	const wantOutput = "PORT\tPID\tWORKTREE\n62001\t11\t/repo/live\n"
