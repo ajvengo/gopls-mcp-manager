@@ -94,6 +94,18 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 		return
 	}
 	l := r.laneFor(worktree)
+	if req.Method == "tools/call" {
+		// Forward the physical spelling of every path argument. gopls answers a
+		// symlinked spelling of a file inside its view with a short result and no
+		// error, so the substitution is what makes an answer trustworthy — see
+		// canonicalToolCall and R10. A copy is delivered because the original
+		// request is still the one this ingress admitted and may report on.
+		if params, rewritten := r.canonicalToolCall(req.Params); rewritten {
+			forwarded := *req
+			forwarded.Params = params
+			req = &forwarded
+		}
+	}
 	select {
 	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, state: call.state, queued: time.Now()}:
 	case <-r.ctx.Done():

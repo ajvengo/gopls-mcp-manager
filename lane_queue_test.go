@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -186,5 +188,135 @@ func TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles(t *testing.T) {
 	}
 	if len(r.worktrees) != 1 {
 		t.Fatalf("same physical directory paid for %d git lookups", len(r.worktrees))
+	}
+}
+
+// gopls answers a symlinked spelling of a file inside its view from whatever
+// single package it can reach, and reports the short result as if it were
+// complete — measured on v0.23.0: three references for a /tmp spelling where
+// the physical spelling of the same file in the same session gives seven. So
+// the spelling that leaves this manager has to be the physical one (R10).
+func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
+	t.Parallel()
+	root, linked := newLinkedWorktree(t)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(linked, alias); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
+	aliased := filepath.Join(alias, "existing.go")
+	physical := filepath.Join(linked, "existing.go")
+	if resolved, err := filepath.EvalSymlinks(physical); err == nil {
+		physical = resolved // the test's own root may sit under a symlink too
+	}
+
+	tests := []struct {
+		name      string
+		arguments string
+		want      string // "" means the message must be forwarded untouched
+	}{
+		{
+			name:      "file argument through a symlink",
+			arguments: `{"file":` + strconv.Quote(aliased) + `}`,
+			want:      `{"file":` + strconv.Quote(physical) + `}`,
+		},
+		{
+			name:      "files argument rewrites only the aliased entry",
+			arguments: `{"files":[` + strconv.Quote(aliased) + `,` + strconv.Quote(physical) + `]}`,
+			want:      `{"files":[` + strconv.Quote(physical) + `,` + strconv.Quote(physical) + `]}`,
+		},
+		{
+			name:      "dir argument through a symlink",
+			arguments: `{"dir":` + strconv.Quote(alias) + `}`,
+			want:      `{"dir":` + strconv.Quote(linked) + `}`,
+		},
+		// Arguments this manager does not model, and every field beside
+		// arguments, must survive a rewrite verbatim.
+		{
+			name:      "unmodelled arguments survive",
+			arguments: `{"file":` + strconv.Quote(aliased) + `,"symbol":"Map.Range"}`,
+			want:      `{"file":` + strconv.Quote(physical) + `,"symbol":"Map.Range"}`,
+		},
+		// Nothing to substitute: a physical spelling, a path we cannot resolve
+		// and so cannot verify, and a relative one that is not ours to resolve.
+		{name: "already physical", arguments: `{"file":` + strconv.Quote(physical) + `}`},
+		{name: "unresolvable path", arguments: `{"file":"/nonexistent/x.go"}`},
+		{name: "relative path", arguments: `{"file":"internal/foo.go"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			r := newTestRouter(t, root)
+			params := json.RawMessage(`{"name":"go_symbol_references","arguments":` + test.arguments + `}`)
+			// Routing is what populates the memo this reads; canonicalToolCall
+			// never waits for a filesystem syscall of its own.
+			r.toolCallWorktrees(params)
+
+			got, rewritten := r.canonicalToolCall(params)
+			if test.want == "" {
+				if rewritten {
+					t.Fatalf("canonicalToolCall(%s) rewrote to %s, want it forwarded untouched", test.arguments, got)
+				}
+				if string(got) != string(params) {
+					t.Fatalf("canonicalToolCall returned %s, want %s", got, params)
+				}
+				return
+			}
+			if !rewritten {
+				t.Fatalf("canonicalToolCall(%s) reported no rewrite, want the physical spelling", test.arguments)
+			}
+			var want, have map[string]any
+			if err := json.Unmarshal([]byte(`{"name":"go_symbol_references","arguments":`+test.want+`}`), &want); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(got, &have); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(have, want) {
+				t.Fatalf("canonicalToolCall(%s) = %s, want %s", test.arguments, got, test.want)
+			}
+		})
+	}
+}
+
+// The rewrite has to reach the wire, not just the helper: this is the whole
+// point of R10, and the delivery path is where a guard on the method or a lost
+// copy would drop it.
+func TestDeliveredToolCallCarriesThePhysicalSpelling(t *testing.T) {
+	t.Parallel()
+	root, linked := newLinkedWorktree(t)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(linked, alias); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
+	physical, err := filepath.EvalSymlinks(filepath.Join(linked, "existing.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := newTestRouter(t, root)
+	l := pausedLane(t, r, linked)
+	params := json.RawMessage(`{"name":"go_symbol_references","arguments":{"file":` +
+		strconv.Quote(filepath.Join(alias, "existing.go")) + `,"symbol":"Map.Range"}}`)
+	r.route(&jsonrpc.Request{ID: mustID(t, "aliased"), Method: "tools/call", Params: params})
+
+	call := mustRecv(t, l.reqs, "the aliased call to be delivered")
+	call.cancel()
+	var delivered struct {
+		Arguments struct {
+			File   string `json:"file"`
+			Symbol string `json:"symbol"`
+		} `json:"arguments"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(call.req.Params, &delivered); err != nil {
+		t.Fatal(err)
+	}
+	if delivered.Arguments.File != physical {
+		t.Errorf("delivered file = %q, want the physical spelling %q", delivered.Arguments.File, physical)
+	}
+	if delivered.Name != "go_symbol_references" || delivered.Arguments.Symbol != "Map.Range" {
+		t.Errorf("delivered call = %s, want the name and unmodelled arguments preserved", call.req.Params)
 	}
 }

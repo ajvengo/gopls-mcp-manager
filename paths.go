@@ -37,6 +37,7 @@ func (r *router) expireMemosLocked() {
 	}
 	if !r.memo.expires.IsZero() {
 		clear(r.paths)
+		clear(r.physical)
 		clear(r.worktrees)
 		r.memo.expirations++
 	}
@@ -129,6 +130,7 @@ func (r *router) worktreeOf(path string) string {
 	}
 	r.memoMu.Unlock()
 	dir := containingDir(path)
+	physical := physicalOf(path)
 	r.memoMu.Lock()
 	worktree, ok := r.worktrees[dir]
 	r.memoMu.Unlock()
@@ -144,6 +146,9 @@ func (r *router) worktreeOf(path string) string {
 	if r.ctx.Err() == nil && generation == r.memo.generation {
 		r.memoize(r.worktrees, dir, worktree)
 		r.memoize(r.paths, path, worktree)
+		if physical != "" {
+			r.memoize(r.physical, path, physical)
+		}
 	}
 	r.memoMu.Unlock()
 	return worktree
@@ -246,4 +251,102 @@ func worktreeOfDir(ctx context.Context, dir string) (string, error) {
 		return "", fmt.Errorf("worktree path is not valid UTF-8: %q", worktree)
 	}
 	return worktree, nil
+}
+
+// physicalOf is path with every symlink resolved, or "" when it cannot be
+// resolved at all — a spelling we cannot verify is one we must not substitute.
+//
+// This is the spelling gopls has to be given. It compares a path argument
+// against the view it loaded, and a non-physical spelling of a file inside that
+// view does not fail: go_symbol_references answers from the single package it
+// can reach and reports the short reference set as if it were the whole answer,
+// with no error and no marker the client could notice. On macOS that is every
+// path under /tmp and under $TMPDIR, since /tmp and /var are symlinks, so an
+// agent that copies the spelling `pwd` printed silently gets less than it asked
+// for. Measured on gopls v0.23.0: three references for /tmp/… where the physical
+// spelling of the same file in the same session gives seven.
+func physicalOf(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return ""
+	}
+	return resolved
+}
+
+// canonicalToolCall is params with every absolute path argument replaced by its
+// physical spelling, or params itself when nothing needs replacing.
+//
+// Memo reads only: it runs on the reader goroutine, which never waits for a
+// filesystem syscall (see cachedWorktrees). A path with no memoized spelling is
+// left alone rather than resolved here — routing already treats it as no
+// evidence, and rewriting is not worth stalling the reader for.
+//
+// The message is rebuilt generically so that arguments this manager does not
+// model, and every field beside arguments, survive verbatim.
+func (r *router) canonicalToolCall(params json.RawMessage) (json.RawMessage, bool) {
+	args := parsePathArguments(params)
+	r.memoMu.Lock()
+	spelling := func(path string) string {
+		if !filepath.IsAbs(path) {
+			return ""
+		}
+		if physical, ok := r.physical[path]; ok && physical != path {
+			return physical
+		}
+		return ""
+	}
+	file, dir := spelling(args.File), spelling(args.Dir)
+	var files []string
+	for i, path := range args.Files {
+		if physical := spelling(path); physical != "" {
+			if files == nil {
+				files = slices.Clone(args.Files)
+			}
+			files[i] = physical
+		}
+	}
+	r.memoMu.Unlock()
+	if file == "" && dir == "" && files == nil {
+		return params, false
+	}
+
+	var call map[string]json.RawMessage
+	if json.Unmarshal(params, &call) != nil {
+		return params, false
+	}
+	var arguments map[string]json.RawMessage
+	if json.Unmarshal(call["arguments"], &arguments) != nil {
+		return params, false
+	}
+	replace := func(key string, value any) bool {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return false
+		}
+		arguments[key] = encoded
+		return true
+	}
+	ok := true
+	if file != "" {
+		ok = replace("file", file)
+	}
+	if ok && dir != "" {
+		ok = replace("dir", dir)
+	}
+	if ok && files != nil {
+		ok = replace("files", files)
+	}
+	if !ok {
+		return params, false
+	}
+	rewritten, err := json.Marshal(arguments)
+	if err != nil {
+		return params, false
+	}
+	call["arguments"] = rewritten
+	rewritten, err = json.Marshal(call)
+	if err != nil {
+		return params, false
+	}
+	return rewritten, true
 }

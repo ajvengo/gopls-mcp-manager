@@ -23,6 +23,7 @@ type router struct {
 	lanesMu   sync.Mutex        // protects lane lookup by the cancellation reader
 	worktrees map[string]string // containing directory -> worktree, see worktreeOf
 	paths     map[string]string // path argument, verbatim -> worktree, see worktreeOf
+	physical  map[string]string // path argument, verbatim -> physical spelling, see physicalOf
 	memoMu    *sync.Mutex       // shared with the single filesystem worker
 	memo      *memoState        // shared expiry epoch and observations, under memoMu
 	// ctx bounds the dial, and only the dial: the connection it hands back is
@@ -65,6 +66,7 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 		lanes:                 make(map[string]*lane),
 		worktrees:             make(map[string]string),
 		paths:                 make(map[string]string),
+		physical:              make(map[string]string),
 		memoMu:                new(sync.Mutex),
 		memo:                  new(memoState),
 		awaitingUpstream:      make(map[jsonrpc.ID]owed),
