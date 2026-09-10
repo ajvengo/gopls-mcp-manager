@@ -122,6 +122,21 @@ cancellation, after the original write completes.
 → `TestExecutionTimeoutQueuesAdvisoryCancellation`
 → `TestExecutionDeadlineCompletesOnce`
 
+R10. Every absolute file, dir and files argument is forwarded in its physical
+spelling. gopls compares a path argument against the view it loaded, and a
+symlinked spelling of a file inside that view does not fail: it answers from the
+single package it can reach and reports the short result as if it were complete,
+with no error and no marker the client could notice. On macOS that is every path
+under /tmp and under $TMPDIR, since /tmp and /var are symlinks, so an agent that
+copies the spelling `pwd` printed silently receives less than it asked for —
+measured on gopls v0.23.0: three references for a /tmp spelling against seven
+for the physical spelling of the same file in the same session. Substitution
+reads the path memo only, never the filesystem, so it cannot stall the ingress
+reader; a spelling that is not memoized, unresolvable or relative is forwarded
+untouched, as is every other argument and field of the message.
+→ `TestToolCallForwardsPhysicalPathSpelling`,
+`TestDeliveredToolCallCarriesThePhysicalSpelling`
+
 ## 3. Handshake
 
 H1. The client's `initialize` is forwarded to home under the client's own id,
