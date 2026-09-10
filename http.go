@@ -240,7 +240,16 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 			switch method {
 			case "tools/list":
 				result := new(mcp.ListToolsResult)
-				return result, b.call(ctx, method, req.GetParams(), result)
+				err := b.call(ctx, method, req.GetParams(), result)
+				// gopls predates the cacheable fields, so a proxied listing
+				// carries an empty scope where the spec allows only "public"
+				// or "private". The SDK fills the default only on the
+				// pagination path this middleware bypasses, and a strict
+				// client rejects the whole listing over it.
+				if result.CacheScope == "" {
+					result.CacheScope = "public"
+				}
+				return result, err
 			case "tools/call":
 				result := new(mcp.CallToolResult)
 				return result, b.call(ctx, method, req.GetParams(), result)

@@ -184,6 +184,11 @@ func TestHTTPCurrentSDKClient(t *testing.T) {
 	if len(listed.Tools) != 1 || listed.Tools[0].Name != "where" {
 		t.Fatalf("tools: %+v", listed)
 	}
+	// A cacheless upstream must not leak an empty scope: strict clients reject
+	// anything but "public"/"private" and drop the whole listing.
+	if listed.CacheScope != "public" {
+		t.Fatalf("cacheScope: %q, want public", listed.CacheScope)
+	}
 	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "where", Arguments: map[string]any{}})
 	if err != nil {
 		t.Fatal(err)
