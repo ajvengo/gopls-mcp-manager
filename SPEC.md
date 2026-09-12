@@ -696,6 +696,17 @@ This applies before reading bodies, including slow and chunked requests.
 → `TestHTTPBodyBudgetIncludesSlowReaders`
 → `TestHTTPRejectsOversizeAndReleasesReservation`
 
+Answering `tools/list` and `tools/call` in the middleware, rather than through
+the SDK's own handlers, skips the result defaults those handlers apply, and two
+of them are required on the wire: `cacheScope`, which has no `omitempty` and
+fails a client's `public`/`private` enum when unset, and `resultType`, which
+`CallToolResult` keeps in an unexported field the SDK sets for no result of that
+type — a client on protocol revision 2026-07-28 rejects a tool call without it.
+Both are filled in with the value an absent field means, `"public"` and
+`"complete"`, and an upstream that supplied its own keeps it. A case added to
+that middleware has to answer the same question for its result type.
+→ `TestHTTPProtocolAndErrors`
+
 HTTP has configurable 4 MiB request bodies, 5 s header reads, 30 s body reads, and a 30 s response-write
 budget starting when response output begins. The SDK owns HTTP validation and
 stateless request lifecycle; the upstream protocol remains legacy SSE, with

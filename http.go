@@ -255,7 +255,12 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 				return result, err
 			case "tools/call":
 				result := new(mcp.CallToolResult)
-				return result, b.call(ctx, method, req.GetParams(), result)
+				var raw json.RawMessage
+				err := b.call(ctx, method, req.GetParams(), &raw)
+				if err != nil {
+					return result, err
+				}
+				return result, json.Unmarshal(withCompleteResultType(raw), result)
 			default:
 				return next(ctx, method, req)
 			}
@@ -288,6 +293,29 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 		requestCtx := context.WithValue(req.Context(), httpRequestContextKey{}, req.Context())
 		handler.ServeHTTP(w, req.WithContext(requestCtx))
 	})
+}
+
+// withCompleteResultType is a tools/call result carrying the resultType the SDK
+// cannot put there itself. CallToolResult keeps resultType in an unexported
+// field and, alone among the results, implements none of the interface
+// setCompleteResultType looks for, so the SDK never sets it and its omitempty
+// then drops it from the wire — and a client on protocol revision 2026-07-28
+// rejects every tool call for the missing field. Unmarshalling is the only door
+// into that field, so the value is spliced in before the result is decoded.
+//
+// "complete" is what an absent resultType means, and what the SDK sets for the
+// results it does reach. An upstream that answered input_required keeps its own
+// answer, as does a result this cannot parse.
+func withCompleteResultType(result json.RawMessage) json.RawMessage {
+	rewritten, _ := rewriteObject(result, func(fields map[string]json.RawMessage) bool {
+		key := jsonKey(fields, "resultType")
+		if !absentJSON(fields[key]) {
+			return false
+		}
+		fields[key] = json.RawMessage(`"complete"`)
+		return true
+	})
+	return rewritten
 }
 
 type httpRequestContextKey struct{}
