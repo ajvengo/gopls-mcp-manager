@@ -19,13 +19,12 @@ type router struct {
 	ctx       context.Context
 	m         *manager
 	home      string
-	lanes     map[string]*lane  // worktree -> its upstream, see lane
-	lanesMu   sync.Mutex        // protects lane lookup by the cancellation reader
-	worktrees map[string]string // containing directory -> worktree, see worktreeOf
-	paths     map[string]string // path argument, verbatim -> worktree, see worktreeOf
-	physical  map[string]string // path argument, verbatim -> physical spelling, see physicalOf
-	memoMu    *sync.Mutex       // shared with the single filesystem worker
-	memo      *memoState        // shared expiry epoch and observations, under memoMu
+	lanes     map[string]*lane    // worktree -> its upstream, see lane
+	lanesMu   sync.Mutex          // protects lane lookup by the cancellation reader
+	worktrees map[string]string   // containing directory -> worktree, see worktreeOf
+	paths     map[string]pathMemo // path argument, verbatim -> its resolution, see worktreeOf
+	memoMu    *sync.Mutex         // shared with the single filesystem worker
+	memo      *memoState          // shared expiry epoch and observations, under memoMu
 	// ctx bounds the dial, and only the dial: the connection it hands back is
 	// read under this same context for the rest of its life, so the caller
 	// cancels it on expiry rather than passing a deadline down. See dialBounded.
@@ -65,8 +64,7 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 		home:                  home,
 		lanes:                 make(map[string]*lane),
 		worktrees:             make(map[string]string),
-		paths:                 make(map[string]string),
-		physical:              make(map[string]string),
+		paths:                 make(map[string]pathMemo),
 		memoMu:                new(sync.Mutex),
 		memo:                  new(memoState),
 		awaitingUpstream:      make(map[jsonrpc.ID]owed),

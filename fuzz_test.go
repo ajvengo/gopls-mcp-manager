@@ -342,7 +342,7 @@ func FuzzContainingDir(f *testing.F) {
 	f.Add("/repo/\x00/a.go")
 
 	f.Fuzz(func(t *testing.T, path string) {
-		got := containingDir(path)
+		got, physical := containingDir(path)
 		// The result is a memo key, so two spellings of one directory must not
 		// become two entries and two git forks.
 		if clean := filepath.Clean(got); clean != got {
@@ -350,6 +350,19 @@ func FuzzContainingDir(f *testing.F) {
 		}
 		if filepath.IsAbs(path) && !filepath.IsAbs(got) {
 			t.Fatalf("containingDir(%q) = %q, relative for an absolute argument", path, got)
+		}
+		// The second result is handed to gopls verbatim (R10), including the
+		// spelling synthesized from a resolved parent for a file that does not
+		// exist yet — so it has to be a cleaned path of the same kind as the
+		// argument, never a relative one substituted for an absolute.
+		if physical == "" {
+			return
+		}
+		if clean := filepath.Clean(physical); clean != physical {
+			t.Fatalf("containingDir(%q) physical = %q, which is not cleaned (%q)", path, physical, clean)
+		}
+		if filepath.IsAbs(path) && !filepath.IsAbs(physical) {
+			t.Fatalf("containingDir(%q) physical = %q, relative for an absolute argument", path, physical)
 		}
 	})
 }

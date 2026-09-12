@@ -50,7 +50,7 @@ func (r *router) resolveWorktrees(parent context.Context, params json.RawMessage
 	if r.resolver == nil {
 		// Only this worker performs filesystem lookups. Its view shares memo
 		// maps and their lock, never request tracking or lane state.
-		view := &router{paths: r.paths, physical: r.physical, worktrees: r.worktrees, memoMu: r.memoMu, memo: r.memo, limits: r.limits}
+		view := &router{paths: r.paths, worktrees: r.worktrees, memoMu: r.memoMu, memo: r.memo, limits: r.limits}
 		r.resolver = &pathResolver{jobs: make(chan resolution)}
 		r.resolver.lookup = func(ctx context.Context, raw json.RawMessage) []string {
 			view.ctx = ctx
@@ -88,14 +88,14 @@ func (r *router) cachedWorktrees(params json.RawMessage) ([]string, bool) {
 		if !filepath.IsAbs(path) {
 			return true
 		}
-		worktree, ok := r.paths[path]
+		memo, ok := r.paths[path]
 		if ok {
 			r.memo.hits++
 		} else {
 			r.memo.misses++
 		}
-		if ok && !slices.Contains(found, worktree) {
-			found = append(found, worktree)
+		if ok && !slices.Contains(found, memo.worktree) {
+			found = append(found, memo.worktree)
 		}
 		return ok
 	}

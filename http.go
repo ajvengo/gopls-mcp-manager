@@ -240,7 +240,19 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 			switch method {
 			case "tools/list":
 				result := new(mcp.ListToolsResult)
-				return result, b.call(ctx, method, req.GetParams(), result)
+				err := b.call(ctx, method, req.GetParams(), result)
+				// Answering without calling next opts out of the SDK's result
+				// post-processing, including the cache defaults it applies to every
+				// result embedding Cacheable. CacheScope has no omitempty, so an unset
+				// one marshals as "" and fails the client's "public"/"private" enum,
+				// taking the whole tool list with it. "public" is the SDK's own
+				// default, and what the protocol reads an absent scope as. Only
+				// tools/list is affected because CallToolResult is not Cacheable — a
+				// case added to this switch has to answer that question again.
+				if result.CacheScope == "" {
+					result.CacheScope = "public"
+				}
+				return result, err
 			case "tools/call":
 				result := new(mcp.CallToolResult)
 				return result, b.call(ctx, method, req.GetParams(), result)
