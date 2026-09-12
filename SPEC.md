@@ -698,14 +698,18 @@ This applies before reading bodies, including slow and chunked requests.
 
 Answering `tools/list` and `tools/call` in the middleware, rather than through
 the SDK's own handlers, skips the result defaults those handlers apply, and two
-of them are required on the wire: `cacheScope`, which has no `omitempty` and
-fails a client's `public`/`private` enum when unset, and `resultType`, which
-`CallToolResult` keeps in an unexported field the SDK sets for no result of that
-type — a client on protocol revision 2026-07-28 rejects a tool call without it.
-Both are filled in with the value an absent field means, `"public"` and
-`"complete"`, and an upstream that supplied its own keeps it. A case added to
-that middleware has to answer the same question for its result type.
-→ `TestHTTPProtocolAndErrors`
+of them are required on the wire. `cacheScope` has no `omitempty`, so an unset
+one ships as `""` and fails a client's `public`/`private` enum. `resultType`
+lives in an unexported field of `CallToolResult`, which — like the other
+multi-round-trip results — carries none of the marker the SDK's own defaulting
+matches on, so nothing sets it and `omitempty` drops it; a client on protocol
+revision 2026-07-28 rejects a tool call without it. Unmarshalling is the only
+door into that field, so the value is spliced into the payload ahead of its
+keys, where a duplicate loses to an upstream that answered for itself. Both
+defaults are the value an absent field means, `"public"` and `"complete"`. A
+case added to that middleware has to answer the same question for its result
+type.
+→ `TestHTTPProtocolAndErrors`, `TestWithCompleteResultType`
 
 HTTP has configurable 4 MiB request bodies, 5 s header reads, 30 s body reads, and a 30 s response-write
 budget starting when response output begins. The SDK owns HTTP validation and
