@@ -35,40 +35,29 @@ func withRootsCapability(params json.RawMessage) json.RawMessage {
 // created; every other key and field survives verbatim. The client's own
 // spelling of each key is the one rewritten; see jsonKey.
 func rewriteNested(params json.RawMessage, key string, edit func(map[string]json.RawMessage) bool) (json.RawMessage, bool) {
-	return rewriteObject(params, func(outer map[string]json.RawMessage) bool {
-		nestedKey := jsonKey(outer, key)
-		nested := make(map[string]json.RawMessage)
-		if raw := outer[nestedKey]; !absentJSON(raw) {
-			if err := json.Unmarshal(raw, &nested); err != nil || nested == nil {
-				return false
-			}
-		}
-		if !edit(nested) {
-			return false
-		}
-		rawNested, err := json.Marshal(nested)
-		if err != nil {
-			return false
-		}
-		outer[nestedKey] = rawNested
-		return true
-	})
-}
-
-// rewriteObject is message with edit applied to its top-level object, and
-// reports whether that happened. A message that is not an object, or that edit
-// leaves alone or cannot be marshalled back, is returned untouched.
-func rewriteObject(message json.RawMessage, edit func(map[string]json.RawMessage) bool) (json.RawMessage, bool) {
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(message, &object); err != nil || object == nil {
-		return message, false
+	var outer map[string]json.RawMessage
+	if err := json.Unmarshal(params, &outer); err != nil || outer == nil {
+		return params, false
 	}
-	if !edit(object) {
-		return message, false
+	nestedKey := jsonKey(outer, key)
+	nested := make(map[string]json.RawMessage)
+	if raw := outer[nestedKey]; !absentJSON(raw) {
+		if err := json.Unmarshal(raw, &nested); err != nil || nested == nil {
+			return params, false
+		}
 	}
-	rewritten, err := json.Marshal(object)
+	if !edit(nested) {
+		return params, false
+	}
+	rawNested, err := json.Marshal(nested)
 	if err != nil {
-		return message, false
+		return params, false
+	}
+	outer[nestedKey] = rawNested
+
+	rewritten, err := json.Marshal(outer)
+	if err != nil {
+		return params, false
 	}
 	return rewritten, true
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -189,6 +190,12 @@ func (b *httpBackend) call(ctx context.Context, method string, params any, resul
 		if resp.Error != nil {
 			return resp.Error
 		}
+		// The raw result is owned by a response nobody else holds, so handing it
+		// over beats copying and revalidating it (see withCompleteResultType).
+		if raw, ok := result.(*json.RawMessage); ok {
+			*raw = resp.Result
+			return nil
+		}
 		return json.Unmarshal(resp.Result, result)
 	case <-ctx.Done():
 		cancelled, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: "HTTP request ended"})
@@ -241,25 +248,18 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 			case "tools/list":
 				result := new(mcp.ListToolsResult)
 				err := b.call(ctx, method, req.GetParams(), result)
-				// Answering without calling next opts out of the SDK's result
-				// post-processing, including the cache defaults it applies to every
-				// result embedding Cacheable. CacheScope has no omitempty, so an unset
-				// one marshals as "" and fails the client's "public"/"private" enum,
-				// taking the whole tool list with it. "public" is the SDK's own
-				// default, and what the protocol reads an absent scope as. Only
-				// tools/list is affected because CallToolResult is not Cacheable — a
-				// case added to this switch has to answer that question again.
+				// One of the two result defaults answering without next skips; an
+				// unset scope marshals as "" and fails the client's enum. See SPEC.
 				if result.CacheScope == "" {
 					result.CacheScope = "public"
 				}
 				return result, err
 			case "tools/call":
-				result := new(mcp.CallToolResult)
 				var raw json.RawMessage
-				err := b.call(ctx, method, req.GetParams(), &raw)
-				if err != nil {
-					return result, err
+				if err := b.call(ctx, method, req.GetParams(), &raw); err != nil {
+					return nil, err
 				}
+				result := new(mcp.CallToolResult)
 				return result, json.Unmarshal(withCompleteResultType(raw), result)
 			default:
 				return next(ctx, method, req)
@@ -296,26 +296,26 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 }
 
 // withCompleteResultType is a tools/call result carrying the resultType the SDK
-// cannot put there itself. CallToolResult keeps resultType in an unexported
-// field and, alone among the results, implements none of the interface
-// setCompleteResultType looks for, so the SDK never sets it and its omitempty
-// then drops it from the wire — and a client on protocol revision 2026-07-28
-// rejects every tool call for the missing field. Unmarshalling is the only door
-// into that field, so the value is spliced in before the result is decoded.
+// cannot put there itself — the other default answering without next skips, and
+// the one a client on protocol revision 2026-07-28 rejects the call for. See
+// SPEC for why unmarshalling is the only door into that field.
 //
-// "complete" is what an absent resultType means, and what the SDK sets for the
-// results it does reach. An upstream that answered input_required keeps its own
-// answer, as does a result this cannot parse.
+// Prepended rather than merged into the object: a duplicate key resolves to the
+// last one, so an upstream that answered input_required still overrides this,
+// and the payload is copied once instead of being decoded and re-encoded whole.
+//
+// Delete this once the SDK marks CallToolResult complete-capable, or once this
+// middleware answers tools/call through next.
 func withCompleteResultType(result json.RawMessage) json.RawMessage {
-	rewritten, _ := rewriteObject(result, func(fields map[string]json.RawMessage) bool {
-		key := jsonKey(fields, "resultType")
-		if !absentJSON(fields[key]) {
-			return false
-		}
-		fields[key] = json.RawMessage(`"complete"`)
-		return true
-	})
-	return rewritten
+	body := bytes.TrimLeft(result, " \t\r\n")
+	if len(body) == 0 || body[0] != '{' {
+		return result // not an object: nothing to splice into, and nothing we own
+	}
+	field := []byte(`{"resultType":"complete",`)
+	if rest := bytes.TrimLeft(body[1:], " \t\r\n"); len(rest) > 0 && rest[0] == '}' {
+		field = []byte(`{"resultType":"complete"`)
+	}
+	return append(field, body[1:]...)
 }
 
 type httpRequestContextKey struct{}

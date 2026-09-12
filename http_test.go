@@ -169,15 +169,48 @@ func TestHTTPProtocolAndErrors(t *testing.T) {
 		t.Fatalf("tools/list must carry a valid cacheScope: %s", resp.Result)
 	}
 	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"where","arguments":{}}}`)
-	// CallToolResult holds resultType in an unexported field the SDK never sets,
-	// and omitempty then drops it — a client on the 2026-07-28 revision rejects
-	// the call for it. Asserted on the wire, where the client reads it.
 	if resp.Error != nil || !strings.Contains(string(resp.Result), `"resultType":"complete"`) {
 		t.Fatalf("tools/call must carry a complete resultType: %+v", resp)
 	}
 	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"missing","arguments":{}}}`)
 	if resp.Error == nil {
 		t.Fatal("upstream error was lost")
+	}
+}
+
+// The splice is byte-level, so it is asserted through the decoder that reads it.
+func TestWithCompleteResultType(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, result, want string
+	}{
+		{name: "empty object", result: `{}`, want: "complete"},
+		{name: "content preserved", result: `{"content":[{"type":"text","text":"x"}]}`, want: "complete"},
+		{name: "leading space", result: "\n {\"content\":[]}", want: "complete"},
+		// Last key wins, so an upstream still owns the answer it gave.
+		{name: "upstream answered", result: `{"resultType":"input_required"}`, want: "input_required"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			result := new(mcp.CallToolResult)
+			if err := json.Unmarshal(withCompleteResultType(json.RawMessage(test.result)), result); err != nil {
+				t.Fatalf("decoding the spliced %s: %v", test.result, err)
+			}
+			wire, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(wire), `"resultType":"`+test.want+`"`) {
+				t.Errorf("withCompleteResultType(%s) reached the client as %s, want resultType %q", test.result, wire, test.want)
+			}
+		})
+	}
+	// A message that is not an object is not ours to rewrite.
+	for _, result := range []string{`null`, `[]`, `"text"`, ``} {
+		if got := withCompleteResultType(json.RawMessage(result)); string(got) != result {
+			t.Errorf("withCompleteResultType(%s) = %s, want it forwarded untouched", result, got)
+		}
 	}
 }
 
