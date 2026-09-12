@@ -168,6 +168,13 @@ func TestHTTPProtocolAndErrors(t *testing.T) {
 	if !strings.Contains(string(resp.Result), `"cacheScope":"public"`) {
 		t.Fatalf("tools/list must carry a valid cacheScope: %s", resp.Result)
 	}
+	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"where","arguments":{}}}`)
+	// CallToolResult holds resultType in an unexported field the SDK never sets,
+	// and omitempty then drops it — a client on the 2026-07-28 revision rejects
+	// the call for it. Asserted on the wire, where the client reads it.
+	if resp.Error != nil || !strings.Contains(string(resp.Result), `"resultType":"complete"`) {
+		t.Fatalf("tools/call must carry a complete resultType: %+v", resp)
+	}
 	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"missing","arguments":{}}}`)
 	if resp.Error == nil {
 		t.Fatal("upstream error was lost")
