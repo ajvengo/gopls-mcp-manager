@@ -175,10 +175,7 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 func TestMemoExpiryRevalidatesRetargetedSymlink(t *testing.T) {
 	t.Parallel()
 	root, linked := newLinkedWorktree(t)
-	alias := filepath.Join(t.TempDir(), "alias")
-	if err := os.Symlink(root, alias); err != nil {
-		t.Fatal(err)
-	}
+	alias := symlinkAt(t, root)
 	r := newTestRouter(t, root)
 	path := filepath.Join(alias, "missing.go")
 	if got := r.worktreeOf(path); got != root {
@@ -201,7 +198,7 @@ func TestMemoEpochExpiresBothLevels(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newTestRouter(t, testHome)
 		r.limits.CacheTTL = time.Second
-		r.paths["/old/file.go"] = testWorktree
+		r.paths["/old/file.go"] = pathMemo{worktree: testWorktree}
 		r.worktrees["/old"] = testWorktree
 		_, hit := r.cachedWorktrees(fileCallParams("/old/file.go"))
 		if !hit {
@@ -223,12 +220,12 @@ func TestMemoRefreshAtCapacityDoesNotEvict(t *testing.T) {
 	t.Parallel()
 	r := newTestRouter(t, testHome)
 	r.limits.CacheEntries = 1
-	r.memoize(r.paths, "/a", testHome)
-	r.memoize(r.paths, "/a", testWorktree)
-	if r.memo.rollovers != 0 || r.paths["/a"] != testWorktree {
+	memoize(r, r.paths, "/a", pathMemo{worktree: testHome})
+	memoize(r, r.paths, "/a", pathMemo{worktree: testWorktree})
+	if r.memo.rollovers != 0 || r.paths["/a"].worktree != testWorktree {
 		t.Fatal("updating an existing key rolled the memo over")
 	}
-	r.memoize(r.paths, "/b", testHome)
+	memoize(r, r.paths, "/b", pathMemo{worktree: testHome})
 	if r.memo.rollovers != 1 || len(r.paths) != 1 {
 		t.Fatal("new key did not enforce capacity")
 	}
@@ -246,7 +243,7 @@ func TestLaneChurnRemainsAtRetentionCeiling(t *testing.T) {
 		for i := range 1000 {
 			worktree := fmt.Sprintf("/worktree-%d", i)
 			file := worktree + "/file.go"
-			r.paths[file] = worktree
+			r.paths[file] = pathMemo{worktree: worktree}
 			r.route(&jsonrpc.Request{ID: mustID(t, float64(i)), Method: "tools/call", Params: fileCallParams(file)})
 			msg := mustRecv(t, r.out, "churn request did not finish")
 			response, ok := msg.(*jsonrpc.Response)

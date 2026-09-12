@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +28,13 @@ type memoState struct {
 	expires                              time.Time
 	generation                           uint64
 	hits, misses, expirations, rollovers int64
+	// aliased records that some path argument has resolved to a spelling other
+	// than the one the client sent. A session where none ever does — every
+	// session on a tree with no symlink above it — then skips the substitution
+	// scan instead of parsing each tools/call a second time for it (R10). Read
+	// without memoMu, and shared with the resolver's view like the maps it
+	// describes. Never cleared: an expired epoch resolves the same spellings.
+	aliased atomic.Bool
 }
 
 // Caller holds memoMu. Expiry is lazy; metrics snapshots also sweep idle memos.
@@ -37,7 +45,6 @@ func (r *router) expireMemosLocked() {
 	}
 	if !r.memo.expires.IsZero() {
 		clear(r.paths)
-		clear(r.physical)
 		clear(r.worktrees)
 		r.memo.expirations++
 	}
@@ -107,6 +114,15 @@ func (r *router) appendWorktreeOf(found []string, path string) []string {
 	return append(found, worktree)
 }
 
+// pathMemo is what one resolved path argument is worth keeping: the worktree
+// that owns it, and its physical spelling when that differs from the one the
+// client sent (R10). One entry, so the two cannot fall out of step on a
+// capacity rollover.
+type pathMemo struct {
+	worktree string
+	physical string
+}
+
 // worktreeOf resolves one path argument, memoizing the answer under the
 // directory holding it rather than the path itself: resolution shells out to
 // git at ~13ms a call, every path in one directory has the same answer, and a
@@ -124,13 +140,15 @@ func (r *router) worktreeOf(path string) string {
 	r.memoMu.Lock()
 	r.expireMemosLocked()
 	generation := r.memo.generation
-	if worktree, ok := r.paths[path]; ok {
+	if memo, ok := r.paths[path]; ok {
 		r.memoMu.Unlock()
-		return worktree
+		return memo.worktree
 	}
 	r.memoMu.Unlock()
-	dir := containingDir(path)
-	physical := physicalOf(path)
+	dir, physical := containingDir(path)
+	if physical == path {
+		physical = "" // nothing to substitute
+	}
 	r.memoMu.Lock()
 	worktree, ok := r.worktrees[dir]
 	r.memoMu.Unlock()
@@ -144,10 +162,10 @@ func (r *router) worktreeOf(path string) string {
 	// A cancelled/slow lookup must not repopulate a newer cache epoch.
 	r.expireMemosLocked()
 	if r.ctx.Err() == nil && generation == r.memo.generation {
-		r.memoize(r.worktrees, dir, worktree)
-		r.memoize(r.paths, path, worktree)
+		memoize(r, r.worktrees, dir, worktree)
+		memoize(r, r.paths, path, pathMemo{worktree: worktree, physical: physical})
 		if physical != "" {
-			r.memoize(r.physical, path, physical)
+			r.memo.aliased.Store(true)
 		}
 	}
 	r.memoMu.Unlock()
@@ -157,7 +175,7 @@ func (r *router) worktreeOf(path string) string {
 // Clear at capacity instead of retaining a second eviction index. A discarded
 // entry is resolved afresh, including symlinks; failures remain uncached.
 // Caller holds memoMu. Each of the two caches has its own entry bound.
-func (r *router) memoize(cache map[string]string, key, value string) {
+func memoize[V any](r *router, cache map[string]V, key string, value V) {
 	limit := r.limits.CacheEntries
 	if limit <= 0 {
 		limit = config.Default().CacheEntries
@@ -185,23 +203,30 @@ func (r *router) memoize(cache map[string]string, key, value string) {
 // A failure leaves input alone: EvalSymlinks needs every component to exist,
 // and a path that does not exist yet must still resolve through its parent
 // (R2) — a file created moments ago is the ordinary case.
-func containingDir(input string) string {
-	resolved, err := filepath.EvalSymlinks(input)
+// physical is the physical spelling of input itself, not of dir: the spelling
+// gopls has to be given (R10). Returned from here because this function already
+// pays for it, and resolving input again would walk its components twice.
+func containingDir(input string) (dir, physical string) {
+	physical, err := filepath.EvalSymlinks(input)
 	if err == nil {
-		input = resolved
+		input = physical
 	}
 	if info, err := os.Stat(input); err == nil && info.IsDir() {
-		return filepath.Clean(input)
+		return filepath.Clean(input), physical
 	}
-	dir := filepath.Dir(input)
+	dir = filepath.Dir(input)
 	// A missing file cannot be resolved as a whole, but its existing parent
 	// still has a physical spelling. Never climb past a missing parent (R2).
+	// The final component does not exist, so it cannot itself be a link: the
+	// resolved parent plus that name is the file's physical spelling once it is
+	// created, which is the ordinary case here and would otherwise stay aliased
+	// in the memo for the rest of the epoch (R10).
 	if err != nil {
 		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-			return resolved
+			return resolved, filepath.Join(resolved, filepath.Base(input))
 		}
 	}
-	return dir
+	return dir, physical
 }
 
 // worktreePath resolves a file or directory to the root of the worktree holding
@@ -214,7 +239,8 @@ func containingDir(input string) string {
 // directory that does not exist climbs to its parent, resolving a path against
 // a tree the caller never named. worktreeOfDir is what makes that unsayable.
 func worktreePath(ctx context.Context, input string) (string, error) {
-	return worktreeOfDir(ctx, containingDir(input))
+	dir, _ := containingDir(input)
+	return worktreeOfDir(ctx, dir)
 }
 
 // worktreeOfDir resolves a directory — never a file — to the root of the
@@ -253,100 +279,60 @@ func worktreeOfDir(ctx context.Context, dir string) (string, error) {
 	return worktree, nil
 }
 
-// physicalOf is path with every symlink resolved, or "" when it cannot be
-// resolved at all — a spelling we cannot verify is one we must not substitute.
-//
-// This is the spelling gopls has to be given. It compares a path argument
-// against the view it loaded, and a non-physical spelling of a file inside that
-// view does not fail: go_symbol_references answers from the single package it
-// can reach and reports the short reference set as if it were the whole answer,
-// with no error and no marker the client could notice. On macOS that is every
-// path under /tmp and under $TMPDIR, since /tmp and /var are symlinks, so an
-// agent that copies the spelling `pwd` printed silently gets less than it asked
-// for. Measured on gopls v0.23.0: three references for /tmp/… where the physical
-// spelling of the same file in the same session gives seven.
-func physicalOf(path string) string {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return ""
-	}
-	return resolved
-}
-
 // canonicalToolCall is params with every absolute path argument replaced by its
-// physical spelling, or params itself when nothing needs replacing.
+// physical spelling, or params itself when nothing needs replacing (R10).
 //
 // Memo reads only: it runs on the reader goroutine, which never waits for a
 // filesystem syscall (see cachedWorktrees). A path with no memoized spelling is
 // left alone rather than resolved here — routing already treats it as no
 // evidence, and rewriting is not worth stalling the reader for.
 //
-// The message is rebuilt generically so that arguments this manager does not
-// model, and every field beside arguments, survive verbatim.
+// Only the arguments named are touched: rewriteNested rebuilds the message from
+// the client's own key spellings, so arguments this manager does not model, and
+// every field beside arguments, survive verbatim.
 func (r *router) canonicalToolCall(params json.RawMessage) (json.RawMessage, bool) {
-	args := parsePathArguments(params)
-	r.memoMu.Lock()
-	spelling := func(path string) string {
-		if !filepath.IsAbs(path) {
-			return ""
-		}
-		if physical, ok := r.physical[path]; ok && physical != path {
-			return physical
-		}
-		return ""
+	if !r.memo.aliased.Load() {
+		return params, false
 	}
-	file, dir := spelling(args.File), spelling(args.Dir)
-	var files []string
+	file, dir, files := r.physicalSpellings(parsePathArguments(params))
+	if file == "" && dir == "" && files == nil {
+		return params, false
+	}
+	return rewriteNested(params, "arguments", func(arguments map[string]json.RawMessage) bool {
+		// Marshalling a string or a []string cannot fail.
+		if file != "" {
+			arguments[jsonKey(arguments, "file")], _ = json.Marshal(file)
+		}
+		if dir != "" {
+			arguments[jsonKey(arguments, "dir")], _ = json.Marshal(dir)
+		}
+		if files != nil {
+			arguments[jsonKey(arguments, "files")], _ = json.Marshal(files)
+		}
+		return true
+	})
+}
+
+// physicalSpellings reports the memoized physical spelling of each path
+// argument that has one: "" for an argument to leave alone, and a nil files
+// slice when no entry of it needs replacing.
+//
+// The epoch is not swept here: a spelling read from an entry fresh enough to
+// have routed this very call is fresh enough to substitute with. It removes one
+// way the entry can vanish between routing and delivery, not all of them — any
+// goroutine's sweep clears the shared maps, and then the call goes out in the
+// client's own spelling.
+func (r *router) physicalSpellings(args pathArguments) (file, dir string, files []string) {
+	r.memoMu.Lock()
+	defer r.memoMu.Unlock()
+	file, dir = r.paths[args.File].physical, r.paths[args.Dir].physical
 	for i, path := range args.Files {
-		if physical := spelling(path); physical != "" {
+		if physical := r.paths[path].physical; physical != "" {
 			if files == nil {
 				files = slices.Clone(args.Files)
 			}
 			files[i] = physical
 		}
 	}
-	r.memoMu.Unlock()
-	if file == "" && dir == "" && files == nil {
-		return params, false
-	}
-
-	var call map[string]json.RawMessage
-	if json.Unmarshal(params, &call) != nil {
-		return params, false
-	}
-	var arguments map[string]json.RawMessage
-	if json.Unmarshal(call["arguments"], &arguments) != nil {
-		return params, false
-	}
-	replace := func(key string, value any) bool {
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return false
-		}
-		arguments[key] = encoded
-		return true
-	}
-	ok := true
-	if file != "" {
-		ok = replace("file", file)
-	}
-	if ok && dir != "" {
-		ok = replace("dir", dir)
-	}
-	if ok && files != nil {
-		ok = replace("files", files)
-	}
-	if !ok {
-		return params, false
-	}
-	rewritten, err := json.Marshal(arguments)
-	if err != nil {
-		return params, false
-	}
-	call["arguments"] = rewritten
-	rewritten, err = json.Marshal(call)
-	if err != nil {
-		return params, false
-	}
-	return rewritten, true
+	return file, dir, files
 }

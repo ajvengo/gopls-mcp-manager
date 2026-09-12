@@ -229,16 +229,19 @@ func TestMemoCapacityRevalidatesEvictedPaths(t *testing.T) {
 	t.Parallel()
 	r := newTestRouter(t, testHome)
 	r.limits.CacheEntries = 2
-	for _, cache := range []map[string]string{r.paths, r.worktrees} {
-		for i := range 100 {
-			r.memoize(cache, fmt.Sprintf("/%d", i), testHome)
-		}
-		if len(cache) > 2 {
-			t.Fatal("memo exceeded capacity")
-		}
-		if _, ok := cache["/0"]; ok {
-			t.Fatal("old memo survived capacity rollover")
-		}
+	for i := range 100 {
+		key := fmt.Sprintf("/%d", i)
+		memoize(r, r.worktrees, key, testHome)
+		memoize(r, r.paths, key, pathMemo{worktree: testHome})
+	}
+	if len(r.worktrees) > 2 || len(r.paths) > 2 {
+		t.Fatal("memo exceeded capacity")
+	}
+	if _, ok := r.worktrees["/0"]; ok {
+		t.Fatal("old memo survived capacity rollover")
+	}
+	if _, ok := r.paths["/0"]; ok {
+		t.Fatal("old memo survived capacity rollover")
 	}
 	r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
 		return []string{testWorktree}

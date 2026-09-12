@@ -56,7 +56,7 @@ func httpFixture(t testing.TB, capacity ...int) (*httpBackend, string, *atomic.I
 	if len(capacity) > 0 {
 		b.r.limits.Session = capacity[0]
 	}
-	b.r.paths["/other/file.go"] = "/other"
+	b.r.paths["/other/file.go"] = pathMemo{worktree: "/other"}
 	b.r.dial = func(ctx context.Context, worktree string) (mcp.Connection, error) {
 		dials.Add(1)
 		return transport.ConnectSSE(ctx, endpoints[worktree], b.r.limits.MessageBytes, b.r.sseBudget)
@@ -161,6 +161,12 @@ func TestHTTPProtocolAndErrors(t *testing.T) {
 	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
 	if resp.Error != nil || !strings.Contains(string(resp.Result), `"where"`) {
 		t.Fatalf("tools/list: %+v", resp)
+	}
+	// The SDK marshals the embedded Cacheable with no omitempty, so an unset scope
+	// ships as "" and a client validating the "public"/"private" enum drops the
+	// whole tool list. Asserted on the wire: an SDK client parses either happily.
+	if !strings.Contains(string(resp.Result), `"cacheScope":"public"`) {
+		t.Fatalf("tools/list must carry a valid cacheScope: %s", resp.Result)
 	}
 	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"missing","arguments":{}}}`)
 	if resp.Error == nil {

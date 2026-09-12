@@ -1530,6 +1530,16 @@ func newLinkedWorktree(t *testing.T) (root, linked string) {
 	return mustEvalSymlinks(t, root), mustEvalSymlinks(t, linked)
 }
 
+// symlinkAt returns a fresh symlink pointing at target.
+func symlinkAt(t *testing.T, target string) string {
+	t.Helper()
+	link := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	return link
+}
+
 func mustEvalSymlinks(t *testing.T, path string) string {
 	t.Helper()
 	resolved, err := filepath.EvalSymlinks(path)

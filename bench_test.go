@@ -30,7 +30,8 @@ func benchRouter(b *testing.B) (*router, string) {
 	r := newTestRouter(b, dir)
 	// Pre-seeded so the benchmark measures the memo hit, which is what a session
 	// spends its time on: the git call behind a miss happens a handful of times.
-	r.worktrees[containingDir(file)] = dir
+	parent, _ := containingDir(file)
+	r.worktrees[parent] = dir
 	return r, file
 }
 
@@ -65,6 +66,32 @@ func BenchmarkTargetToolCall(b *testing.B) {
 	}
 }
 
+// What routeResolved adds to every tools/call after it has picked a lane, on the
+// reader goroutine beside BenchmarkTargetToolCall. The aliased row is the rewrite
+// itself; the physical row is what a session that has seen one symlinked spelling
+// pays on the calls that need no rewrite — measured at ~380ns against that
+// benchmark's ~540ns, which is why a session that has seen none is gated out of
+// this path entirely (memoState.aliased).
+func BenchmarkCanonicalToolCall(b *testing.B) {
+	for _, bench := range []struct{ name, physical string }{
+		{name: "physical"},
+		{name: "aliased", physical: "/physical/main.go"},
+	} {
+		b.Run(bench.name, func(b *testing.B) {
+			r, file := benchRouter(b)
+			r.paths[file] = pathMemo{worktree: r.home, physical: bench.physical}
+			r.memo.aliased.Store(true) // past the gate: what is left is the scan
+			params := fileCallParams(file)
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, rewritten := r.canonicalToolCall(params); rewritten != (bench.physical != "") {
+					b.Fatal("unexpected rewrite")
+				}
+			}
+		})
+	}
+}
+
 // A tools/call naming many files at once — the shape a multi-file edit or a
 // package-wide query sends. One memo lookup per path, and the answer is needed
 // before any of them can be routed, so this is the reader goroutine's worst
@@ -77,7 +104,7 @@ func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 	for i := range files {
 		path := filepath.Join(dir, fmt.Sprintf("f%d.go", i))
 		files[i] = strconv.Quote(path)
-		r.paths[path] = r.home
+		r.paths[path] = pathMemo{worktree: r.home}
 	}
 	req := &jsonrpc.Request{
 		ID:     mustID(b, float64(1)),

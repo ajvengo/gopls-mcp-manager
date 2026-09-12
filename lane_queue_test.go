@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -175,10 +174,7 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 func TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles(t *testing.T) {
 	t.Parallel()
 	root, linked := newLinkedWorktree(t)
-	alias := filepath.Join(t.TempDir(), "alias")
-	if err := os.Symlink(linked, alias); err != nil {
-		t.Fatal(err)
-	}
+	alias := symlinkAt(t, linked)
 	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
 	r := newTestRouter(t, root)
 	for _, path := range []string{filepath.Join(alias, "existing.go"), filepath.Join(alias, "missing.go"), linked} {
@@ -191,24 +187,17 @@ func TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles(t *testing.T) {
 	}
 }
 
-// gopls answers a symlinked spelling of a file inside its view from whatever
-// single package it can reach, and reports the short result as if it were
-// complete — measured on v0.23.0: three references for a /tmp spelling where
-// the physical spelling of the same file in the same session gives seven. So
-// the spelling that leaves this manager has to be the physical one (R10).
+// The spelling that leaves this manager has to be the physical one: gopls
+// answers a symlinked one with a short result and no error (R10).
 func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
 	t.Parallel()
 	root, linked := newLinkedWorktree(t)
-	alias := filepath.Join(t.TempDir(), "alias")
-	if err := os.Symlink(linked, alias); err != nil {
-		t.Fatal(err)
-	}
-	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
-	aliased := filepath.Join(alias, "existing.go")
+	alias := symlinkAt(t, linked)
+	// newLinkedWorktree resolves linked, so a regular file under it is already
+	// spelled physically.
 	physical := filepath.Join(linked, "existing.go")
-	if resolved, err := filepath.EvalSymlinks(physical); err == nil {
-		physical = resolved // the test's own root may sit under a symlink too
-	}
+	mustWriteFile(t, physical, "package example\n")
+	aliased := filepath.Join(alias, "existing.go")
 
 	tests := []struct {
 		name      string
@@ -224,6 +213,13 @@ func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
 			name:      "files argument rewrites only the aliased entry",
 			arguments: `{"files":[` + strconv.Quote(aliased) + `,` + strconv.Quote(physical) + `]}`,
 			want:      `{"files":[` + strconv.Quote(physical) + `,` + strconv.Quote(physical) + `]}`,
+		},
+		{
+			// Resolvable through its parent: the file an agent just asked to
+			// create is named before it exists.
+			name:      "missing file through a symlink",
+			arguments: `{"file":` + strconv.Quote(filepath.Join(alias, "missing.go")) + `}`,
+			want:      `{"file":` + strconv.Quote(filepath.Join(linked, "missing.go")) + `}`,
 		},
 		{
 			name:      "dir argument through a symlink",
@@ -285,15 +281,9 @@ func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
 func TestDeliveredToolCallCarriesThePhysicalSpelling(t *testing.T) {
 	t.Parallel()
 	root, linked := newLinkedWorktree(t)
-	alias := filepath.Join(t.TempDir(), "alias")
-	if err := os.Symlink(linked, alias); err != nil {
-		t.Fatal(err)
-	}
-	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
-	physical, err := filepath.EvalSymlinks(filepath.Join(linked, "existing.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	alias := symlinkAt(t, linked)
+	physical := filepath.Join(linked, "existing.go")
+	mustWriteFile(t, physical, "package example\n")
 
 	r := newTestRouter(t, root)
 	l := pausedLane(t, r, linked)

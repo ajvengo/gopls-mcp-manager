@@ -15,40 +15,51 @@ import (
 // withRootsCapability makes every upstream ask this bridge for its roots. Some
 // MCP clients omit the optional capability; without it gopls installs no file
 // watcher and newly-created Go files remain invisible until its daemon restarts.
-// Parameters we cannot rewrite — invalid ones, or ones that will not marshal
-// back — are forwarded untouched and left for gopls to reject. The client's own
-// spelling of each key is the one rewritten; see jsonKey for why.
 func withRootsCapability(params json.RawMessage) json.RawMessage {
-	var initialize map[string]json.RawMessage
-	if err := json.Unmarshal(params, &initialize); err != nil || initialize == nil {
-		return params
-	}
+	rewritten, _ := rewriteNested(params, "capabilities", func(capabilities map[string]json.RawMessage) bool {
+		rootsKey := jsonKey(capabilities, "roots")
+		if !absentJSON(capabilities[rootsKey]) {
+			return false
+		}
+		capabilities[rootsKey] = json.RawMessage(`{}`)
+		return true
+	})
+	return rewritten
+}
 
-	capabilitiesKey := jsonKey(initialize, "capabilities")
-	var capabilities map[string]json.RawMessage
-	if raw := initialize[capabilitiesKey]; !absentJSON(raw) {
-		if err := json.Unmarshal(raw, &capabilities); err != nil || capabilities == nil {
-			return params
+// rewriteNested is params with the object under key replaced by what edit made
+// of it, and reports whether that happened. Messages we cannot rewrite — ones
+// that do not parse, whose nested value is not an object, that edit leaves
+// alone, or that will not marshal back — are returned untouched and left for
+// the far side to read as the client sent them. An absent nested object is
+// created; every other key and field survives verbatim. The client's own
+// spelling of each key is the one rewritten; see jsonKey.
+func rewriteNested(params json.RawMessage, key string, edit func(map[string]json.RawMessage) bool) (json.RawMessage, bool) {
+	var outer map[string]json.RawMessage
+	if err := json.Unmarshal(params, &outer); err != nil || outer == nil {
+		return params, false
+	}
+	nestedKey := jsonKey(outer, key)
+	nested := make(map[string]json.RawMessage)
+	if raw := outer[nestedKey]; !absentJSON(raw) {
+		if err := json.Unmarshal(raw, &nested); err != nil || nested == nil {
+			return params, false
 		}
 	}
-	if capabilities == nil {
-		capabilities = make(map[string]json.RawMessage)
+	if !edit(nested) {
+		return params, false
 	}
-	if rootsKey := jsonKey(capabilities, "roots"); absentJSON(capabilities[rootsKey]) {
-		capabilities[rootsKey] = json.RawMessage(`{}`)
-	}
-
-	rawCapabilities, err := json.Marshal(capabilities)
+	rawNested, err := json.Marshal(nested)
 	if err != nil {
-		return params
+		return params, false
 	}
-	initialize[capabilitiesKey] = rawCapabilities
+	outer[nestedKey] = rawNested
 
-	rewritten, err := json.Marshal(initialize)
+	rewritten, err := json.Marshal(outer)
 	if err != nil {
-		return params
+		return params, false
 	}
-	return rewritten
+	return rewritten, true
 }
 
 // jsonKey is the key in object that a Go decoder would read as name: the exact
