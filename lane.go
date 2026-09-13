@@ -79,7 +79,8 @@ func (l *lane) run() {
 	// here, so this ends the lane's budgets and nothing else — see dialBounded.
 	defer l.cancel()
 	go l.runControls()
-draining:
+	// One loop for both jobs, because they differ in one step: every entry is
+	// cancelled, and only a live session also gets it delivered.
 	for call := range l.reqs {
 		// Whatever is left in the queue when the session ends is not worth an
 		// upstream: dialling would run ensure, spawning a whole gopls for a client
@@ -90,15 +91,10 @@ draining:
 		// contention lane.ctx exists to keep off the session context.
 		select {
 		case <-l.r.ctx.Done():
-			call.cancel()
-			break draining
 		default:
+			l.r.timed("delivery_queue", call.queued)
+			l.send(call.ctx, call.req, call.state)
 		}
-		l.r.timed("delivery_queue", call.queued)
-		l.send(call.ctx, call.req, call.state)
-		call.cancel()
-	}
-	for call := range l.reqs {
 		call.cancel()
 	}
 	if l.conn != nil {
@@ -196,10 +192,7 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 		// contradictory reply to the same id later on.
 		placed := make(chan struct{})
 		if err := l.r.beginOperation(id, state, conn, l.worktree, cancel, placed); err != nil {
-			if conn != l.conn {
-				_ = conn.Close()
-			}
-			l.r.failDelivery(id, state, -32000, err.Error())
+			l.giveUp(conn, id, state, err)
 			return
 		}
 		err = conn.Write(ctx, req)
@@ -210,10 +203,7 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 			l.r.mu.Lock()
 			l.r.endOperationLocked(operationKey{conn, id})
 			l.r.mu.Unlock()
-			if conn != l.conn {
-				_ = conn.Close()
-			}
-			l.r.failDelivery(id, state, -32000, err.Error())
+			l.giveUp(conn, id, state, err)
 			return
 		}
 		if err == nil {
@@ -245,6 +235,17 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 		code = -32800
 	}
 	l.r.failDelivery(id, state, code, fmt.Sprintf("gopls for %s: %v", l.worktree, err))
+}
+
+// giveUp abandons a delivery that will not be retried, closing conn unless the
+// lane has adopted it — a connection this attempt dialled and nobody reads is
+// the one thing send must not leave behind, and both of its no-retry exits had
+// to remember it separately before.
+func (l *lane) giveUp(conn mcp.Connection, id jsonrpc.ID, state *callState, cause error) {
+	if conn != l.conn {
+		_ = conn.Close()
+	}
+	l.r.failDelivery(id, state, -32000, cause.Error())
 }
 
 // cache adopts conn as this lane's upstream and starts the goroutine that reads

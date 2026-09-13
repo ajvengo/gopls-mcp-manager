@@ -35,6 +35,12 @@ func benchRouter(b *testing.B) (*router, string) {
 	return r, file
 }
 
+// toolCall is the message every benchmark here routes: one tools/call under a
+// fixed id, differing only in the arguments it names.
+func toolCall(tb testing.TB, params json.RawMessage) *jsonrpc.Request {
+	return &jsonrpc.Request{ID: mustID(tb, float64(1)), Method: "tools/call", Params: params}
+}
+
 // fileCallParams is the tool call every benchmark here sends: one naming one
 // file, which is what target has to resolve a worktree from.
 func fileCallParams(file string) json.RawMessage {
@@ -53,11 +59,7 @@ func fileCallParams(file string) json.RawMessage {
 // spending a diff on the routing rather than the decode above it.
 func BenchmarkTargetToolCall(b *testing.B) {
 	r, file := benchRouter(b)
-	req := &jsonrpc.Request{
-		ID:     mustID(b, float64(1)),
-		Method: "tools/call",
-		Params: fileCallParams(file),
-	}
+	req := toolCall(b, fileCallParams(file))
 	b.ReportAllocs()
 	for b.Loop() {
 		if worktree, _ := r.target(req); worktree == "" {
@@ -106,11 +108,7 @@ func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 		files[i] = strconv.Quote(path)
 		r.paths[path] = pathMemo{worktree: r.home}
 	}
-	req := &jsonrpc.Request{
-		ID:     mustID(b, float64(1)),
-		Method: "tools/call",
-		Params: json.RawMessage(`{"name":"go_diagnostics","arguments":{"files":[` + strings.Join(files, ",") + `]}}`),
-	}
+	req := toolCall(b, json.RawMessage(`{"name":"go_diagnostics","arguments":{"files":[`+strings.Join(files, ",")+`]}}`))
 	b.ReportAllocs()
 	for b.Loop() {
 		if worktree, _ := r.target(req); worktree == "" {
@@ -212,11 +210,7 @@ func BenchmarkStdioCodec(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	req := &jsonrpc.Request{
-		ID:     mustID(b, float64(1)),
-		Method: "tools/call",
-		Params: fileCallParams(file),
-	}
+	req := toolCall(b, fileCallParams(file))
 	go func() {
 		for b.Context().Err() == nil {
 			if writer.Write(b.Context(), req) != nil {
@@ -340,7 +334,7 @@ func BenchmarkWorktreeOfNewPath(b *testing.B) {
 	i := 0
 	b.ReportAllocs()
 	for b.Loop() {
-		if r.worktreeOf(filepath.Join(dir, fmt.Sprintf("f%d.go", i))) == "" {
+		if r.worktreeOf(r.ctx, filepath.Join(dir, fmt.Sprintf("f%d.go", i))) == "" {
 			b.Fatal("no worktree")
 		}
 		i++

@@ -28,8 +28,21 @@ type requestUsage struct {
 
 type stageTiming struct{ Count, TotalNS, MaxNS int64 }
 
+// now is the clock the stage timings are taken from, and it does not tick
+// unless metrics are asked for: a zero start is what timed skips on.
+func (r *router) now() time.Time {
+	if !r.limits.Metrics {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+// timed is off unless metrics are asked for, because on it is three or four
+// acquisitions of the router's central lock per request — the same lock admit,
+// bindWorktree, placeDelivery and finish already take for that request, from a
+// different goroutine each time — bought for a snapshot nobody is reading.
 func (r *router) timed(stage string, start time.Time) {
-	if start.IsZero() {
+	if !r.limits.Metrics || start.IsZero() {
 		return
 	}
 	elapsed := time.Since(start).Nanoseconds()
@@ -69,34 +82,29 @@ func (r *router) requestUsage() requestUsage {
 	return usage
 }
 
-func (r *router) admit(id jsonrpc.ID, worktree string, cancel func()) error {
+// admit records id as outstanding and reports the generation token minted for
+// it — nil for a notification, which is owed no answer and so tracked nowhere.
+// No worktree is taken here because none is known yet: per-lane admission is
+// bindWorktree's, once routing has picked the lane. See owed.
+func (r *router) admit(id jsonrpc.ID, cancel func()) (*callState, error) {
 	if !id.IsValid() {
-		return nil
+		return nil, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.awaitingUpstream[id]; exists {
-		r.usage.Rejected++
-		r.usage.Rejections["duplicate_id"]++
-		return fmt.Errorf("request id %v is already outstanding", id)
+		r.rejectedLocked("duplicate_id")
+		return nil, fmt.Errorf("request id %v is already outstanding", id)
 	}
 	if len(r.awaitingUpstream) >= r.limits.Session {
-		r.usage.Rejected++
-		r.usage.Rejections["session_outstanding"]++
-		return fmt.Errorf("session outstanding request limit reached")
+		r.rejectedLocked("session_outstanding")
+		return nil, fmt.Errorf("session outstanding request limit reached")
 	}
-	if worktree != "" && r.perWorktree[worktree] >= r.limits.PerLane {
-		r.usage.Rejected++
-		r.usage.Rejections["lane_outstanding"]++
-		return fmt.Errorf("gopls for %s reached its outstanding request limit", worktree)
-	}
-	r.awaitingUpstream[id] = owed{worktree: worktree, cancel: cancel, state: &callState{}}
-	if worktree != "" {
-		r.perWorktree[worktree]++
-	}
+	state := &callState{}
+	r.awaitingUpstream[id] = owed{cancel: cancel, state: state}
 	r.usage.Admitted++
 	r.usage.Peak = max(r.usage.Peak, len(r.awaitingUpstream))
-	return nil
+	return state, nil
 }
 
 // All terminal paths remove state here while holding mu. Queued delivery is
@@ -112,12 +120,38 @@ func (r *router) removeLocked(id jsonrpc.ID, owner owed) {
 	}
 	delete(r.awaitingUpstream, id)
 	if owner.worktree != "" {
-		r.perWorktree[owner.worktree]--
-		if r.perWorktree[owner.worktree] <= 0 {
-			delete(r.perWorktree, owner.worktree)
-		}
+		release(r.perWorktree, owner.worktree)
 	}
 	r.usage.Completed++
+}
+
+// release gives one count in a per-worktree tally back, dropping the entry once
+// nothing holds it — so a session that touched many worktrees does not keep a
+// key per worktree for the rest of its life. Shared by the two tallies (see
+// endOperationLocked) because a second spelling of it already disagreed about
+// whether zero or negative is the empty case.
+func release(counts map[string]int, key string) {
+	counts[key]--
+	if counts[key] <= 0 {
+		delete(counts, key)
+	}
+}
+
+// ownerLocked is the record still owed under id, provided state is the
+// admission the caller came from. A nil state asks for the record whoever holds
+// it, which is what a client's own cancellation does.
+//
+// The generation-token comparison is the tracker's load-bearing rule — a wire
+// id the client reuses gets a fresh token, so an older caller's checks fail
+// against it rather than answering the new call — and every caller that looks a
+// record up has to make it. Made here so a seventh caller cannot forget to.
+// Caller holds mu.
+func (r *router) ownerLocked(id jsonrpc.ID, state *callState) (owed, bool) {
+	owner, ok := r.awaitingUpstream[id]
+	if !ok || (state != nil && owner.state != state) {
+		return owed{}, false
+	}
+	return owner, true
 }
 
 func (r *router) finish(id jsonrpc.ID, conn mcp.Connection, state *callState) (owed, bool) {
@@ -126,8 +160,8 @@ func (r *router) finish(id jsonrpc.ID, conn mcp.Connection, state *callState) (o
 	if conn != nil {
 		r.endOperationLocked(operationKey{conn, id})
 	}
-	owner, ok := r.awaitingUpstream[id]
-	if !ok || (conn != nil && owner.conn != conn) || (state != nil && owner.state != state) {
+	owner, ok := r.ownerLocked(id, state)
+	if !ok || (conn != nil && owner.conn != conn) {
 		return owed{}, false
 	}
 	r.removeLocked(id, owner)
@@ -140,8 +174,8 @@ func (r *router) retry(id jsonrpc.ID, conn mcp.Connection, state *callState) boo
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	owner, ok := r.awaitingUpstream[id]
-	if !ok || owner.conn != conn || owner.state != state {
+	owner, ok := r.ownerLocked(id, state)
+	if !ok || owner.conn != conn {
 		return false
 	}
 	owner.conn = nil
@@ -156,8 +190,7 @@ func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	owner, ok := r.awaitingUpstream[id]
-	if !ok || owner.state != state {
+	if _, ok := r.ownerLocked(id, state); !ok {
 		return
 	}
 	state.timer = time.AfterFunc(r.limits.Execution, func() {
@@ -204,12 +237,17 @@ func (r *router) clearRequests() {
 // call went (R7), which is why one record covers both stages rather than the
 // route appearing only once an upstream owes an answer.
 //
+// state is what says this record is still the admission a given delivery came
+// from: a wire id the client reuses after a cancellation gets a fresh token, so
+// the old delivery's own checks fail against it rather than failing or
+// answering the new call. It is the only identity the record needs, which is
+// why the ingress context is not kept here beside it.
+//
 // conn is compared by connection, never by worktree: send() replaces a dead
 // connection with a live one under the same worktree, and matching by name
 // would let the dead one's reader fail calls the reconnect had already placed
 // successfully.
 type owed struct {
-	ingress  context.Context // distinguishes cancelled ingress from reused IDs
 	conn     mcp.Connection
 	worktree string
 	cancel   context.CancelFunc // stops queued/dialling delivery, never the shared server
@@ -220,23 +258,33 @@ type owed struct {
 func (r *router) rejected(reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.rejectedLocked(reason)
+}
+
+// Both halves in one place: the total and the breakdown have to stay in step
+// for a usage snapshot to add up, and the five sites that already hold mu were
+// each counting them by hand.
+func (r *router) rejectedLocked(reason string) {
 	r.usage.Rejected++
 	r.usage.Rejections[reason]++
 }
 
+// failIngress fails a call that never reached a lane. Nothing else about it
+// differs from any other terminal failure, so it is that same claim-then-answer
+// — see failDelivery — plus the counter that says where it died.
+//
+// The delivery is cancelled here rather than at each of the six call sites:
+// removeLocked already does it for a tracked id, so the copies only ever
+// mattered for a notification, whose invalid id was never tracked — half a rule
+// in the shared function and half in every caller.
 func (r *router) failIngress(call delivery, code int64, message string) {
+	defer call.cancel()
+	if !r.failDelivery(call.req.ID, call.state, code, message) {
+		return
+	}
 	r.mu.Lock()
-	owner, ok := r.awaitingUpstream[call.req.ID]
-	if ok && owner.ingress == call.ctx {
-		r.removeLocked(call.req.ID, owner)
-		r.usage.RoutingFailed++
-	} else {
-		ok = false
-	}
+	r.usage.RoutingFailed++
 	r.mu.Unlock()
-	if ok {
-		r.forward(errorResponse(call.req.ID, code, "%s", message))
-	}
 }
 
 // Transfer accounting and cancellation atomically after ordered resolution.
@@ -244,7 +292,7 @@ func (r *router) bindWorktree(call delivery, worktree string, cancel context.Can
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	owner, ok := r.awaitingUpstream[call.req.ID]
-	if call.ctx.Err() != nil || (call.req.ID.IsValid() && (!ok || owner.ingress != call.ctx)) {
+	if call.ctx.Err() != nil || (call.req.ID.IsValid() && (!ok || owner.state != call.state)) {
 		return context.Canceled
 	}
 	r.lanesMu.Lock()
@@ -252,16 +300,14 @@ func (r *router) bindWorktree(call delivery, worktree string, cancel context.Can
 	full := r.limits.Lanes > 0 && len(r.lanes) >= r.limits.Lanes
 	r.lanesMu.Unlock()
 	if !exists && full {
-		r.usage.Rejected++
-		r.usage.Rejections["lanes"]++
+		r.rejectedLocked("lanes")
 		return fmt.Errorf("session retained lane limit reached")
 	}
 	if !call.req.ID.IsValid() {
 		return nil
 	}
 	if r.perWorktree[worktree] >= r.limits.PerLane {
-		r.usage.Rejected++
-		r.usage.Rejections["lane_outstanding"]++
+		r.rejectedLocked("lane_outstanding")
 		return fmt.Errorf("gopls for %s reached its outstanding request limit", worktree)
 	}
 	owner.worktree, owner.cancel = worktree, cancel
@@ -270,13 +316,24 @@ func (r *router) bindWorktree(call delivery, worktree string, cancel context.Can
 	return nil
 }
 
-func (r *router) cancelCall(req *jsonrpc.Request) {
-	var params mcp.CancelledParams
-	if json.Unmarshal(req.Params, &params) != nil {
-		return
+// cancelledID is the request id a notifications/cancelled names, and whether it
+// named one at all.
+//
+// Ids arrive off the wire as the same nil/float64/string that json.Unmarshal
+// produces here, and both sides go through MakeID, so one rebuilt from the
+// notification compares equal to the one the route was recorded under.
+func cancelledID(params json.RawMessage) (jsonrpc.ID, bool) {
+	var cancelled mcp.CancelledParams
+	if json.Unmarshal(params, &cancelled) != nil {
+		return jsonrpc.ID{}, false
 	}
-	id, err := jsonrpc.MakeID(params.RequestID)
-	if err != nil {
+	id, err := jsonrpc.MakeID(cancelled.RequestID)
+	return id, err == nil
+}
+
+func (r *router) cancelCall(req *jsonrpc.Request) {
+	id, named := cancelledID(req.Params)
+	if !named {
 		return
 	}
 	owner, ok := r.finish(id, nil, nil)
@@ -286,9 +343,8 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 	r.mu.Lock()
 	r.usage.Cancelled++
 	r.mu.Unlock()
-	if owner.conn == nil && owner.cancel != nil {
-		owner.cancel()
-	}
+	// The queued delivery is already stopped: removeLocked cancels every record
+	// no upstream has taken, under mu, which is where that rule belongs.
 	r.forward(errorResponse(id, -32800, "request cancelled"))
 	r.queueCancellation(owner, req)
 }

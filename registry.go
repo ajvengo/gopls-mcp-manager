@@ -27,6 +27,10 @@ type record struct {
 	Terminating bool `json:",omitempty"`
 }
 
+// keepRecords is the body that changes nothing: withRecords sweeps whatever the
+// caller asks it to, and both callers that only want the sweep say so with this.
+func keepRecords(records []record) ([]record, error) { return records, nil }
+
 // readMap returns the records the file holds, and whether it holds nothing
 // else. A file that is not intact has lines the read dropped, so it needs
 // rewriting whatever the caller then does with the records — see withRecords.

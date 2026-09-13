@@ -29,7 +29,9 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 	}
 	servers := make([]serverUsage, 0, len(records))
 	// One process-table snapshot avoids a serial fork and timeout per record.
-	commands := make(map[int]string, len(records))
+	// Kept split: the rss column and the command line are both read below, and
+	// rejoining them only to split again is work already done.
+	commands := make(map[int][]string, len(records))
 	if len(records) != 0 {
 		wanted := make(map[int]bool, len(records))
 		for _, r := range records {
@@ -48,7 +50,8 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 			}
 			pid, err := strconv.Atoi(fields[0])
 			if err == nil && wanted[pid] {
-				commands[pid] = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), fields[0]))
+				// Fields are pid, rss, then the command line ps was asked for.
+				commands[pid] = fields[1:]
 			}
 		}
 	}
@@ -58,10 +61,9 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 			size := info.Size()
 			usage.LogBytes = &size
 		}
-		if command, ok := commands[r.PID]; ok {
-			fields := strings.Fields(command)
+		if fields, ok := commands[r.PID]; ok {
 			usage.Identity = "different process"
-			if len(fields) > 1 && strings.Contains(command, goplsBinary) && strings.Contains(command, mcpAddress(r.Port)) {
+			if len(fields) > 1 && matchesGopls(strings.Join(fields[1:], " "), r.Port) {
 				usage.Identity = "matched"
 				if rss, err := strconv.ParseInt(fields[0], 10, 64); err == nil && rss >= 0 {
 					usage.RSSKiB = &rss

@@ -9,13 +9,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -39,9 +36,6 @@ func newHTTPBackend(parent context.Context, m *manager, home string) *httpBacken
 	ctx, cancel := context.WithCancel(parent)
 	r := newRouter(ctx, m, home)
 	r.stateless = true
-	if m != nil && m.limits.Session > 0 {
-		r.limits = m.limits
-	}
 	// The internal legacy session has its own capabilities and lifecycle.
 	// HTTP initialization and client roots never mutate this shared session.
 	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: json.RawMessage(
@@ -64,7 +58,7 @@ func (b *httpBackend) start() {
 			case <-b.r.ctx.Done():
 				return
 			case call := <-cold:
-				start := time.Now()
+				start := b.r.now()
 				worktrees, err := b.r.resolveWorktrees(call.ctx, call.req.Params)
 				b.r.timed("resolution", start)
 				select {
@@ -79,21 +73,20 @@ func (b *httpBackend) start() {
 	go func() {
 		defer close(b.done)
 		defer b.r.clearRequests()
-		defer func() {
-			b.r.closeLanes()
-			for _, l := range b.r.lanes {
-				<-l.done
-			}
-		}()
+		defer b.r.awaitLanes()
+		defer b.r.closeLanes()
 		for {
 			select {
 			case <-b.r.ctx.Done():
 				return
 			case result := <-ready:
-				worktree, err := b.r.targetWorktrees(result.worktrees)
 				if result.err != nil {
-					err = result.err
+					// A lookup that failed names no worktree, so it is not asked
+					// to pick between none.
+					b.r.routeResolved(result.call, "", result.err)
+					continue
 				}
+				worktree, err := b.r.targetWorktrees(result.worktrees)
 				b.r.routeResolved(result.call, worktree, err)
 			case call := <-b.queue:
 				if call.req.Method != "tools/call" {
@@ -109,7 +102,6 @@ func (b *httpBackend) start() {
 				select {
 				case cold <- call:
 				default:
-					call.cancel()
 					b.r.rejected("resolution_queue")
 					b.r.failIngress(call, -32000, "resolution queue is full")
 				}
@@ -139,7 +131,7 @@ func (b *httpBackend) start() {
 			}
 		}
 	}()
-	if os.Getenv("GOPLS_MANAGER_METRICS") == "1" {
+	if b.r.limits.Metrics {
 		go b.r.reportUsage()
 	}
 }
@@ -180,7 +172,6 @@ func (b *httpBackend) call(ctx context.Context, method string, params any, resul
 		select {
 		case b.queue <- call:
 		default:
-			call.cancel()
 			b.r.rejected("routing_queue")
 			b.r.failIngress(call, -32000, "routing queue is full")
 		}
@@ -272,14 +263,7 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 	// Bound request bodies and concurrent HTTP exchanges, including slow writers.
 	// Reserve the maximum body size until the exchange ends, including chunked
 	// requests. This bounds admitted wire bytes, not decoded result/heap overhead.
-	messageBytes, budget := b.r.limits.MessageBytes, b.r.limits.HTTPBytes
-	if messageBytes <= 0 {
-		messageBytes = config.Default().MessageBytes
-	}
-	if budget <= 0 {
-		budget = config.Default().HTTPBytes
-	}
-	slots := make(chan struct{}, min(b.r.limits.Session, budget/messageBytes))
+	slots := make(chan struct{}, min(b.r.limits.Session, b.r.limits.HTTPBytes/b.r.limits.MessageBytes))
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w = &httpReplyWriter{ResponseWriter: w}
 		select {
@@ -301,8 +285,9 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 // SPEC for why unmarshalling is the only door into that field.
 //
 // Prepended rather than merged into the object: a duplicate key resolves to the
-// last one, so an upstream that answered input_required still overrides this,
-// and the payload is copied once instead of being decoded and re-encoded whole.
+// last one, so an upstream that answered input_required still overrides this —
+// without this middleware having to know which values are allowed, or to take
+// the object apart to find out.
 //
 // Delete this once the SDK marks CallToolResult complete-capable, or once this
 // middleware answers tools/call through next.
