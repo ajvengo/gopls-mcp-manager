@@ -1141,7 +1141,7 @@ func TestToolCallRoutesToTheWorktreeOwningItsPath(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			r := newTestRouter(t, testHome)
-			got := r.toolCallWorktrees(json.RawMessage(`{"arguments":` + test.arguments + `}`))
+			got := r.toolCallWorktrees(r.ctx, json.RawMessage(`{"arguments":`+test.arguments+`}`))
 			if !slices.Equal(got, test.want) {
 				t.Fatalf("toolCallWorktrees(%s) = %q, want %q", test.arguments, got, test.want)
 			}
@@ -1260,7 +1260,7 @@ func TestWorktreeOfResolvesAndMemoizes(t *testing.T) {
 			t.Parallel()
 			r := newTestRouter(t, testHome)
 			for i, path := range test.paths {
-				if got := r.worktreeOf(path); got != test.want[i] {
+				if got := r.worktreeOf(r.ctx, path); got != test.want[i] {
 					t.Fatalf("worktreeOf(%q) = %q, want %q", path, got, test.want[i])
 				}
 			}

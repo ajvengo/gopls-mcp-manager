@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -83,7 +84,7 @@ func jsonKey(object map[string]json.RawMessage, name string) string {
 // absentJSON reports whether a client left this value out, spelled either way:
 // the key missing entirely, or present and null.
 func absentJSON(raw json.RawMessage) bool {
-	return len(raw) == 0 || strings.TrimSpace(string(raw)) == "null"
+	return len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 // errorResponse builds the one error shape this bridge sends, in both

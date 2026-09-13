@@ -29,8 +29,8 @@ func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connec
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	owner, ok := r.awaitingUpstream[id]
-	if !ok || owner.state != state {
+	owner, ok := r.ownerLocked(id, state)
+	if !ok {
 		return context.Canceled
 	}
 	key := operationKey{conn, id}
@@ -38,8 +38,7 @@ func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connec
 		return fmt.Errorf("request id %v still has an unresolved upstream operation", id)
 	}
 	if len(r.operations) >= r.limits.Session || r.operationsPerWorktree[worktree] >= r.limits.PerLane {
-		r.usage.Rejected++
-		r.usage.Rejections["upstream_operations"]++
+		r.rejectedLocked("upstream_operations")
 		return fmt.Errorf("upstream operation limit reached; cancelled or disconnected work may still be running")
 	}
 	r.operations[key] = operation{worktree: worktree}
@@ -54,10 +53,7 @@ func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connec
 func (r *router) endOperationLocked(key operationKey) {
 	if op, ok := r.operations[key]; ok {
 		delete(r.operations, key)
-		r.operationsPerWorktree[op.worktree]--
-		if r.operationsPerWorktree[op.worktree] == 0 {
-			delete(r.operationsPerWorktree, op.worktree)
-		}
+		release(r.operationsPerWorktree, op.worktree)
 	}
 }
 
@@ -76,8 +72,8 @@ func (r *router) placeDelivery(id jsonrpc.ID, expected *callState, cancel contex
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	owner, ok := r.awaitingUpstream[id]
-	if !ok || (expected != nil && owner.state != expected) {
+	owner, ok := r.ownerLocked(id, expected)
+	if !ok {
 		return nil, false
 	}
 	owner.conn, owner.cancel, owner.placed = nil, cancel, nil
@@ -85,8 +81,15 @@ func (r *router) placeDelivery(id jsonrpc.ID, expected *callState, cancel contex
 	return owner.state, true
 }
 
-func (r *router) failDelivery(id jsonrpc.ID, state *callState, code int64, message string) {
-	if _, ok := r.finish(id, nil, state); ok {
-		r.forward(errorResponse(id, code, "%s", message))
+// failDelivery answers a call this caller has just taken terminal ownership of,
+// and reports whether it was still the caller's to answer. The one spelling of
+// that pair: claiming the id under mu is what says nobody else will answer it,
+// and the reply goes out after unlocking so a slow client cannot hold the
+// tracker.
+func (r *router) failDelivery(id jsonrpc.ID, state *callState, code int64, message string) bool {
+	if _, ok := r.finish(id, nil, state); !ok {
+		return false
 	}
+	r.forward(errorResponse(id, code, "%s", message))
+	return true
 }

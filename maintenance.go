@@ -6,8 +6,6 @@ import (
 	"os"
 	"syscall"
 	"time"
-
-	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
 func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
@@ -24,16 +22,9 @@ func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
 			return probeUncertain
 		}
-		ours, err := isOurGopls(ctx, r.PID, r.Port)
-		if err != nil || ctx.Err() != nil {
-			return probeUncertain
-		}
-		if !ours {
-			return probeGone
-		}
-		return probeTerminate
+		return identityVerdict(ctx, r)
 	}
-	return maintenance.withRecords(ctx, func(records []record) ([]record, error) { return records, nil })
+	return maintenance.withRecords(ctx, keepRecords)
 }
 
 // A signal is not an available slot. Confirm exits before startup admission,
@@ -55,11 +46,7 @@ func (m *manager) prepareAdmission(ctx context.Context, worktree string) error {
 			pending = pending || r.Terminating
 			requestedPending = requestedPending || (r.Worktree == worktree && r.Terminating)
 		}
-		limit := m.limits.SharedServers
-		if limit <= 0 {
-			limit = config.Default().SharedServers
-		}
-		if !pending || (!requestedPending && len(records) < limit) {
+		if !pending || (!requestedPending && len(records) < m.limits.SharedServers) {
 			return nil
 		}
 		if err := waitContext(ctx, 20*time.Millisecond); err != nil {

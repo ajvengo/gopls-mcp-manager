@@ -48,14 +48,10 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	r := newRouter(ctx, m, home)
-	if os.Getenv("GOPLS_MANAGER_METRICS") == "1" {
+	if r.limits.Metrics {
 		defer func() { _ = json.NewEncoder(os.Stderr).Encode(r.requestUsage()) }()
 		go r.reportUsage()
 	}
-	if m != nil && m.limits.Session > 0 {
-		r.limits = m.limits
-	}
-
 	// Only the reader is waited for, because r.lanes is its state and
 	// closeLanes must not race it. The writer is left where it stands: the
 	// stdio transport's Close closes stdin and no-ops on stdout, so a Write
@@ -73,12 +69,8 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	_ = stdio.Close()
 	<-readerDone
 	r.closeLanes()
+	r.awaitLanes()
 	r.clearRequests()
-	// Lanes may be finishing cleanup of a failed child. Let them confirm exit
-	// before main can terminate the process and abandon that cleanup.
-	for _, l := range r.lanes {
-		<-l.done
-	}
 	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, mcp.ErrConnectionClosed) {
 		return nil
 	}
@@ -102,15 +94,26 @@ func (r *router) reportUsage() {
 
 // closeLanes ends every lane and lets it close its own connection.
 //
-// Only ever after readFromClient has stopped: it owns r.lanes and is the only
-// sender on l.reqs, so closing these channels is safe because that goroutine is
-// provably gone. bridge waits for readerDone first, and is the only caller.
+// Only ever after the goroutine that owns r.lanes has stopped — it is the only
+// sender on l.reqs, so closing these channels is safe exactly because it is
+// provably gone. Every caller waits for theirs first.
 //
-// serve waits for lane completion after closing all queues. Manager waits are
-// cancellable; failed-child cleanup has its own short termination budget.
+// Waiting for the lanes to finish is deliberately the caller's, not folded in
+// here: it only terminates once the session context is cancelled, which the two
+// shutdown paths do first and a test closing a router's queues does not.
 func (r *router) closeLanes() {
 	for _, l := range r.lanes {
 		close(l.reqs)
+	}
+}
+
+// awaitLanes waits out whatever each lane is still finishing — the cleanup of a
+// failed child, most of the time — so the process cannot exit and abandon it.
+// Manager waits are cancellable and that cleanup has its own short termination
+// budget, so this is bounded. Only meaningful after closeLanes.
+func (r *router) awaitLanes() {
+	for _, l := range r.lanes {
+		<-l.done
 	}
 }
 
@@ -167,11 +170,7 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 			r.refuse(req, jsonrpc.CodeInvalidRequest, "%s arrived before the client sent initialize", req.Method)
 			continue
 		}
-		if req.Method == "notifications/cancelled" && !req.ID.IsValid() {
-			r.cancelCall(req)
-			continue
-		}
-		call, ok := r.prepare(req)
+		call, ok := r.admitted(req)
 		if !ok {
 			continue
 		}
@@ -181,7 +180,6 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 			call.cancel()
 			return
 		default:
-			call.cancel()
 			r.rejected("routing_queue")
 			r.failIngress(call, -32000, "routing queue is full")
 		}

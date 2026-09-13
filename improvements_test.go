@@ -321,7 +321,7 @@ func BenchmarkAdmissionLoaded(b *testing.B) {
 			id := mustID(b, "new")
 			b.ReportAllocs()
 			for b.Loop() {
-				if err := r.admit(id, testHome, nil); err != nil {
+				if _, err := r.admit(id, nil); err != nil {
 					b.Fatal(err)
 				}
 				r.finish(id, nil, nil)

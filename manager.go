@@ -55,7 +55,7 @@ func newManager() (*manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	if os.Getenv("GOPLS_MANAGER_METRICS") == "1" {
+	if m.limits.Metrics {
 		m.measure = func(stage string, elapsed time.Duration) {
 			fmt.Fprintf(os.Stderr, "{\"event\":\"manager_operation\",\"stage\":%q,\"elapsed_ns\":%d}\n", stage, elapsed.Nanoseconds())
 		}
@@ -184,15 +184,11 @@ func (m *manager) claimPort(ctx context.Context, worktree string) (record, *chil
 				return records, nil
 			}
 		}
-		limit := m.limits.SharedServers
-		if limit <= 0 {
-			limit = config.Default().SharedServers
-		}
 		// Checked under the same cross-process lock as spawn and reservation.
 		// Existing and terminating records consume capacity; never evict another
 		// manager's child to make room. Existing endpoints above remain reusable.
-		if len(records) >= limit {
-			return nil, fmt.Errorf("shared gopls server limit reached (%d recorded); run list to reconcile dead records or raise GOPLS_MANAGER_MAX_SERVERS", limit)
+		if len(records) >= m.limits.SharedServers {
+			return nil, fmt.Errorf("shared gopls server limit reached (%d recorded); run list to reconcile dead records or raise GOPLS_MANAGER_MAX_SERVERS", m.limits.SharedServers)
 		}
 		port, err := allocatePort(worktree, records, portUnavailable)
 		if err != nil {
@@ -244,7 +240,7 @@ func (m *manager) forget(ctx context.Context, started record) error {
 // client that stopped reading cannot hold it, and so that the sweep's result is
 // already on disk whatever stdout does.
 func (m *manager) list(ctx context.Context, w io.Writer) error {
-	records, err := m.withRecords(ctx, func(records []record) ([]record, error) { return records, nil })
+	records, err := m.withRecords(ctx, keepRecords)
 	if err != nil {
 		return err
 	}

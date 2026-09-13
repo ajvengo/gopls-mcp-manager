@@ -140,13 +140,13 @@ func TestDeliveryCompletionCannotTouchReusedID(t *testing.T) {
 						r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"reused"}`)})
 						_ = wantClientError(t, r, id, "cancelled call did not complete")
 					}
-					if err := r.admit(id, testHome, nil); err != nil {
+					if _, err := r.admit(id, nil); err != nil {
 						t.Fatal(err)
 					}
 					replacement = r.awaitingUpstream[id].state
 					return tc.writeErr
 				}
-				if err := r.admit(id, testHome, nil); err != nil {
+				if _, err := r.admit(id, nil); err != nil {
 					t.Fatal(err)
 				}
 				connectedLane(r, testHome, conn).send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"}, r.awaitingUpstream[id].state)

@@ -15,6 +15,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// The shipped message ceiling, for the tests that are not about the limit.
+const defaultTestLimit = 4 << 20
+
 func TestStdioMessageLimitAndReadAhead(t *testing.T) {
 	t.Parallel()
 	wire := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
@@ -75,7 +78,7 @@ func TestStdioMatchesSDK(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = sdk.Close() }()
-			fast := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard)
+			fast := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
 			defer func() { _ = fast.Close() }()
 			want, wantErr := sdk.Read(ctx)
 			got, gotErr := fast.Read(ctx)
@@ -98,7 +101,7 @@ func TestStdioPreservesBatchResponses(t *testing.T) {
 	t.Parallel()
 	var output bytes.Buffer
 	wire := `[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":"b","method":"tools/list"}]` + "\n"
-	c := NewStdio(io.NopCloser(strings.NewReader(wire)), &output)
+	c := NewStdio(io.NopCloser(strings.NewReader(wire)), &output, defaultTestLimit)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
@@ -126,7 +129,7 @@ func TestStdioCloseUnblocksRead(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
 	defer func() { _ = writer.Close() }()
-	c := NewStdio(reader, io.Discard)
+	c := NewStdio(reader, io.Discard, defaultTestLimit)
 	done := make(chan error, 1)
 	go func() { _, err := c.Read(t.Context()); done <- err }()
 	if err := c.Close(); err != nil {
@@ -180,7 +183,7 @@ func BenchmarkStdioTransport(b *testing.B) {
 			}
 			var reader mcp.Connection
 			if fast {
-				reader = NewStdio(right, right)
+				reader = NewStdio(right, right, defaultTestLimit)
 			} else {
 				reader, err = (&mcp.IOTransport{Reader: right, Writer: right}).Connect(b.Context())
 				if err != nil {
