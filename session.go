@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/protocol"
 	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -158,7 +159,7 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 			continue
 		}
 		if req.Method == "initialize" {
-			req.Params = withRootsCapability(req.Params)
+			req.Params = protocol.WithRootsCapability(req.Params)
 			r.initialize.Store(req)
 		} else if r.initialize.Load() == nil {
 			// A request the client sent before its own initialize, which the

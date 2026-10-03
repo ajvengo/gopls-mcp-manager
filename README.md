@@ -290,27 +290,61 @@ reaping behavior. SPEC.md §8 describes reconciliation and identity safeguards.
 
 ## Development
 
-The repository is one Go module with two internal packages:
+The repository is one Go module with three internal packages:
 
 - `internal/config` owns resource limits, defaults and environment validation.
   Defaults are plain values; importing the package does not read the environment.
 - `internal/transport` owns stdio/SSE connections, JSON-RPC framing and buffer
   accounting. Constructors return SDK connections; frame-budget observations
   use a synchronized snapshot. Codec and connection implementation types stay private.
+- `internal/protocol` owns pure MCP adaptations: roots capabilities, physical
+  path arguments, and complete tool results. It preserves opaque fields and
+  client key spellings, and owns no routing, filesystem or concurrency state.
 
 The root command owns routing, request generations, lanes and shared-process
 lifecycle. Both frontends reuse the transport package and the same configuration.
-Transport depends on config for default sizes; neither package imports the command.
+Internal packages do not import the command; protocol adaptations are independent
+of transport and configuration. Router, lanes and operation accounting stay
+together so their lock, generation and cancellation ownership remains private.
 Package-specific tests and transport benchmarks live beside their implementations;
 integration and shared-process tests remain at the root.
 
 ```sh
-go test -race . ./internal/config ./internal/transport
+go test -race -coverprofile=/tmp/gopls-manager.cover . ./internal/config ./internal/transport ./internal/protocol
+python3 scripts/check_coverage.py /tmp/gopls-manager.cover --minimum 85
+python3 -m unittest discover -s scripts
 golangci-lint run ./...
 ```
 
-CI runs tests, lint, and builds for `linux/amd64` and `darwin/arm64` on the
-latest 1.26 patch release.
+CI uses the latest patch release matching `go.mod` (Go 1.27), builds for
+`linux/amd64` and `darwin/arm64`, and requires 85% statement coverage in every
+package and overall. Tests use real HTTP/stdio/SSE transports with SDK upstreams.
+The optional real-gopls suite starts and reaps children in disposable worktrees
+with a private registry; CI installs gopls v0.23.0 and runs it too:
+
+```sh
+go test -race -tags=integration -run '^TestEndToEndRealGopls$' -timeout=3m .
+GOMAXPROCS=4 go test -tags=integration -run '^$' -bench '^BenchmarkRealGoplsRoundTrip$' -benchmem .
+```
+
+For warm frontend overhead, `BenchmarkHTTPRoundTrip` and `BenchmarkStdioRoundTrip`
+include real wire framing, routing, queues and SSE calls to a minimal SDK server;
+they exclude setup and gopls indexing/tool execution. `BenchmarkCallRoundTrip`
+isolates the router with fake connections. Profile one benchmark at a time:
+
+```sh
+GOMAXPROCS=4 go test -run '^$' -bench 'Benchmark(HTTP|Stdio)RoundTrip$' -benchmem -count=10 .
+GOMAXPROCS=4 go test -run '^$' -bench '^BenchmarkHTTPRoundTrip$' -benchtime=5s -cpuprofile=/tmp/manager.cpu -memprofile=/tmp/manager.mem -o /tmp/manager.test .
+go tool pprof -top /tmp/manager.test /tmp/manager.cpu
+go tool pprof -top -alloc_space /tmp/manager.test /tmp/manager.mem
+```
+
+Compare repeated before/after samples with `benchstat`; keep profiles and test
+binaries outside the repository. Allocation profiles include SDK fixture/client
+costs; inspect stacks before attributing them to the manager.
+The integration benchmark includes actual gopls execution latency; its child
+process CPU and allocations require separate profiling and are outside the
+manager's pprof profile.
 
 The bridge tests run under `testing/synctest`, whose clock only moves once every
 goroutine in the bubble has blocked, which makes timeouts free and exact: a test

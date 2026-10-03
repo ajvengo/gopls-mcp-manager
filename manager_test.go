@@ -100,7 +100,7 @@ func TestCleanRecordsProbesEveryRecordAtOnce(t *testing.T) {
 	})
 }
 
-func mustWriteMap(t *testing.T, path string, records []record) {
+func mustWriteMap(t testing.TB, path string, records []record) {
 	t.Helper()
 	if err := writeMap(path, records); err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func wantRunning(t *testing.T, cmd *exec.Cmd, whatWouldBeWrong string) {
 // Asking portUnavailable and binding afterwards leaves a window, and the sibling
 // tests spend it taking ephemeral ports — a range macOS overlaps with this one —
 // so the port this walked to is occasionally gone by the time it is claimed.
-func listenInAllocationRange(t *testing.T, worktree string) (net.Listener, int) {
+func listenInAllocationRange(t testing.TB, worktree string) (net.Listener, int) {
 	t.Helper()
 	var listener net.Listener
 	port, err := allocatePort(worktree, nil, func(port int) bool {

@@ -119,7 +119,10 @@ func (c *sseConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 			_, data, err := parseSSEFrame(result.frame)
 			var msg jsonrpc.Message
 			if err == nil && data != nil {
-				msg, err = jsonrpc.DecodeMessage(data)
+				var ok bool
+				if msg, ok = decodeScalar(data); !ok {
+					msg, err = jsonrpc.DecodeMessage(data)
+				}
 			}
 			c.budget.release(cap(result.frame))
 			if err != nil {

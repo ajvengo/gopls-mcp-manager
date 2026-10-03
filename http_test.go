@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,14 +19,17 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Exercise both real transports: stateless HTTP outside, bounded SSE against the SDK server inside.
-func httpFixture(t testing.TB, capacity ...int) (*httpBackend, string, *atomic.Int32, <-chan struct{}, <-chan struct{}) {
+// sseFixture supplies SDK upstreams and a private registry for either frontend.
+// Servers occupy real allocation-range ports, so production manager dialing is
+// usable without replacing process lifecycle or transport behavior.
+func sseFixture(t testing.TB, worktrees ...string) (*manager, map[string]string, <-chan struct{}, <-chan struct{}) {
 	t.Helper()
 	fixtureCtx, stopFixture := context.WithCancel(t.Context())
 	started, cancelled := make(chan struct{}, 8), make(chan struct{}, 8)
-	var dials atomic.Int32
+	m := newTestManager(t)
 	endpoints := make(map[string]string)
-	for _, worktree := range []string{"/home", "/other"} {
+	var records []record
+	for _, worktree := range worktrees {
 		s := mcp.NewServer(&mcp.Implementation{Name: "test-gopls", Version: "1"}, nil)
 		s.AddTool(&mcp.Tool{Name: "where", InputSchema: map[string]any{"type": "object"}},
 			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -47,11 +51,25 @@ func httpFixture(t testing.TB, capacity ...int) (*httpBackend, string, *atomic.I
 				}
 				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: worktree}}}, nil
 			})
-		upstream := httptest.NewServer(mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return s }, nil))
+		upstream := httptest.NewUnstartedServer(mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return s }, nil))
+		_ = upstream.Listener.Close()
+		listener, port := listenInAllocationRange(t, worktree)
+		upstream.Listener = listener
+		upstream.Start()
 		t.Cleanup(upstream.Close)
 		endpoints[worktree] = upstream.URL
+		records = append(records, record{Worktree: worktree, Port: port, PID: os.Getpid()})
 	}
 	t.Cleanup(stopFixture)
+	mustWriteMap(t, m.mapPath, records)
+	return &m, endpoints, started, cancelled
+}
+
+// Exercise both real transports: stateless HTTP outside, bounded SSE inside.
+func httpFixture(t testing.TB, capacity ...int) (*httpBackend, string, *atomic.Int32, <-chan struct{}, <-chan struct{}) {
+	t.Helper()
+	_, endpoints, started, cancelled := sseFixture(t, "/home", "/other")
+	var dials atomic.Int32
 	b := newHTTPBackend(t.Context(), nil, "/home")
 	if len(capacity) > 0 {
 		b.r.limits.Session = capacity[0]
@@ -184,42 +202,6 @@ func TestHTTPProtocolAndErrors(t *testing.T) {
 	resp = postMCP(t, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"missing","arguments":{}}}`)
 	if resp.Error == nil {
 		t.Fatal("upstream error was lost")
-	}
-}
-
-// The splice is byte-level, so it is asserted through the decoder that reads it.
-func TestWithCompleteResultType(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name, result, want string
-	}{
-		{name: "empty object", result: `{}`, want: "complete"},
-		{name: "content preserved", result: `{"content":[{"type":"text","text":"x"}]}`, want: "complete"},
-		{name: "leading space", result: "\n {\"content\":[]}", want: "complete"},
-		// Last key wins, so an upstream still owns the answer it gave.
-		{name: "upstream answered", result: `{"resultType":"input_required"}`, want: "input_required"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			result := new(mcp.CallToolResult)
-			if err := json.Unmarshal(withCompleteResultType(json.RawMessage(test.result)), result); err != nil {
-				t.Fatalf("decoding the spliced %s: %v", test.result, err)
-			}
-			wire, err := json.Marshal(result)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(wire), `"resultType":"`+test.want+`"`) {
-				t.Errorf("withCompleteResultType(%s) reached the client as %s, want resultType %q", test.result, wire, test.want)
-			}
-		})
-	}
-	// A message that is not an object is not ours to rewrite.
-	for _, result := range []string{`null`, `[]`, `"text"`, ``} {
-		if got := withCompleteResultType(json.RawMessage(result)); string(got) != result {
-			t.Errorf("withCompleteResultType(%s) = %s, want it forwarded untouched", result, got)
-		}
 	}
 }
 
