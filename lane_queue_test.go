@@ -178,7 +178,7 @@ func TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles(t *testing.T) {
 	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
 	r := newTestRouter(t, root)
 	for _, path := range []string{filepath.Join(alias, "existing.go"), filepath.Join(alias, "missing.go"), linked} {
-		if got := r.worktreeOf(path); got != linked {
+		if got := r.worktreeOf(r.ctx, path); got != linked {
 			t.Fatalf("worktreeOf(%q) = %q, want %q", path, got, linked)
 		}
 	}
@@ -246,7 +246,7 @@ func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
 			params := json.RawMessage(`{"name":"go_symbol_references","arguments":` + test.arguments + `}`)
 			// Routing is what populates the memo this reads; canonicalToolCall
 			// never waits for a filesystem syscall of its own.
-			r.toolCallWorktrees(params)
+			r.toolCallWorktrees(r.ctx, params)
 
 			got, rewritten := r.canonicalToolCall(params)
 			if test.want == "" {

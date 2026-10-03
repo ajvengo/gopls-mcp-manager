@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-
-	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
 type logUsage struct {
@@ -27,9 +25,6 @@ type logUsage struct {
 // Never unlink or rename: detached children retain the O_APPEND descriptor.
 func (m *manager) logs(ctx context.Context, trim bool) (logUsage, error) {
 	limit := m.limits.LogBytes
-	if limit <= 0 {
-		limit = config.Default().LogBytes
-	}
 	usage := logUsage{Policy: "explicit trim-logs; no automatic retention", TrimThresholdBytes: int64(limit)}
 	dir := filepath.Dir(m.logPath(""))
 	f, err := os.Open(dir)

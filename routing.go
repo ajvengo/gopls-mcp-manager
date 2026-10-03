@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // laneFor returns worktree's lane, opening one on first use. Called only from
@@ -26,48 +24,41 @@ func (r *router) laneFor(worktree string) *lane {
 	return l
 }
 
-// route admits req without waiting for lane capacity. Its budget starts here,
-// so waiting in the queue does not buy another delivery budget.
-func (r *router) route(req *jsonrpc.Request) {
+// admitted is the delivery req travels as, or no delivery at all: a client's
+// cancellation never becomes one — it answers a call already admitted, and
+// queueing it behind that call's own routing is how it would arrive too late to
+// stop anything. Stated here rather than at each of the two entry points, which
+// is what kept the rule in step with itself.
+func (r *router) admitted(req *jsonrpc.Request) (delivery, bool) {
 	if req.Method == "notifications/cancelled" && !req.ID.IsValid() {
 		r.cancelCall(req)
-		return
+		return delivery{}, false
 	}
-	if call, ok := r.prepare(req); ok {
-		r.routePrepared(call)
-	}
+	return r.prepare(req)
 }
 
 // prepare tracks calls before they wait for routing, so cancellation can finish
 // both queued and resolving work without racing admission.
 func (r *router) prepare(req *jsonrpc.Request) (delivery, bool) {
 	ctx, cancel := context.WithTimeout(r.ctx, routingBudget+sendBudget)
-	if err := r.admit(req.ID, "", cancel); err != nil {
+	state, err := r.admit(req.ID, cancel)
+	if err != nil {
 		cancel()
 		r.refuse(req, -32000, "%s", err)
 		return delivery{}, false
 	}
-	r.mu.Lock()
-	owner := r.awaitingUpstream[req.ID]
-	owner.ingress = ctx
-	if req.ID.IsValid() {
-		r.awaitingUpstream[req.ID] = owner
-	}
-	r.mu.Unlock()
-	return delivery{req: req, ctx: ctx, cancel: cancel, state: owner.state, queued: time.Now()}, true
+	return delivery{req: req, ctx: ctx, cancel: cancel, state: state, queued: r.now()}, true
 }
 
 func (r *router) routePrepared(call delivery) {
 	r.timed("routing_queue", call.queued)
-	start := time.Now()
-	defer r.timed("routing", start)
-	req := call.req
-	if call.ctx.Err() != nil {
-		r.failIngress(call, jsonrpc.CodeInternalError, "routing queue deadline exceeded")
-		call.cancel()
-		return
-	}
-	worktree, err := r.targetContext(call.ctx, req)
+	defer r.timed("routing", r.now())
+	// A call whose budget went while it waited is not checked for here: every
+	// path below reports it. resolveWorktrees refuses an expired parent before
+	// it queues any filesystem work, and routeResolved fails whatever reaches it
+	// on its own ctx check — so an expired queue entry is answered once, in the
+	// words of the deadline that actually passed.
+	worktree, err := r.targetContext(call.ctx, call.req)
 	r.routeResolved(call, worktree, err)
 }
 
@@ -83,11 +74,15 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 			code = jsonrpc.CodeInternalError
 		}
 		r.failIngress(call, code, err.Error())
-		call.cancel()
 		return
 	}
 	ctx, stop := context.WithTimeout(call.ctx, sendBudget)
-	cancel := func() { stop(); call.cancel() }
+	// Closed over by name, not through call: a closure captures whole variables,
+	// and this one outlives the delivery — it is held in the tracker for the
+	// length of the upstream call, which would keep the client's original
+	// request and its params bytes alive with it.
+	parentCancel := call.cancel
+	cancel := func() { stop(); parentCancel() }
 	if err := r.bindWorktree(call, worktree, cancel); err != nil {
 		cancel()
 		r.failIngress(call, -32000, err.Error())
@@ -105,20 +100,16 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 		}
 	}
 	select {
-	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, state: call.state, queued: time.Now()}:
+	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, state: call.state, queued: r.now()}:
 	case <-r.ctx.Done():
 		cancel()
 	default:
+		// The compound cancel, not failIngress's: this one also stops the send
+		// budget's timer by name rather than waiting for the parent to reach it.
 		cancel()
 		r.rejected("delivery_queue")
 		r.failIngress(call, -32000, fmt.Sprintf("gopls for %s is overloaded: delivery queue is full", worktree))
 	}
-}
-
-// target picks the worktree that should answer req, or reports why no single
-// one can — see toolCallWorktrees.
-func (r *router) target(req *jsonrpc.Request) (string, error) {
-	return r.targetContext(r.ctx, req)
 }
 
 func (r *router) targetContext(ctx context.Context, req *jsonrpc.Request) (string, error) {
@@ -158,15 +149,8 @@ func (r *router) targetWorktrees(worktrees []string) (string, error) {
 // notification cancels — see R7. An id nobody owes reports nothing, and the
 // notification goes home like every other one.
 func (r *router) cancelTarget(params json.RawMessage) string {
-	var cancelled mcp.CancelledParams
-	if err := json.Unmarshal(params, &cancelled); err != nil {
-		return ""
-	}
-	// Ids arrive off the wire as the same nil/float64/string that json.Unmarshal
-	// produces here, and both sides go through MakeID, so one rebuilt from the
-	// notification compares equal to the one the route was recorded under.
-	id, err := jsonrpc.MakeID(cancelled.RequestID)
-	if err != nil {
+	id, ok := cancelledID(params)
+	if !ok {
 		return ""
 	}
 	r.mu.Lock()

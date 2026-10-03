@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
-
-	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
 type pathArguments struct {
@@ -32,8 +30,7 @@ type memoState struct {
 	// than the one the client sent. A session where none ever does — every
 	// session on a tree with no symlink above it — then skips the substitution
 	// scan instead of parsing each tools/call a second time for it (R10). Read
-	// without memoMu, and shared with the resolver's view like the maps it
-	// describes. Never cleared: an expired epoch resolves the same spellings.
+	// without memoMu. Never cleared: an expired epoch resolves the same spellings.
 	aliased atomic.Bool
 }
 
@@ -48,11 +45,7 @@ func (r *router) expireMemosLocked() {
 		clear(r.worktrees)
 		r.memo.expirations++
 	}
-	ttl := r.limits.CacheTTL
-	if ttl <= 0 {
-		ttl = config.Default().CacheTTL
-	}
-	r.memo.expires = now.Add(ttl)
+	r.memo.expires = now.Add(r.limits.CacheTTL)
 	r.memo.generation++
 }
 
@@ -78,7 +71,7 @@ func parsePathArguments(params json.RawMessage) pathArguments {
 // what comes back is a well-formed result for the files it did cover. Both are
 // reported so that route can refuse it instead. The extra work is a memo lookup
 // per path on the hit that already covers the routing path (see worktreeOf).
-func (r *router) toolCallWorktrees(params json.RawMessage) []string {
+func (r *router) toolCallWorktrees(ctx context.Context, params json.RawMessage) []string {
 	args := parsePathArguments(params)
 	// The scalar arguments are ranged over as an array rather than concatenated
 	// with Files into one slice: this runs on the goroutine that routes every
@@ -86,18 +79,18 @@ func (r *router) toolCallWorktrees(params json.RawMessage) []string {
 	// tools/call — including the overwhelmingly common one naming a single file.
 	var found []string
 	for _, path := range [...]string{args.File, args.Dir} {
-		found = r.appendWorktreeOf(found, path)
+		found = r.appendWorktreeOf(ctx, found, path)
 	}
 	for _, path := range args.Files {
-		found = r.appendWorktreeOf(found, path)
+		found = r.appendWorktreeOf(ctx, found, path)
 	}
 	return found
 }
 
 // appendWorktreeOf adds the worktree owning path to found, unless the path is
 // no evidence or names a worktree already there.
-func (r *router) appendWorktreeOf(found []string, path string) []string {
-	if r.ctx.Err() != nil {
+func (r *router) appendWorktreeOf(ctx context.Context, found []string, path string) []string {
+	if ctx.Err() != nil {
 		return found
 	}
 	// An absent argument is no evidence, and a relative one is worse: it would
@@ -107,7 +100,7 @@ func (r *router) appendWorktreeOf(found []string, path string) []string {
 	if !filepath.IsAbs(path) {
 		return found
 	}
-	worktree := r.worktreeOf(path)
+	worktree := r.worktreeOf(ctx, path)
 	if worktree == "" || slices.Contains(found, worktree) {
 		return found
 	}
@@ -136,7 +129,7 @@ type pathMemo struct {
 // argument, and a profile put two thirds of the routing path there — time the
 // reader goroutine spends routing nobody else's call. Kept as a second map so
 // that a path-cache rollover need not discard cached directory resolutions.
-func (r *router) worktreeOf(path string) string {
+func (r *router) worktreeOf(ctx context.Context, path string) string {
 	r.memoMu.Lock()
 	r.expireMemosLocked()
 	generation := r.memo.generation
@@ -154,14 +147,14 @@ func (r *router) worktreeOf(path string) string {
 	r.memoMu.Unlock()
 	if !ok {
 		var err error
-		if worktree, err = worktreeOfDir(r.ctx, dir); err != nil {
+		if worktree, err = worktreeOfDir(ctx, dir); err != nil {
 			return ""
 		}
 	}
 	r.memoMu.Lock()
 	// A cancelled/slow lookup must not repopulate a newer cache epoch.
 	r.expireMemosLocked()
-	if r.ctx.Err() == nil && generation == r.memo.generation {
+	if ctx.Err() == nil && generation == r.memo.generation {
 		memoize(r, r.worktrees, dir, worktree)
 		memoize(r, r.paths, path, pathMemo{worktree: worktree, physical: physical})
 		if physical != "" {
@@ -176,11 +169,7 @@ func (r *router) worktreeOf(path string) string {
 // entry is resolved afresh, including symlinks; failures remain uncached.
 // Caller holds memoMu. Each of the two caches has its own entry bound.
 func memoize[V any](r *router, cache map[string]V, key string, value V) {
-	limit := r.limits.CacheEntries
-	if limit <= 0 {
-		limit = config.Default().CacheEntries
-	}
-	if _, exists := cache[key]; !exists && len(cache) >= limit {
+	if _, exists := cache[key]; !exists && len(cache) >= r.limits.CacheEntries {
 		clear(cache)
 		r.memo.rollovers++
 	}

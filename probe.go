@@ -62,14 +62,7 @@ func recordAlive(ctx context.Context, r record) probeVerdict {
 		return probeGone
 	}
 	if r.Terminating {
-		ours, err := isOurGopls(ctx, r.PID, r.Port)
-		if err != nil {
-			return probeUncertain
-		}
-		if !ours {
-			return probeGone
-		}
-		return probeTerminate
+		return identityVerdict(ctx, r)
 	}
 	// Asked after the pid, not before: the grace is for a process that exists
 	// and has not bound yet, and a start that crashed instead is not that. Held
@@ -89,20 +82,29 @@ func recordAlive(ctx context.Context, r record) probeVerdict {
 	// kept as alive: a port some unrelated listener took over, after a reboot
 	// recycled the pid too, would leave this worktree pointed at it until the
 	// map is edited by hand.
-	ours, identityErr := isOurGopls(ctx, r.PID, r.Port)
-	if identityErr != nil || ctx.Err() != nil {
+	verdict := identityVerdict(ctx, r)
+	// A probe that proved nothing cannot license a signal on its own: identity
+	// only says the process may be signalled, not that it needs to be. Kept
+	// uncertain, the record comes back to a later sweep with a conclusive probe.
+	if verdict == probeTerminate && !conclusive {
 		return probeUncertain
 	}
-	if !conclusive {
-		if ours {
-			return probeUncertain
-		}
+	return verdict
+}
+
+// identityVerdict asks whether the process r names is still one of ours, and
+// says what that alone is worth: ours may be signalled, somebody else's means
+// the record names nothing this tool manages, and no answer at all leaves the
+// record for a later sweep rather than acting on a guess.
+func identityVerdict(ctx context.Context, r record) probeVerdict {
+	ours, err := isOurGopls(ctx, r.PID, r.Port)
+	if err != nil || ctx.Err() != nil {
+		return probeUncertain
+	}
+	if !ours {
 		return probeGone
 	}
-	if ours {
-		return probeTerminate
-	}
-	return probeGone
+	return probeTerminate
 }
 
 // Probing never mutates the registry or signals a process. Termination is an
@@ -123,5 +125,14 @@ func isOurGopls(ctx context.Context, pid, port int) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
-	return strings.Contains(string(out), goplsBinary) && strings.Contains(string(out), mcpAddress(port)), err
+	return matchesGopls(string(out), port), err
+}
+
+// matchesGopls reports whether a command line is one of ours listening on port.
+// Named once because two callers ask it — this one, which decides whether a
+// server may be signalled, and status, which reports the same judgement. Two
+// spellings could disagree, and then status would vouch for a process the sweep
+// declines to touch.
+func matchesGopls(command string, port int) bool {
+	return strings.Contains(command, goplsBinary) && strings.Contains(command, mcpAddress(port))
 }

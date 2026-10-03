@@ -11,8 +11,6 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/ajvengo/gopls-mcp-manager/internal/config"
-
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -26,7 +24,10 @@ type sseResult struct {
 // unbounded SSE framing and 100-event queue with one bounded frame per reader
 // and an unbuffered handoff. Connection Close unblocks both network and handoff.
 type sseConn struct {
-	endpoint *url.URL
+	// endpoint is kept as the string it is posted to: url.URL.String() rebuilds
+	// scheme, host and path on every call, and this one never changes after the
+	// handshake below settles it.
+	endpoint string
 	body     io.ReadCloser
 	budget   *Budget
 	maxBytes int
@@ -36,11 +37,9 @@ type sseConn struct {
 }
 
 // ConnectSSE opens a legacy SSE connection sharing the non-nil frame budget.
-// ctx owns the stream until Close; a nonpositive maxBytes uses the default size.
+// ctx owns the stream until Close. maxBytes is taken at face value: config.Limits
+// is normalized where it enters the program, so there is no second opinion here.
 func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budget) (mcp.Connection, error) {
-	if maxBytes <= 0 {
-		maxBytes = config.Default().MessageBytes
-	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -74,7 +73,10 @@ func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budg
 			err = fmt.Errorf("first SSE event is %q, want endpoint", name)
 		}
 		if err == nil {
-			c.endpoint, err = req.URL.Parse(string(data))
+			var posted *url.URL
+			if posted, err = req.URL.Parse(string(data)); err == nil {
+				c.endpoint = posted.String()
+			}
 		}
 		budget.release(cap(frame))
 		break
@@ -144,7 +146,7 @@ func (c *sseConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 	if len(data) > c.maxBytes {
 		return ErrMessageTooLarge
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint.String(), bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -189,10 +191,11 @@ func (c *sseConn) readFrame(reader *bufio.Reader) ([]byte, error) {
 			frame = next
 		}
 		frame = append(frame, part...)
-		for _, b := range part {
-			if b != '\r' && b != '\n' {
-				lineEmpty = false
-			}
+		// Trim rather than scanning every byte: it stops at the first byte that
+		// is not a line ending, so a data line costs one comparison instead of
+		// one per byte of every upstream response.
+		if lineEmpty && len(bytes.Trim(part, "\r\n")) > 0 {
+			lineEmpty = false
 		}
 		if err == nil {
 			if lineEmpty {
@@ -215,7 +218,7 @@ func (c *sseConn) readFrame(reader *bufio.Reader) ([]byte, error) {
 // Compact data fields in place. Destination always precedes unread fields, so
 // multiline JSON needs no second payload buffer. Whitespace follows SDK v1.7.
 func parseSSEFrame(frame []byte) (string, []byte, error) {
-	var name, id, retry string
+	var name string
 	written, fields := 0, 0
 	for start := 0; start < len(frame); {
 		end := bytes.IndexByte(frame[start:], '\n')
@@ -237,10 +240,6 @@ func parseSSEFrame(frame []byte) (string, []byte, error) {
 		switch string(key) {
 		case "event":
 			name = string(value)
-		case "id":
-			id = string(value)
-		case "retry":
-			retry = string(value)
 		case "data":
 			if fields > 0 {
 				frame[written] = '\n'
@@ -250,7 +249,10 @@ func parseSSEFrame(frame []byte) (string, []byte, error) {
 			fields++
 		}
 	}
-	if name == "" && id == "" && retry == "" && written == 0 {
+	// id and retry are read past as unknown keys: a frame carrying one and no
+	// data dispatches no message, and reporting it as an empty payload instead
+	// had Read fail to decode "" and close a healthy upstream over it.
+	if name == "" && written == 0 {
 		return name, nil, nil
 	}
 	return name, frame[:written], nil

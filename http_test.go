@@ -72,15 +72,24 @@ func httpFixture(t testing.TB, capacity ...int) (*httpBackend, string, *atomic.I
 	return b, server.URL, &dials, started, cancelled
 }
 
-func postMCP(t testing.TB, endpoint, body string) *jsonrpc.Response {
+// mcpRequest is a POST the streamable-HTTP handler will accept: the SDK rejects
+// a body whose headers do not negotiate the protocol, so every test that sends
+// one sets the same three.
+func mcpRequest(t testing.TB, ctx context.Context, endpoint, body string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Protocol-Version", "2025-06-18")
+	return req
+}
+
+func postMCP(t testing.TB, endpoint, body string) *jsonrpc.Response {
+	t.Helper()
+	req := mcpRequest(t, t.Context(), endpoint, body)
 	// Even a supplied session identifier must not create or select a session.
 	req.Header.Set("Mcp-Session-Id", "same-client-supplied-id")
 	resp, err := http.DefaultClient.Do(req)
@@ -244,14 +253,8 @@ func TestHTTPDisconnectCancelsLegacySSECall(t *testing.T) {
 	b, endpoint, _, started, cancelled := httpFixture(t, 1)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"where","arguments":{"block":true}}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Mcp-Protocol-Version", "2025-06-18")
+	req := mcpRequest(t, ctx, endpoint,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"where","arguments":{"block":true}}}`)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -260,11 +263,7 @@ func TestHTTPDisconnectCancelsLegacySSECall(t *testing.T) {
 		}
 	}()
 	mustRecv(t, started, "upstream call did not start")
-	overload, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint, strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rejected, err := http.DefaultClient.Do(overload)
+	rejected, err := http.DefaultClient.Do(mcpRequest(t, t.Context(), endpoint, `{}`))
 	if err != nil {
 		t.Fatal(err)
 	}

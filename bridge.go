@@ -23,8 +23,8 @@ type router struct {
 	lanesMu   sync.Mutex          // protects lane lookup by the cancellation reader
 	worktrees map[string]string   // containing directory -> worktree, see worktreeOf
 	paths     map[string]pathMemo // path argument, verbatim -> its resolution, see worktreeOf
-	memoMu    *sync.Mutex         // shared with the single filesystem worker
-	memo      *memoState          // shared expiry epoch and observations, under memoMu
+	memoMu    sync.Mutex          // guards both memo maps and the epoch below
+	memo      memoState           // expiry epoch and observations, under memoMu
 	// ctx bounds the dial, and only the dial: the connection it hands back is
 	// read under this same context for the rest of its life, so the caller
 	// cancels it on expiry rather than passing a deadline down. See dialBounded.
@@ -65,22 +65,22 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 		lanes:                 make(map[string]*lane),
 		worktrees:             make(map[string]string),
 		paths:                 make(map[string]pathMemo),
-		memoMu:                new(sync.Mutex),
-		memo:                  new(memoState),
 		awaitingUpstream:      make(map[jsonrpc.ID]owed),
 		perWorktree:           make(map[string]int),
 		operations:            make(map[operationKey]operation),
 		operationsPerWorktree: make(map[string]int),
 		usage:                 requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
-		limits:                config.Default(),
 		out:                   make(chan jsonrpc.Message, 64),
 		errs:                  make(chan error, 4),
 	}
-	r.dial = r.dialGopls
-	budget := r.limits.SSEBytes
-	if m != nil && m.limits.SSEBytes > 0 {
-		budget = m.limits.SSEBytes
+	// The manager's policy is the session's, and WithDefaults is what lets every
+	// reader below take a limit at face value — including on the zero-value
+	// manager a test hands in, and on no manager at all.
+	if m != nil {
+		r.limits = m.limits
 	}
-	r.sseBudget = transport.NewBudget(budget)
+	r.limits = r.limits.WithDefaults()
+	r.dial = r.dialGopls
+	r.sseBudget = transport.NewBudget(r.limits.SSEBytes)
 	return r
 }

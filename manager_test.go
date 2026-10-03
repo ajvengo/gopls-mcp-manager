@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
 func TestBasePortIsStableAndInRange(t *testing.T) {
@@ -141,10 +143,13 @@ func wantRecords(t *testing.T, path string, whatWouldBeWrong string, want ...rec
 	}
 }
 
-// newTestManager returns a manager over a map file of its own.
+// newTestManager returns a manager over a map file of its own. Its limits are
+// the shipped ones, because newManager's are: a partially filled Limits is not
+// a state the program can be in, and nothing below it checks for one.
 func newTestManager(tb testing.TB) manager {
 	tb.Helper()
-	m := manager{mapPath: filepath.Join(tb.TempDir(), "gopls-ports.map"), alive: recordAlive, ready: awaitReady}
+	m := manager{mapPath: filepath.Join(tb.TempDir(), "gopls-ports.map"),
+		alive: recordAlive, ready: awaitReady, limits: config.Default()}
 	m.start = m.startGopls
 	return m
 }

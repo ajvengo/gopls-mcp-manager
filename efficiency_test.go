@@ -178,7 +178,7 @@ func TestMemoExpiryRevalidatesRetargetedSymlink(t *testing.T) {
 	alias := symlinkAt(t, root)
 	r := newTestRouter(t, root)
 	path := filepath.Join(alias, "missing.go")
-	if got := r.worktreeOf(path); got != root {
+	if got := r.worktreeOf(r.ctx, path); got != root {
 		t.Fatalf("initial target = %s, want %s", got, root)
 	}
 	if err := os.Remove(alias); err != nil {
@@ -188,7 +188,7 @@ func TestMemoExpiryRevalidatesRetargetedSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.memo.expires = time.Now().Add(-time.Second)
-	if got := r.worktreeOf(path); got != linked {
+	if got := r.worktreeOf(r.ctx, path); got != linked {
 		t.Fatalf("expired target = %s, want %s", got, linked)
 	}
 }

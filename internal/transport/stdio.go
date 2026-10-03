@@ -8,8 +8,6 @@ import (
 	"io"
 	"sync"
 
-	"github.com/ajvengo/gopls-mcp-manager/internal/config"
-
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	segmentjson "github.com/segmentio/encoding/json"
@@ -39,16 +37,14 @@ type writerOnly struct{ io.Writer }
 func (writerOnly) Close() error { return nil }
 
 // NewStdio starts a bounded stdio connection. Close closes input, not output.
-// An omitted or nonpositive limit uses the shipped default message size.
-func NewStdio(input io.ReadCloser, output io.Writer, messageLimit ...int) mcp.Connection {
+// maxBytes is taken at face value: config.Limits is normalized where it enters
+// the program, so there is no second opinion here.
+func NewStdio(input io.ReadCloser, output io.Writer, maxBytes int) mcp.Connection {
 	reader, writer := io.Pipe()
 	// IOTransport.Connect cannot fail: it only constructs the connection.
 	sdk, _ := (&mcp.IOTransport{Reader: reader, Writer: writerOnly{output}}).Connect(context.Background())
 	c := &stdioConn{input: input, sdk: sdk, feed: writer,
-		incoming: make(chan decodedMessage), closed: make(chan struct{}), maxBytes: config.Default().MessageBytes}
-	if len(messageLimit) > 0 && messageLimit[0] > 0 {
-		c.maxBytes = messageLimit[0]
-	}
+		incoming: make(chan decodedMessage), closed: make(chan struct{}), maxBytes: maxBytes}
 	go c.read()
 	return c
 }

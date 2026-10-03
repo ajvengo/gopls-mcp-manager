@@ -507,8 +507,8 @@ func FuzzToolCallWorktrees(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, params []byte) {
 		r := newTestRouter(t, testHome)
-		first := r.toolCallWorktrees(params)
-		if again := r.toolCallWorktrees(params); !slices.Equal(first, again) {
+		first := r.toolCallWorktrees(r.ctx, params)
+		if again := r.toolCallWorktrees(r.ctx, params); !slices.Equal(first, again) {
 			t.Fatalf("toolCallWorktrees(%s) = %q, then %q from the memo", params, first, again)
 		}
 	})

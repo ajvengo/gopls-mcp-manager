@@ -17,6 +17,39 @@ type Limits struct {
 	MessageBytes, HTTPBytes, SSEBytes int
 	SharedServers                     int
 	LogBytes                          int
+	// Metrics is GOPLS_MANAGER_METRICS, kept here so the one env var that is
+	// not a limit is still read in the one place that reads the environment.
+	Metrics bool
+}
+
+// WithDefaults fills every unset field from Default, so that nothing downstream
+// has to ask whether the value it was handed is populated: a zero field there
+// would otherwise mean a cache of no entries, a message limit of no bytes, or a
+// server cap of none.
+//
+// FromEnv needs none of this — it starts from Default and refuses every
+// non-positive override. newRouter is the caller that does: the manager it is
+// handed may be one a test built field by field, or no manager at all.
+//
+// Execution is deliberately absent: zero is its shipped value and means no
+// execution deadline at all, so there is nothing to fill in.
+func (l Limits) WithDefaults() Limits {
+	d := Default()
+	for _, field := range []struct{ target, fallback *int }{
+		{&l.PerLane, &d.PerLane}, {&l.Session, &d.Session},
+		{&l.Lanes, &d.Lanes}, {&l.CacheEntries, &d.CacheEntries},
+		{&l.MessageBytes, &d.MessageBytes}, {&l.HTTPBytes, &d.HTTPBytes},
+		{&l.SSEBytes, &d.SSEBytes}, {&l.SharedServers, &d.SharedServers},
+		{&l.LogBytes, &d.LogBytes},
+	} {
+		if *field.target <= 0 {
+			*field.target = *field.fallback
+		}
+	}
+	if l.CacheTTL <= 0 {
+		l.CacheTTL = d.CacheTTL
+	}
+	return l
 }
 
 // Default returns an independent value containing the shipped limits.
@@ -70,5 +103,6 @@ func FromEnv() (Limits, error) {
 	if limits.SSEBytes < limits.MessageBytes {
 		return limits, fmt.Errorf("GOPLS_MANAGER_SSE_BUFFER_BUDGET must hold at least one maximum-size message")
 	}
+	limits.Metrics = os.Getenv("GOPLS_MANAGER_METRICS") == "1"
 	return limits, nil
 }

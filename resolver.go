@@ -48,14 +48,18 @@ func (r *router) resolveWorktrees(parent context.Context, params json.RawMessage
 		return found, parent.Err()
 	}
 	if r.resolver == nil {
-		// Only this worker performs filesystem lookups. Its view shares memo
-		// maps and their lock, never request tracking or lane state.
-		view := &router{paths: r.paths, worktrees: r.worktrees, memoMu: r.memoMu, memo: r.memo, limits: r.limits}
-		r.resolver = &pathResolver{jobs: make(chan resolution)}
-		r.resolver.lookup = func(ctx context.Context, raw json.RawMessage) []string {
-			view.ctx = ctx
-			return view.toolCallWorktrees(raw)
-		}
+		// Unsynchronised, and safe for the same reason the worker is single:
+		// resolveWorktrees has one caller per router — the stdio reader, or the
+		// HTTP backend's one cold-resolution goroutine — so the first miss of a
+		// session is the only thing that ever reaches this branch. Built here
+		// rather than in newRouter so a session that never misses the memo, which
+		// is most of them, starts no goroutine at all.
+		//
+		// Only this worker performs filesystem lookups. It touches the memo maps
+		// and their lock, never request tracking or lane state — and it runs
+		// under the job's own context, not the session's, so a routing budget
+		// that expires cuts the lookup it paid for and no other.
+		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: r.toolCallWorktrees}
 		go r.resolver.run(r.ctx)
 	}
 	ctx, cancel := context.WithTimeout(parent, routingBudget)
@@ -83,29 +87,40 @@ func (r *router) cachedWorktrees(params json.RawMessage) ([]string, bool) {
 	r.memoMu.Lock()
 	defer r.memoMu.Unlock()
 	r.expireMemosLocked()
+	// Written out rather than as a closure over found, for the reason
+	// toolCallWorktrees gives: this runs on the goroutine that routes every
+	// worktree's calls, and a closure capturing found heap-allocates both on
+	// each tools/call, memo hit included.
 	var found []string
-	add := func(path string) bool {
-		if !filepath.IsAbs(path) {
-			return true
-		}
-		memo, ok := r.paths[path]
-		if ok {
-			r.memo.hits++
-		} else {
-			r.memo.misses++
-		}
-		if ok && !slices.Contains(found, memo.worktree) {
-			found = append(found, memo.worktree)
-		}
-		return ok
-	}
-	if !add(args.File) || !add(args.Dir) {
-		return nil, false
-	}
-	for _, path := range args.Files {
-		if !add(path) {
+	var ok bool
+	for _, path := range [...]string{args.File, args.Dir} {
+		if found, ok = r.appendMemoizedWorktree(found, path); !ok {
 			return nil, false
 		}
+	}
+	for _, path := range args.Files {
+		if found, ok = r.appendMemoizedWorktree(found, path); !ok {
+			return nil, false
+		}
+	}
+	return found, true
+}
+
+// appendMemoizedWorktree is appendWorktreeOf without the filesystem: it adds
+// only what the memo already knows, and reports whether path needed nothing
+// more. Caller holds memoMu.
+func (r *router) appendMemoizedWorktree(found []string, path string) ([]string, bool) {
+	if !filepath.IsAbs(path) {
+		return found, true
+	}
+	memo, ok := r.paths[path]
+	if !ok {
+		r.memo.misses++
+		return found, false
+	}
+	r.memo.hits++
+	if !slices.Contains(found, memo.worktree) {
+		found = append(found, memo.worktree)
 	}
 	return found, true
 }
