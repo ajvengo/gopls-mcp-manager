@@ -1,3 +1,4 @@
 /gopls-mcp-manager
 *.test
 .idea/
+__pycache__/

@@ -619,7 +619,7 @@ abandoned operations, current/peak SSE frame capacity, and count/total/max
 nanoseconds for routing, resolution, queue waits and handshake.
 Snapshots copy mutable counters under their owning locks. Completed includes
 local termination and shutdown cleanup, not just successful upstream answers.
-→ `TestCallLimitConfiguration`, `TestNewRetentionSettings`,
+→ `TestFromEnvRejectsInvalidSettings`, `TestFromEnvOverrides`, `TestWithDefaults`,
 `TestAccountingTerminalPathsAndSnapshots`
 
 The status command is read-only, emits JSON and never invokes a sweep. It reports
@@ -656,10 +656,11 @@ collection. It is not a process heap limit.
 
 Implementation remains one Go module. `internal/config` owns shared limits,
 defaults and environment validation. `internal/transport` owns bounded stdio/SSE
-connections, codecs and frame-budget accounting; it uses config's default sizes
-and exposes connection constructors plus synchronized budget observations.
-Neither internal package depends on the root command. Routing, resolver/path
-logic, lanes, request accounting, upstream protocol handling, registry, process
+connections, codecs and frame-budget accounting, and exposes connection constructors
+plus synchronized budget observations. `internal/protocol` owns pure JSON
+adaptations for roots capabilities, physical path arguments and complete results.
+Internal packages do not depend on the root command. Routing, resolver/path
+logic, lanes, request accounting, upstream request handling, registry, process
 lifecycle and probes remain in the root package. requests.go owns terminal request
 completion and generation checks; registry.go owns persistent mutation. Leaf tests
 move with their packages, while the root retains integration and lifecycle tests.

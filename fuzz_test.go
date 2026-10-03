@@ -8,7 +8,6 @@ package main
 // go test -fuzz FuzzReadMap -fuzztime 30s
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
 	"path/filepath"
@@ -365,128 +364,6 @@ func FuzzContainingDir(f *testing.F) {
 			t.Fatalf("containingDir(%q) physical = %q, relative for an absolute argument", path, physical)
 		}
 	})
-}
-
-// The client's initialize params, rewritten so gopls asks us for its roots
-// rather than believing it has none. Arbitrary because a client may send any
-// shape it likes.
-func FuzzWithRootsCapability(f *testing.F) {
-	f.Add([]byte(`{}`))
-	f.Add([]byte(`null`))
-	f.Add([]byte(`{"capabilities":{}}`))
-	f.Add([]byte(`{"capabilities":{"roots":{"listChanged":true}}}`))
-	f.Add([]byte(`{"capabilities":null}`))
-	f.Add([]byte(`{"capabilities":[]}`))
-	f.Add([]byte(`{"capabilities":"nonsense"}`))
-	f.Add([]byte(`[1,2,3]`))
-	f.Add([]byte(`not json`))
-
-	f.Fuzz(func(t *testing.T, params []byte) {
-		got := withRootsCapability(params)
-
-		var object map[string]json.RawMessage
-		if err := json.Unmarshal(params, &object); err != nil || object == nil {
-			// Nothing it can safely rewrite: it must hand the params back as-is
-			// rather than inventing a shape the client never sent.
-			if !bytes.Equal(got, params) {
-				t.Fatalf("withRootsCapability rewrote params it could not parse:\n got %s\nwant %s", got, params)
-			}
-			return
-		}
-		if bytes.Equal(got, params) {
-			// Handed back untouched: capabilities was there but was not an
-			// object to add roots to, so there is nothing safe to rewrite.
-			return
-		}
-		if !json.Valid(got) {
-			t.Fatalf("withRootsCapability(%s) = %s, which is not valid JSON", params, got)
-		}
-		var rewritten map[string]json.RawMessage
-		if err := json.Unmarshal(got, &rewritten); err != nil {
-			t.Fatalf("withRootsCapability(%s) = %s, no longer an object: %v", params, got, err)
-		}
-		before := spellingBudget(object, "capabilities")
-		if after := foldCount(rewritten, "capabilities"); after > before {
-			t.Fatalf("withRootsCapability(%s) = %s: %d keys fold to \"capabilities\", want at most %d", params, got, after, before)
-		}
-		// Decoded the way gopls decodes it, rather than through jsonKey: a
-		// jsonKey that picked the wrong key would otherwise send this assertion
-		// looking under the same wrong key and pass.
-		var out struct {
-			Capabilities struct {
-				Roots json.RawMessage `json:"roots"`
-			} `json:"capabilities"`
-		}
-		if err := json.Unmarshal(got, &out); err != nil {
-			t.Fatalf("withRootsCapability(%s) = %s, which gopls could not decode: %v", params, got, err)
-		}
-		if absentJSON(out.Capabilities.Roots) {
-			t.Fatalf("withRootsCapability(%s) = %s: rewritten, but with no roots capability", params, got)
-		}
-	})
-}
-
-// jsonKey is what keeps the rewrite above from adding a second spelling of a
-// key the client already sent — two keys mapping to one field, with gopls
-// reading whichever marshalled first. Fuzzed directly as well as through
-// withRootsCapability, because the hazard is in the object's keys rather than
-// in the params around them, and a decoder folds case, so the interesting keys
-// are the ones no seed would think to write.
-func FuzzJSONKey(f *testing.F) {
-	f.Add(`{}`, "capabilities")
-	f.Add(`{"capabilities":{}}`, "capabilities")
-	f.Add(`{"CApABilities":{}}`, "capabilities")
-	f.Add(`{"capabilities":1,"CAPABILITIES":2}`, "capabilities")
-	f.Add(`{"roots":null}`, "roots")
-	f.Add(`{"":1}`, "")
-	f.Add(`{"Ω":1}`, "ω")
-	f.Add(`{"other":1}`, "capabilities")
-
-	f.Fuzz(func(t *testing.T, object string, name string) {
-		var decoded map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(object), &decoded); err != nil || decoded == nil {
-			t.Skip() // not an object, so there are no keys to pick between
-		}
-		key := jsonKey(decoded, name)
-		if key != name && !strings.EqualFold(key, name) {
-			t.Fatalf("jsonKey(%s, %q) = %q, a key no decoder would read as %q", object, name, key, name)
-		}
-		if _, present := decoded[key]; !present && key != name {
-			t.Fatalf("jsonKey(%s, %q) = %q, which the object does not have", object, name, key)
-		}
-		// The property the caller needs: writing under the key it hands back
-		// never leaves the object with more spellings of name than it had.
-		before := spellingBudget(decoded, name)
-		decoded[key] = json.RawMessage(`{}`)
-		if after := foldCount(decoded, name); after > before {
-			t.Fatalf("writing under jsonKey(%s, %q) = %q left %d keys folding to it, want at most %d", object, name, key, after, before)
-		}
-	})
-}
-
-// spellingBudget is how many keys may fold to name once something has written
-// under it — the assertion both fuzzers above are built around.
-//
-// encoding/json matches field names case-insensitively, so a second spelling of
-// a key the client already sent leaves two keys mapping to one field, and which
-// one gopls reads comes down to their order. Adding the key to an object that
-// had none is the point; making it ambiguous is the bug. Hence the clamp to 1:
-// an object with no spelling is allowed to gain its first, and one already
-// ambiguous is allowed to stay exactly as ambiguous as it arrived — dropping it
-// would forbid the write these fuzzers exist to permit.
-func spellingBudget(object map[string]json.RawMessage, name string) int {
-	return max(foldCount(object, name), 1)
-}
-
-// foldCount is how many of object's keys a Go decoder would read as name.
-func foldCount(object map[string]json.RawMessage, name string) int {
-	var n int
-	for key := range object {
-		if strings.EqualFold(key, name) {
-			n++
-		}
-	}
-	return n
 }
 
 // The routing decision itself: which worktrees a tools/call names. Resolution

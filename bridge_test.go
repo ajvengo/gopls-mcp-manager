@@ -376,7 +376,7 @@ func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong st
 
 // wantResponse insists msg is the answer to id, which is the shape of every
 // reply these tests read back off a connection.
-func wantResponse(t *testing.T, msg jsonrpc.Message, id jsonrpc.ID) *jsonrpc.Response {
+func wantResponse(t testing.TB, msg jsonrpc.Message, id jsonrpc.ID) *jsonrpc.Response {
 	t.Helper()
 	resp, ok := msg.(*jsonrpc.Response)
 	if !ok || resp.ID != id {
@@ -423,32 +423,6 @@ func mustID(tb testing.TB, raw any) jsonrpc.ID {
 		tb.Fatalf("MakeID(%v): %v", raw, err)
 	}
 	return id
-}
-
-func TestWithRootsCapability(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "missing capabilities", in: `{}`, want: `{"capabilities":{"roots":{}}}`},
-		{name: "null capabilities", in: `{"capabilities":null}`, want: `{"capabilities":{"roots":{}}}`},
-		{name: "preserves peers", in: `{"capabilities":{"sampling":{}}}`, want: `{"capabilities":{"roots":{},"sampling":{}}}`},
-		{name: "preserves roots", in: `{"capabilities":{"roots":{"listChanged":true}}}`, want: `{"capabilities":{"roots":{"listChanged":true}}}`},
-		{name: "replaces null roots", in: `{"capabilities":{"roots":null}}`, want: `{"capabilities":{"roots":{}}}`},
-		{name: "invalid parameters", in: `[`, want: `[`},
-		{name: "invalid capabilities", in: `{"capabilities":[]}`, want: `{"capabilities":[]}`},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			if got := string(withRootsCapability(json.RawMessage(test.in))); got != test.want {
-				t.Errorf("withRootsCapability(%s) = %s, want %s", test.in, got, test.want)
-			}
-		})
-	}
 }
 
 // Refusing on the reader is what keeps the client's initialize from reaching a
@@ -1520,7 +1494,7 @@ func TestWriteToClientStopsWithTheSessionWithoutReportingIt(t *testing.T) {
 }
 
 // newLinkedWorktree returns a fresh repository and a linked worktree of it.
-func newLinkedWorktree(t *testing.T) (root, linked string) {
+func newLinkedWorktree(t testing.TB) (root, linked string) {
 	t.Helper()
 	root = filepath.Join(t.TempDir(), "main")
 	linked = filepath.Join(t.TempDir(), "linked")
@@ -1540,7 +1514,7 @@ func symlinkAt(t *testing.T, target string) string {
 	return link
 }
 
-func mustEvalSymlinks(t *testing.T, path string) string {
+func mustEvalSymlinks(t testing.TB, path string) string {
 	t.Helper()
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -1549,7 +1523,7 @@ func mustEvalSymlinks(t *testing.T, path string) string {
 	return resolved
 }
 
-func runGit(t *testing.T, args ...string) {
+func runGit(t testing.TB, args ...string) {
 	t.Helper()
 	if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, output)

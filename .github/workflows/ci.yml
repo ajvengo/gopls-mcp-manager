@@ -50,7 +50,11 @@ jobs:
 
       # The tests shell out to git worktree, and the runner's default identity
       # is enough only because newLinkedWorktree passes its own -c user.*.
-      - run: go test -race ./...
+      - run: go test -race -coverprofile="${{ runner.temp }}/coverage.out" ./...
+      - run: python3 -m unittest discover -s scripts
+      - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
+      - run: go install golang.org/x/tools/gopls@v0.23.0
+      - run: go test -race -tags=integration -run '^TestEndToEndRealGopls$' -timeout=3m .
 
   lint:
     runs-on: ubuntu-latest

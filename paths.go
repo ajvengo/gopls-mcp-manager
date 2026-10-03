@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/protocol"
 )
 
 type pathArguments struct {
@@ -284,22 +286,7 @@ func (r *router) canonicalToolCall(params json.RawMessage) (json.RawMessage, boo
 		return params, false
 	}
 	file, dir, files := r.physicalSpellings(parsePathArguments(params))
-	if file == "" && dir == "" && files == nil {
-		return params, false
-	}
-	return rewriteNested(params, "arguments", func(arguments map[string]json.RawMessage) bool {
-		// Marshalling a string or a []string cannot fail.
-		if file != "" {
-			arguments[jsonKey(arguments, "file")], _ = json.Marshal(file)
-		}
-		if dir != "" {
-			arguments[jsonKey(arguments, "dir")], _ = json.Marshal(dir)
-		}
-		if files != nil {
-			arguments[jsonKey(arguments, "files")], _ = json.Marshal(files)
-		}
-		return true
-	})
+	return protocol.WithPhysicalPaths(params, file, dir, files)
 }
 
 // physicalSpellings reports the memoized physical spelling of each path

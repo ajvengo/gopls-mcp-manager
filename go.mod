@@ -3,7 +3,7 @@ module github.com/ajvengo/gopls-mcp-manager
 go 1.27
 
 require (
-	github.com/modelcontextprotocol/go-sdk v1.7.0
+	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/segmentio/encoding v0.5.4
 )
 

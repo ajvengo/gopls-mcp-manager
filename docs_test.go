@@ -35,13 +35,11 @@ func TestDocsNameTestsThatExist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, dir := range []string{"internal/config", "internal/transport"} {
-		files, err := filepath.Glob(filepath.Join(dir, "*_test.go"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		testFiles = append(testFiles, files...)
+	internalFiles, err := filepath.Glob("internal/*/*_test.go")
+	if err != nil {
+		t.Fatal(err)
 	}
+	testFiles = append(testFiles, internalFiles...)
 	for _, path := range testFiles {
 		source := mustReadString(t, path)
 		for _, m := range declaredPattern.FindAllStringSubmatch(source, -1) {

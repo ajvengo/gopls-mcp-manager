@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/protocol"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -251,7 +251,7 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 					return nil, err
 				}
 				result := new(mcp.CallToolResult)
-				return result, json.Unmarshal(withCompleteResultType(raw), result)
+				return result, json.Unmarshal(protocol.WithCompleteResultType(raw), result)
 			default:
 				return next(ctx, method, req)
 			}
@@ -277,30 +277,6 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 		requestCtx := context.WithValue(req.Context(), httpRequestContextKey{}, req.Context())
 		handler.ServeHTTP(w, req.WithContext(requestCtx))
 	})
-}
-
-// withCompleteResultType is a tools/call result carrying the resultType the SDK
-// cannot put there itself — the other default answering without next skips, and
-// the one a client on protocol revision 2026-07-28 rejects the call for. See
-// SPEC for why unmarshalling is the only door into that field.
-//
-// Prepended rather than merged into the object: a duplicate key resolves to the
-// last one, so an upstream that answered input_required still overrides this —
-// without this middleware having to know which values are allowed, or to take
-// the object apart to find out.
-//
-// Delete this once the SDK marks CallToolResult complete-capable, or once this
-// middleware answers tools/call through next.
-func withCompleteResultType(result json.RawMessage) json.RawMessage {
-	body := bytes.TrimLeft(result, " \t\r\n")
-	if len(body) == 0 || body[0] != '{' {
-		return result // not an object: nothing to splice into, and nothing we own
-	}
-	field := []byte(`{"resultType":"complete",`)
-	if rest := bytes.TrimLeft(body[1:], " \t\r\n"); len(rest) > 0 && rest[0] == '}' {
-		field = []byte(`{"resultType":"complete"`)
-	}
-	return append(field, body[1:]...)
 }
 
 type httpRequestContextKey struct{}
