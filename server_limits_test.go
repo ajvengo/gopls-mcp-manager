@@ -6,6 +6,8 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestSharedServerCapSerializesConcurrentManagers(t *testing.T) {
@@ -32,15 +34,9 @@ func TestSharedServerCapSerializesConcurrentManagers(t *testing.T) {
 			rejected++
 		}
 	}
-	if rejected != 1 || starts.Load() != 1 {
-		t.Fatalf("capacity race: rejected=%d starts=%d", rejected, starts.Load())
-	}
+	require.Truef(t, rejected == 1 && starts.Load() == 1, "capacity race: rejected=%d starts=%d", rejected, starts.Load())
 	records, _, err := readMap(first.mapPath)
-	if err != nil || len(records) != 1 {
-		t.Fatalf("registry = %+v, %v", records, err)
-	}
+	require.Truef(t, err == nil && len(records) == 1, "registry = %+v, %v", records, err)
 	got, child, err := first.claimPort(t.Context(), records[0].Worktree)
-	if err != nil || child != nil || got != records[0] || starts.Load() != 1 {
-		t.Fatalf("existing endpoint not reusable at capacity: %+v, %v", got, err)
-	}
+	require.Truef(t, err == nil && child == nil && got == records[0] && starts.Load() == 1, "existing endpoint not reusable at capacity: %+v, %v", got, err)
 }

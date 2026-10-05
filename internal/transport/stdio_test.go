@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/require"
 )
 
 // The shipped message ceiling, for the tests that are not about the limit.
@@ -38,11 +38,9 @@ func TestStdioMessageLimitAndReadAhead(t *testing.T) {
 			for range tc.count {
 				_, err := conn.Read(t.Context())
 				if tc.oversize {
-					if !errors.Is(err, ErrMessageTooLarge) {
-						t.Fatalf("error = %v, want byte limit", err)
-					}
-				} else if err != nil {
-					t.Fatal(err)
+					require.ErrorIsf(t, err, ErrMessageTooLarge, "error = %v, want byte limit", err)
+				} else {
+					require.NoError(t, err)
 				}
 			}
 		})
@@ -74,25 +72,19 @@ func TestStdioMatchesSDK(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 			sdk, err := (&mcp.IOTransport{Reader: io.NopCloser(strings.NewReader(wire + "\n")), Writer: writerOnly{io.Discard}}).Connect(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			defer func() { _ = sdk.Close() }()
 			fast := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
 			defer func() { _ = fast.Close() }()
 			want, wantErr := sdk.Read(ctx)
 			got, gotErr := fast.Read(ctx)
-			if (wantErr == nil) != (gotErr == nil) {
-				t.Fatalf("error mismatch: SDK %v, fast %v", wantErr, gotErr)
-			}
+			require.Truef(t, (wantErr == nil) == (gotErr == nil), "error mismatch: SDK %v, fast %v", wantErr, gotErr)
 			if gotErr != nil {
 				return
 			}
 			wantWire, _ := jsonrpc.EncodeMessage(want)
 			gotWire, _ := jsonrpc.EncodeMessage(got)
-			if !bytes.Equal(gotWire, wantWire) {
-				t.Fatalf("got %s, want %s", gotWire, wantWire)
-			}
+			require.Equalf(t, wantWire, gotWire, "got %s, want %s", gotWire, wantWire)
 		})
 	}
 }
@@ -106,23 +98,18 @@ func TestStdioPreservesBatchResponses(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	for range 2 {
-		if _, err := c.Read(ctx); err != nil {
-			t.Fatal(err)
-		}
+		_, err := c.Read(ctx)
+		require.NoError(t, err)
 	}
 	for _, id := range []string{"b", "a"} {
 		requestID, _ := jsonrpc.MakeID(id)
-		if err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: json.RawMessage(`{}`)}); err != nil {
-			t.Fatal(err)
-		}
-		if id == "b" && output.Len() != 0 {
-			t.Fatal("partial batch response escaped")
-		}
+		err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: json.RawMessage(`{}`)})
+		require.NoError(t, err)
+		require.Falsef(t, id == "b" && output.Len() != 0, "partial batch response escaped")
 	}
 	var responses []json.RawMessage
-	if err := json.Unmarshal(output.Bytes(), &responses); err != nil || len(responses) != 2 {
-		t.Fatalf("batch response: %s, %v", output.Bytes(), err)
-	}
+	err := json.Unmarshal(output.Bytes(), &responses)
+	require.Truef(t, err == nil && len(responses) == 2, "batch response: %s, %v", output.Bytes(), err)
 }
 
 func TestStdioCloseUnblocksRead(t *testing.T) {
@@ -132,16 +119,12 @@ func TestStdioCloseUnblocksRead(t *testing.T) {
 	c := NewStdio(reader, io.Discard, defaultTestLimit)
 	done := make(chan error, 1)
 	go func() { _, err := c.Read(t.Context()); done <- err }()
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, c.Close())
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("closed read succeeded")
-		}
+		require.Error(t, err, "closed read succeeded")
 	case <-time.After(time.Second):
-		t.Fatal("closed stdio read remained blocked")
+		require.FailNow(t, "closed stdio read remained blocked")
 	}
 }
 
@@ -154,18 +137,14 @@ func FuzzDecodeScalarMatchesSDK(f *testing.F) {
 			return
 		} // rejected input is delegated to the SDK
 		want, err := jsonrpc.DecodeMessage(raw)
-		if err != nil {
-			t.Fatalf("fast path accepted rejected input: %v", err)
-		}
+		require.NoErrorf(t, err, "fast path accepted rejected input: %v", err)
 		wantWire, _ := jsonrpc.EncodeMessage(want)
 		// Make buffer ownership part of the comparison.
 		for i := range raw {
 			raw[i] = 'x'
 		}
 		gotWire, _ := jsonrpc.EncodeMessage(got)
-		if !bytes.Equal(wantWire, gotWire) {
-			t.Fatalf("wire mismatch: %s != %s", gotWire, wantWire)
-		}
+		require.Equalf(t, wantWire, gotWire, "wire mismatch: %s != %s", gotWire, wantWire)
 	})
 }
 
@@ -178,17 +157,13 @@ func BenchmarkStdioTransport(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			left, right := net.Pipe()
 			writer, err := (&mcp.IOTransport{Reader: left, Writer: left}).Connect(b.Context())
-			if err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
 			var reader mcp.Connection
 			if fast {
 				reader = NewStdio(right, right, defaultTestLimit)
 			} else {
 				reader, err = (&mcp.IOTransport{Reader: right, Writer: right}).Connect(b.Context())
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 			}
 			b.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
 			id, _ := jsonrpc.MakeID(float64(1))
@@ -202,9 +177,8 @@ func BenchmarkStdioTransport(b *testing.B) {
 			}()
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := reader.Read(b.Context()); err != nil {
-					b.Fatal(err)
-				}
+				_, err := reader.Read(b.Context())
+				require.NoError(b, err)
 			}
 		})
 	}

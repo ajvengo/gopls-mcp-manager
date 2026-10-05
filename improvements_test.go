@@ -13,6 +13,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type observedClose struct {
@@ -49,12 +51,8 @@ func TestServerReplyFailureCompletesOutstanding(t *testing.T) {
 						time.Sleep(sendBudget)
 					}
 					_ = wantWireError(t, wantClientError(t, r, id, "server reply stranded other calls"), jsonrpc.CodeInternalError)
-					if !observed.closed.Load() {
-						t.Fatal("failed connection was not closed")
-					}
-					if r.requestUsage().Outstanding != 0 {
-						t.Fatal("failed connection retained callers")
-					}
+					require.True(t, observed.closed.Load(), "failed connection was not closed")
+					require.Zero(t, r.requestUsage().Outstanding, "failed connection retained callers")
 					wantClientQuiet(t, r, "failure completed twice")
 				})
 			})
@@ -71,24 +69,17 @@ func TestAcquisitionDoesNotProbeUnrelatedRecords(t *testing.T) {
 	var probes atomic.Int64
 	m.alive = func(_ context.Context, r record) probeVerdict {
 		probes.Add(1)
-		if r != records[0] {
-			t.Error("acquisition probed an unrelated worktree")
-		}
+		assert.Equalf(t, records[0], r, "acquisition probed an unrelated worktree")
 		return probeLive
 	}
 	port, err := m.ensure(t.Context(), records[0].Worktree)
-	if err != nil || port != records[0].Port || probes.Load() != 1 {
-		t.Fatalf("ensure = %d, %v; probes %d", port, err, probes.Load())
-	}
+	require.Falsef(t, err != nil || port != records[0].Port || probes.Load() != 1, "ensure = %d, %v; probes %d", port, err, probes.Load())
 	wantRecords(t, m.mapPath, "acquisition changed unrelated records", records...)
 	probes.Store(0)
 	m.alive = func(context.Context, record) probeVerdict { probes.Add(1); return probeLive }
-	if err := m.list(t.Context(), io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	if probes.Load() != int64(len(records)) {
-		t.Fatal("explicit sweep omitted records")
-	}
+	err = m.list(t.Context(), io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(records)), probes.Load(), "explicit sweep omitted records")
 }
 
 func TestIngressCancellationBypassesBlockedResolution(t *testing.T) {
@@ -113,17 +104,12 @@ func TestIngressCancellationBypassesBlockedResolution(t *testing.T) {
 		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"resolving"}`)}
 		_ = wantWireError(t, wantClientError(t, r, id, "cancellation waited for filesystem"), -32800)
 		response := mustRecv(t, r.out, "pathless call after cancellation")
-		if resp, ok := response.(*jsonrpc.Response); !ok || resp.ID != mustID(t, "pathless") || resp.Error != nil {
-			t.Fatalf("pathless call failed: %#v", response)
-		}
-		if time.Since(start) != 0 {
-			t.Fatal("cancellation or pathless call waited for routing timeout")
-		}
+		resp, ok := response.(*jsonrpc.Response)
+		require.Falsef(t, !ok || resp.ID != mustID(t, "pathless") || resp.Error != nil, "pathless call failed: %#v", response)
+		require.Zerof(t, time.Since(start), "cancellation or pathless call waited for routing timeout")
 		close(release)
 		synctest.Wait()
-		if r.sticky != testWorktree {
-			t.Fatal("cancelled resolution committed late sticky state")
-		}
+		require.Equal(t, testWorktree, r.sticky, "cancelled resolution committed late sticky state")
 		wantClientQuiet(t, r, "late lookup completed twice")
 	})
 }
@@ -136,9 +122,7 @@ func TestRetentionLimitDoesNotAllocateRejectedLane(t *testing.T) {
 		r.sticky = testWorktree
 		id := queuedCall(t, r, "too-many-lanes")
 		_ = wantWireError(t, wantClientError(t, r, id, "retention limit was ignored"), -32000)
-		if len(r.lanes) != 1 || len(r.awaitingUpstream) != 0 || len(r.perWorktree) != 0 {
-			t.Fatal("rejected lane retained resources")
-		}
+		require.Falsef(t, len(r.lanes) != 1 || len(r.awaitingUpstream) != 0 || len(r.perWorktree) != 0, "rejected lane retained resources")
 		r.sticky = testHome
 		queuedCall(t, r, "existing-lane")
 		wantClientQuiet(t, r, "retention cap refused an existing lane")
@@ -168,19 +152,13 @@ func TestFullIngressQueueStillAcceptsCancellation(t *testing.T) {
 		start := time.Now()
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "overflow"), "full ingress blocked reader"), -32000)
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "0"), "full ingress blocked cancellation"), -32800)
-		if time.Since(start) != 0 {
-			t.Fatal("cancellation waited for resolution timeout")
-		}
+		require.Zerof(t, time.Since(start), "cancellation waited for resolution timeout")
 		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"resolving"}`)}
 		_ = wantClientError(t, r, mustID(t, "resolving"), "resolving call not cancelled")
 		close(release)
 		synctest.Wait()
-		if len(l.reqs) != laneQueue-1 {
-			t.Fatalf("delivered %d queued calls", len(l.reqs))
-		}
-		if r.requestUsage().Rejections["routing_queue"] != 1 {
-			t.Fatal("routing overload not counted")
-		}
+		require.Lenf(t, l.reqs, laneQueue-1, "delivered %d queued calls", len(l.reqs))
+		require.Equal(t, 1, r.requestUsage().Rejections["routing_queue"], "routing overload not counted")
 	})
 }
 
@@ -201,12 +179,9 @@ func TestServerReplyKeepsShorterHandshakeDeadline(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
 		start := time.Now()
-		if err := newLane(r, testHome).handshake(ctx, conn); err == nil {
-			t.Fatal("stalled roots reply succeeded")
-		}
-		if time.Since(start) != time.Second {
-			t.Fatal("server reply extended handshake deadline")
-		}
+		err := newLane(r, testHome).handshake(ctx, conn)
+		require.Error(t, err, "stalled roots reply succeeded")
+		require.Truef(t, time.Since(start) == time.Second, "server reply extended handshake deadline")
 	})
 }
 
@@ -219,9 +194,7 @@ func TestOutstandingLimitDoesNotAllocateNewLane(t *testing.T) {
 		r.sticky = testWorktree
 		id := queuedCall(t, r, "second")
 		_ = wantWireError(t, wantClientError(t, r, id, "session cap was ignored"), -32000)
-		if len(r.lanes) != 1 {
-			t.Fatal("session rejection created a new lane")
-		}
+		require.Lenf(t, r.lanes, 1, "session rejection created a new lane")
 	})
 }
 
@@ -234,23 +207,17 @@ func TestMemoCapacityRevalidatesEvictedPaths(t *testing.T) {
 		memoize(r, r.worktrees, key, testHome)
 		memoize(r, r.paths, key, pathMemo{worktree: testHome})
 	}
-	if len(r.worktrees) > 2 || len(r.paths) > 2 {
-		t.Fatal("memo exceeded capacity")
-	}
-	if _, ok := r.worktrees["/0"]; ok {
-		t.Fatal("old memo survived capacity rollover")
-	}
-	if _, ok := r.paths["/0"]; ok {
-		t.Fatal("old memo survived capacity rollover")
-	}
+	require.Falsef(t, len(r.worktrees) > 2 || len(r.paths) > 2, "memo exceeded capacity")
+	_, ok := r.worktrees["/0"]
+	require.False(t, ok, "old memo survived capacity rollover")
+	_, ok = r.paths["/0"]
+	require.False(t, ok, "old memo survived capacity rollover")
 	r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
 		return []string{testWorktree}
 	}}
 	go r.resolver.run(t.Context())
 	got, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: fileCallParams("/0")})
-	if err != nil || got != testWorktree {
-		t.Fatalf("evicted path not resolved afresh: %s, %v", got, err)
-	}
+	require.Falsef(t, err != nil || got != testWorktree, "evicted path not resolved afresh: %s, %v", got, err)
 }
 
 func TestStatusSnapshotKeepsIdentityPerRecord(t *testing.T) {
@@ -267,28 +234,21 @@ func TestStatusSnapshotKeepsIdentityPerRecord(t *testing.T) {
 		return map[int]int{process.Process.Pid: 7}, nil
 	}
 	var output bytes.Buffer
-	if err := m.status(t.Context(), &output); err != nil {
-		t.Fatal(err)
-	}
+	err := m.status(t.Context(), &output)
+	require.NoError(t, err)
 	var report struct {
 		OpenFiles int
 		Servers   []serverUsage
 	}
-	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
-		t.Fatal(err)
-	}
-	if len(report.Servers) != 3 {
-		t.Fatalf("status: %s", &output)
-	}
+	err = json.Unmarshal(output.Bytes(), &report)
+	require.NoError(t, err)
+	require.Lenf(t, report.Servers, 3, "status: %s", &output)
 	for i, identity := range []string{"matched", "different process", "unknown"} {
 		row := report.Servers[i]
-		if row.Identity != identity || (row.RSSKiB != nil) != (i == 0) || (row.OpenFiles != nil) != (i == 0) {
-			t.Fatalf("row %d: %+v", i, row)
-		}
+		require.Falsef(t, row.Identity != identity || (row.RSSKiB != nil) != (i == 0) || (row.OpenFiles != nil) != (i == 0),
+			"row %d: %+v", i, row)
 	}
-	if report.OpenFiles != 7 {
-		t.Fatalf("open files = %d, want only the matched row's 7", report.OpenFiles)
-	}
+	require.Equalf(t, 7, report.OpenFiles, "open files = %d, want only the matched row's 7", report.OpenFiles)
 	wantRecords(t, m.mapPath, "status changed records", records...)
 }
 
@@ -309,15 +269,11 @@ func TestAccountingTerminalPathsAndSnapshots(t *testing.T) {
 		_ = mustRecv(t, r.out, "disconnect result")
 		queuedCall(t, r, "clear-again")
 		r.clearRequests()
-		if len(r.perWorktree) != 0 || r.requestUsage().Admitted != r.requestUsage().Completed {
-			t.Fatal("terminal paths leaked accounting")
-		}
+		require.Falsef(t, len(r.perWorktree) != 0 || r.requestUsage().Admitted != r.requestUsage().Completed, "terminal paths leaked accounting")
 		r.rejected("delivery_queue")
 		before := r.requestUsage()
 		r.rejected("delivery_queue")
-		if before.Rejections["delivery_queue"] != 1 {
-			t.Fatal("snapshot shares mutable counters")
-		}
+		require.Equal(t, 1, before.Rejections["delivery_queue"], "snapshot shares mutable counters")
 	})
 }
 
@@ -331,9 +287,8 @@ func BenchmarkAdmissionLoaded(b *testing.B) {
 			id := mustID(b, "new")
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := r.admit(id, nil); err != nil {
-					b.Fatal(err)
-				}
+				_, err := r.admit(id, nil)
+				require.NoError(b, err)
 				r.finish(id, nil, nil)
 			}
 		})
@@ -345,9 +300,8 @@ func BenchmarkAcquisitionVersusSweep(b *testing.B) {
 		b.Run(fmt.Sprintf("whole=%v", whole), func(b *testing.B) {
 			m := newTestManager(b)
 			records := testRecords(8)
-			if err := writeMap(m.mapPath, records); err != nil {
-				b.Fatal(err)
-			}
+			err := writeMap(m.mapPath, records)
+			require.NoError(b, err)
 			m.alive = func(ctx context.Context, r record) probeVerdict {
 				if r != records[0] {
 					_ = waitContext(ctx, 10*time.Millisecond)
@@ -362,9 +316,7 @@ func BenchmarkAcquisitionVersusSweep(b *testing.B) {
 				} else {
 					_, err = m.ensure(b.Context(), records[0].Worktree)
 				}
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 			}
 		})
 	}

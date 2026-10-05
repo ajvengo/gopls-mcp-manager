@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestOverBudgetEvictsLeastFrequentlyUsed(t *testing.T) {
@@ -56,9 +58,8 @@ func TestOverBudgetEvictsLeastFrequentlyUsed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			victims, remaining := overBudget(tc.records, tc.files, tc.busy, tc.budget, now)
-			if !slices.Equal(victims, tc.victims) || remaining != tc.remaining {
-				t.Fatalf("overBudget = %+v, %d; want %+v, %d", victims, remaining, tc.victims, tc.remaining)
-			}
+			require.Truef(t, slices.Equal(victims, tc.victims) && remaining == tc.remaining,
+				"overBudget = %+v, %d; want %+v, %d", victims, remaining, tc.victims, tc.remaining)
 		})
 	}
 }
@@ -76,19 +77,12 @@ func TestFlushUsesAgesAndAddsCounts(t *testing.T) {
 		m.used(worktree)
 	}
 	got, err := m.withMap(t.Context(), m.flushUses)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// Eight uses one half-life ago age to four, plus the two just counted.
-	if math.Abs(got[0].Uses-6) > 0.01 || time.Since(time.Unix(got[0].UsedAt, 0)) > time.Minute {
-		t.Fatalf("used record = %+v, want about 6 uses as of now", got[0])
-	}
-	if got[1] != leaving || got[2] != unused {
-		t.Fatalf("records without counts changed: %+v", got[1:])
-	}
-	if len(m.uses.counts) != 0 {
-		t.Fatalf("counts survived the flush: %v", m.uses.counts)
-	}
+	require.Falsef(t, math.Abs(got[0].Uses-6) > 0.01 || time.Since(time.Unix(got[0].UsedAt, 0)) > time.Minute,
+		"used record = %+v, want about 6 uses as of now", got[0])
+	require.Falsef(t, got[1] != leaving || got[2] != unused, "records without counts changed: %+v", got[1:])
+	require.Lenf(t, m.uses.counts, 0, "counts survived the flush: %v", m.uses.counts)
 	wantRecords(t, m.mapPath, "flushed uses were not written", got...)
 	var nothing *manager
 	nothing.used("/nil-safe")
@@ -109,18 +103,15 @@ func TestMaintenanceEvictsLeastFrequentlyUsedOverBudget(t *testing.T) {
 	mustWriteMap(t, m.mapPath, []record{busy, idle})
 	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	m.openFiles = func(_ context.Context, measured []record) (map[int]int, error) {
-		if !slices.Equal(measured, []record{busy, idle}) {
-			t.Errorf("measured %+v, want both records", measured)
-		}
+		assert.Truef(t, slices.Equal(measured, []record{busy, idle}), "measured %+v, want both records", measured)
 		return map[int]int{busy.PID: 20, idle.PID: 20}, nil
 	}
-	if _, err := m.sweepMaintenance(t.Context()); err != nil {
-		t.Fatal(err)
-	}
+	_, err := m.sweepMaintenance(t.Context())
+	require.NoError(t, err)
 	select {
 	case <-exited:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the least frequently used server was not terminated")
+		require.FailNow(t, "the least frequently used server was not terminated")
 	}
 	wantRunning(t, busyProcess, "the budget evicted the busier server")
 	idle.Terminating = true
@@ -134,9 +125,8 @@ func TestMaintenanceSweepsWhenOpenFilesCannotBeCounted(t *testing.T) {
 		mustWriteMap(t, m.mapPath, []record{{Worktree: "/removed", PID: 12345, Port: firstPort}})
 		m.alive = func(context.Context, record) probeVerdict { return probeGone }
 		m.openFiles = func(context.Context, []record) (map[int]int, error) { return nil, err }
-		if records, sweepErr := m.sweepMaintenance(t.Context()); sweepErr != nil || len(records) != 0 {
-			t.Fatalf("%v: sweep = %+v, %v; want the dead record reaped", err, records, sweepErr)
-		}
+		records, sweepErr := m.sweepMaintenance(t.Context())
+		require.Falsef(t, sweepErr != nil || len(records) != 0, "%v: sweep = %+v, %v; want the dead record reaped", err, records, sweepErr)
 	}
 }
 
@@ -152,26 +142,22 @@ func TestDeliveredToolCallsCountUses(t *testing.T) {
 		r.track(id, nil, testWorktree)
 		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/list"}, nil)
 		mustRecv(t, conn.writes, "the tools/list")
-		if got := r.m.uses.counts; !maps.Equal(got, map[string]int{testWorktree: 1}) {
-			t.Fatalf("uses = %v, want one tools/call for %s", got, testWorktree)
-		}
-		if got := r.m.pending.newest(); len(got) != 1 || got[testWorktree].IsZero() {
-			t.Fatalf("pending = %v, want both deliveries on %s", got, testWorktree)
-		}
+		got := r.m.uses.counts
+		require.Truef(t, maps.Equal(got, map[string]int{testWorktree: 1}), "uses = %v, want one tools/call for %s", got, testWorktree)
+		pending := r.m.pending.newest()
+		require.Falsef(t, len(pending) != 1 || pending[testWorktree].IsZero(), "pending = %v, want both deliveries on %s", pending, testWorktree)
 		r.finish(id, conn, nil)
 		r.finish(mustID(t, "counted"), conn, nil)
-		if got := r.m.pending.newest(); len(got) != 0 {
-			t.Fatalf("answered operations still pending: %v", got)
-		}
+		pending = r.m.pending.newest()
+		require.Lenf(t, pending, 0, "answered operations still pending: %v", pending)
 	})
 }
 
 func TestParseOpenFiles(t *testing.T) {
 	t.Parallel()
 	got := parseOpenFiles("p10\nfcwd\nftxt\nf0\np11\nf3\nfmem\nnoise\np\nf9\n")
-	if want := map[int]int{10: 3, 11: 2}; !maps.Equal(got, want) {
-		t.Fatalf("parseOpenFiles = %v, want %v", got, want)
-	}
+	want := map[int]int{10: 3, 11: 2}
+	require.Truef(t, maps.Equal(got, want), "parseOpenFiles = %v, want %v", got, want)
 }
 
 func TestCountOpenFilesToleratesMissingPID(t *testing.T) {
@@ -180,9 +166,7 @@ func TestCountOpenFilesToleratesMissingPID(t *testing.T) {
 		t.Skip("lsof not installed")
 	}
 	got, err := countOpenFiles(t.Context(), []record{{PID: os.Getpid()}, {PID: 2147483647}})
-	if err != nil || got[os.Getpid()] == 0 {
-		t.Fatalf("countOpenFiles = %v, %v; want this process counted", got, err)
-	}
+	require.Falsef(t, err != nil || got[os.Getpid()] == 0, "countOpenFiles = %v, %v; want this process counted", got, err)
 }
 
 // Another manager's fresh pending call must stop this one evicting, including
@@ -200,9 +184,8 @@ func TestMaintenanceSparesServersWithFreshPendingCalls(t *testing.T) {
 			mustWriteMap(t, m.mapPath, []record{r})
 			other := m.pendingPath(process.Process.Pid)
 			busy := func() {
-				if err := writePending(other, map[string]time.Time{worktree: time.Now()}); err != nil {
-					t.Error(err)
-				}
+				err := writePending(other, map[string]time.Time{worktree: time.Now()})
+				assert.NoError(t, err)
 			}
 			if !late {
 				busy()
@@ -216,9 +199,8 @@ func TestMaintenanceSparesServersWithFreshPendingCalls(t *testing.T) {
 			m.openFiles = func(context.Context, []record) (map[int]int, error) {
 				return map[int]int{r.PID: 40}, nil
 			}
-			if _, err := m.sweepMaintenance(t.Context()); err != nil {
-				t.Fatal(err)
-			}
+			_, err := m.sweepMaintenance(t.Context())
+			require.NoError(t, err)
 			wantRecords(t, m.mapPath, "a server with a fresh pending call was evicted", r)
 			wantRunning(t, process, "a server with a fresh pending call was signalled")
 		})
@@ -238,9 +220,8 @@ func TestBusyWorktreesAgesEntriesAndDropsDeadManagers(t *testing.T) {
 	mustWritePending := func(pid int, newest map[string]time.Time) string {
 		t.Helper()
 		path := m.pendingPath(pid)
-		if err := writePending(path, newest); err != nil {
-			t.Fatal(err)
-		}
+		err := writePending(path, newest)
+		require.NoError(t, err)
 		return path
 	}
 	mustWritePending(live.Process.Pid, map[string]time.Time{
@@ -249,20 +230,15 @@ func TestBusyWorktreesAgesEntriesAndDropsDeadManagers(t *testing.T) {
 	mustWriteFile(t, m.pendingPath(os.Getppid()), "not json")
 	mustWriteFile(t, filepath.Join(m.pendingDir(), ".pending-tmp"), "{}")
 	got, err := m.busyWorktrees(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := map[string]bool{"/own": true, "/other": true}; !maps.Equal(got, want) {
-		t.Fatalf("busy = %v, want %v", got, want)
-	}
-	if _, err := os.Stat(dead); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a dead manager's file survived: %v", err)
-	}
+	require.NoError(t, err)
+	want := map[string]bool{"/own": true, "/other": true}
+	require.Truef(t, maps.Equal(got, want), "busy = %v, want %v", got, want)
+	_, err = os.Stat(dead)
+	require.ErrorIsf(t, err, os.ErrNotExist, "a dead manager's file survived: %v", err)
 	broken := newTestManager(t)
 	mustWriteFile(t, broken.pendingDir(), "a file where the directory belongs")
-	if _, err := broken.busyWorktrees(now); err == nil {
-		t.Fatal("an unreadable pending directory read as nothing pending")
-	}
+	_, err = broken.busyWorktrees(now)
+	require.Error(t, err, "an unreadable pending directory read as nothing pending")
 }
 
 // Under synctest, Wait returns once the publisher has written and gone back
@@ -284,21 +260,17 @@ func TestPublishPendingFollowsOperations(t *testing.T) {
 				return nil
 			}
 			var newest map[string]int64
-			if err != nil || json.Unmarshal(data, &newest) != nil {
-				t.Fatalf("pending file %q: %v", data, err)
-			}
+			require.Falsef(t, err != nil || json.Unmarshal(data, &newest) != nil, "pending file %q: %v", data, err)
 			return newest
 		}
 
 		key := operationKey{id: mustID(t, "published")}
 		m.beginPending(key, "/published")
-		if got := published(); got["/published"] != time.Now().UnixMilli() {
-			t.Fatalf("published %v, want /published started now", got)
-		}
+		got := published()
+		require.Equalf(t, time.Now().UnixMilli(), got["/published"], "published %v, want /published started now", got)
 		m.endPending(key)
-		if got := published(); got != nil {
-			t.Fatalf("file kept after the last call ended: %v", got)
-		}
+		got = published()
+		require.Nilf(t, got, "file kept after the last call ended: %v", got)
 
 		// Routers on many goroutines: the publisher coalesces whatever burst
 		// it finds and settles on the final state.
@@ -312,14 +284,12 @@ func TestPublishPendingFollowsOperations(t *testing.T) {
 		}
 		m.beginPending(key, "/published")
 		routers.Wait()
-		if got := published(); len(got) != 1 || got["/published"] == 0 {
-			t.Fatalf("after the burst published %v, want only /published", got)
-		}
+		got = published()
+		require.Falsef(t, len(got) != 1 || got["/published"] == 0, "after the burst published %v, want only /published", got)
 
 		cancel()
 		<-done
-		if got := published(); got != nil {
-			t.Fatalf("file kept after shutdown: %v", got)
-		}
+		got = published()
+		require.Nilf(t, got, "file kept after shutdown: %v", got)
 	})
 }

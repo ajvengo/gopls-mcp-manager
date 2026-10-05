@@ -3,7 +3,6 @@ package transport
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBudgetReservations(t *testing.T) {
@@ -21,22 +21,17 @@ func TestBudgetReservations(t *testing.T) {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			t.Parallel()
 			b := NewBudget(limit)
-			if used, peak := b.Snapshot(); used != 0 || peak != 0 {
-				t.Fatalf("new budget = %d/%d", used, peak)
-			}
-			if got := b.acquire(6); got != (limit > 0) {
-				t.Fatalf("reservation = %v, limit %d", got, limit)
-			}
+			used, peak := b.Snapshot()
+			require.Falsef(t, used != 0 || peak != 0, "new budget = %d/%d", used, peak)
+			got := b.acquire(6)
+			require.Equalf(t, limit > 0, got, "reservation = %v, limit %d", got, limit)
 			if limit <= 0 {
 				return
 			}
-			if b.acquire(5) {
-				t.Fatal("over-capacity reservation accepted")
-			}
+			require.False(t, b.acquire(5), "over-capacity reservation accepted")
 			b.release(6)
-			if used, peak := b.Snapshot(); used != 0 || peak != 6 {
-				t.Fatalf("released budget = %d/%d, want 0/6", used, peak)
-			}
+			used, peak = b.Snapshot()
+			require.Falsef(t, used != 0 || peak != 6, "released budget = %d/%d, want 0/6", used, peak)
 		})
 	}
 }
@@ -64,21 +59,14 @@ func TestSSEReadContracts(t *testing.T) {
 			t.Cleanup(server.Close)
 			budget := NewBudget(4096)
 			conn, err := ConnectSSE(t.Context(), server.URL, 1024, budget)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			t.Cleanup(func() { _ = conn.Close() })
-			if conn.SessionID() != "" {
-				t.Fatal("legacy SSE transport has an HTTP session ID")
-			}
+			require.Empty(t, conn.SessionID(), "legacy SSE transport has an HTTP session ID")
 			msg, err := conn.Read(t.Context())
-			if (err != nil) != tc.fails || (!tc.fails && msg == nil) {
-				t.Fatalf("Read = %v, %v; want failure %v", msg, err, tc.fails)
-			}
+			require.Falsef(t, (err != nil) != tc.fails || (!tc.fails && msg == nil), "Read = %v, %v; want failure %v", msg, err, tc.fails)
 			if tc.fails {
-				if used, _ := budget.Snapshot(); used != 0 {
-					t.Fatalf("failed read retained %d bytes", used)
-				}
+				used, _ := budget.Snapshot()
+				require.Equalf(t, 0, used, "failed read retained %d bytes", used)
 			}
 		})
 	}
@@ -124,13 +112,10 @@ func TestSSEWriteContracts(t *testing.T) {
 				cancel()
 			}
 			err := c.Write(ctx, &jsonrpc.Request{ID: id, Method: "ping", Params: tc.params})
-			if (err != nil) != tc.fails {
-				t.Fatalf("Write = %v, want failure %v", err, tc.fails)
-			}
+			require.Equalf(t, tc.fails, err != nil, "Write = %v, want failure %v", err, tc.fails)
 			if tc.status != 0 {
-				if wire := <-posted; !strings.HasPrefix(wire, "application/json:") || !strings.Contains(wire, `"id":"call"`) {
-					t.Fatalf("POST lost headers or identity: %s", wire)
-				}
+				wire := <-posted
+				require.Falsef(t, !strings.HasPrefix(wire, "application/json:") || !strings.Contains(wire, `"id":"call"`), "POST lost headers or identity: %s", wire)
 			}
 		})
 	}
@@ -144,13 +129,10 @@ func TestTransportReadCancellation(t *testing.T) {
 	defer func() { _ = writer.Close() }()
 	stdio := NewStdio(reader, io.Discard, 1024)
 	defer func() { _ = stdio.Close() }()
-	if stdio.SessionID() != "" {
-		t.Fatal("stdio session ID must be empty")
-	}
+	require.Empty(t, stdio.SessionID(), "stdio session ID must be empty")
 	sse := &sseConn{done: make(chan struct{})}
 	for name, conn := range map[string]mcp.Connection{"stdio": stdio, "SSE": sse} {
-		if _, err := conn.Read(ctx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("%s read cancellation = %v", name, err)
-		}
+		_, err := conn.Read(ctx)
+		require.ErrorIsf(t, err, context.Canceled, "%s read cancellation = %v", name, err)
 	}
 }

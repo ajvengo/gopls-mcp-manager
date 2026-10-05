@@ -19,6 +19,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // StartedAt is the one field readMap does not range-check — unlike the other
@@ -50,12 +52,9 @@ func FuzzWithinStartGrace(f *testing.F) {
 		if !granted {
 			return // no grace is always a safe answer; the sweep simply probes
 		}
-		if startedAt > after {
-			t.Fatalf("startedAt %d is in the future and was given grace, want a record nobody can make immortal", startedAt)
-		}
-		if oldest := before - int64(startGrace/time.Second); startedAt < oldest {
-			t.Fatalf("startedAt %d was given grace at %d, though the grace runs out at %d", startedAt, before, oldest)
-		}
+		require.LessOrEqualf(t, startedAt, after, "startedAt %d is in the future and was given grace, want a record nobody can make immortal", startedAt)
+		oldest := before - int64(startGrace/time.Second)
+		require.GreaterOrEqualf(t, startedAt, oldest, "startedAt %d was given grace at %d, though the grace runs out at %d", startedAt, before, oldest)
 	})
 }
 
@@ -83,17 +82,13 @@ func FuzzLogPath(f *testing.F) {
 	f.Fuzz(func(t *testing.T, worktree string) {
 		got := m.logPath(worktree)
 
-		if dir := filepath.Dir(got); dir != wantDir {
-			t.Fatalf("logPath(%q) = %q, which is under %q rather than %q", worktree, got, dir, wantDir)
-		}
+		dir := filepath.Dir(got)
+		require.Equalf(t, wantDir, dir, "logPath(%q) = %q, which is under %q rather than %q", worktree, got, dir, wantDir)
 		// Cleaning is what a traversal would survive: a name that reduces to
 		// something else is one that reached the directory above by another road.
-		if filepath.Clean(got) != got {
-			t.Fatalf("logPath(%q) = %q, which cleans to %q", worktree, got, filepath.Clean(got))
-		}
-		if again := m.logPath(worktree); again != got {
-			t.Fatalf("logPath(%q) = %q, then %q: the same worktree logs to two files", worktree, got, again)
-		}
+		require.Equalf(t, got, filepath.Clean(got), "logPath(%q) = %q, which cleans to %q", worktree, got, filepath.Clean(got))
+		again := m.logPath(worktree)
+		require.Equalf(t, got, again, "logPath(%q) = %q, then %q: the same worktree logs to two files", worktree, got, again)
 	})
 }
 
@@ -125,16 +120,12 @@ func FuzzCleanRecords(f *testing.F) {
 		}
 
 		got := cleanRecords(records, alive)
-		if offered.Load() != int64(len(records)) {
-			t.Fatalf("alive() saw %d of %d records; one probed twice costs a stranger's gopls a probe, one skipped strands an index", offered.Load(), len(records))
-		}
+		require.Equalf(t, int64(len(records)), offered.Load(), "alive() saw %d of %d records; one probed twice costs a stranger's gopls a probe, one skipped strands an index", offered.Load(), len(records))
 		// From the predicate, not from alive: calling alive again would count
 		// probes of its own, and the assertion above would then only hold for as
 		// long as nobody moved it below this.
 		want := slices.DeleteFunc(slices.Clone(records), dead)
-		if !slices.Equal(got, want) {
-			t.Fatalf("cleanRecords() = %#v, want %#v in that order", got, want)
-		}
+		require.Truef(t, slices.Equal(got, want), "cleanRecords() = %#v, want %#v in that order", got, want)
 	})
 }
 
@@ -165,15 +156,9 @@ func FuzzReadMap(f *testing.F) {
 			return // a read that failed hands nothing back to act on
 		}
 		for _, r := range records {
-			if r.Worktree == "" {
-				t.Errorf("readMap kept a record with no worktree: %#v", r)
-			}
-			if r.PID <= 0 {
-				t.Errorf("readMap kept pid %d, which kill(2) would aim at a group: %#v", r.PID, r)
-			}
-			if r.Port < firstPort || r.Port > lastPort {
-				t.Errorf("readMap kept port %d, outside %d-%d: %#v", r.Port, firstPort, lastPort, r)
-			}
+			assert.NotEmptyf(t, r.Worktree, "readMap kept a record with no worktree: %#v", r)
+			assert.Greaterf(t, r.PID, 0, "readMap kept pid %d, which kill(2) would aim at a group: %#v", r.PID, r)
+			assert.Truef(t, r.Port >= firstPort && r.Port <= lastPort, "readMap kept port %d, outside %d-%d: %#v", r.Port, firstPort, lastPort, r)
 		}
 
 		// The repair has to converge, because withRecords skips the write only when
@@ -181,25 +166,15 @@ func FuzzReadMap(f *testing.F) {
 		// something this read would drop again, or that still reported damaged after
 		// its own repair, would be rewritten and fsynced under the machine-wide lock
 		// on every ensure for as long as it sits there.
-		if err := writeMap(path, records); err != nil {
-			t.Fatalf("writeMap refused what readMap handed back: %v", err)
-		}
+		require.NoErrorf(t, writeMap(path, records), "writeMap refused what readMap handed back")
 		again, againIntact, err := readMap(path)
-		if err != nil {
-			t.Fatalf("readMap failed on a file it wrote itself: %v", err)
-		}
-		if !slices.Equal(again, records) {
-			t.Fatalf("readMap is not idempotent: %#v, then %#v", records, again)
-		}
-		if !againIntact {
-			t.Fatalf("readMap called its own rewritten file damaged: %#v", again)
-		}
+		require.NoErrorf(t, err, "readMap failed on a file it wrote itself")
+		require.Truef(t, slices.Equal(again, records), "readMap is not idempotent: %#v, then %#v", records, again)
+		require.Truef(t, againIntact, "readMap called its own rewritten file damaged: %#v", again)
 		// Damaged has to mean there is something to repair. The converse is not
 		// claimed: a hand-edited file may order its keys differently from writeMap
 		// and still have lost nothing, so intact does not promise equal bytes.
-		if !intact && string(content) == mustReadString(t, path) {
-			t.Fatalf("readMap called %q damaged, but rewriting it changed nothing", content)
-		}
+		require.Falsef(t, !intact && string(content) == mustReadString(t, path), "readMap called %q damaged, but rewriting it changed nothing", content)
 	})
 }
 
@@ -229,14 +204,10 @@ func FuzzMapRoundTrip(f *testing.F) {
 
 		path := newTestManager(t).mapPath
 		if err := writeMap(path, want); err != nil {
-			if utf8.ValidString(worktree) {
-				t.Fatalf("writeMap refused a representable record: %v", err)
-			}
+			require.Falsef(t, utf8.ValidString(worktree), "writeMap refused a representable record: %v", err)
 			return
 		}
-		if !utf8.ValidString(worktree) {
-			t.Fatalf("writeMap accepted %q, which JSON cannot represent byte for byte", worktree)
-		}
+		require.Truef(t, utf8.ValidString(worktree), "writeMap accepted %q, which JSON cannot represent byte for byte", worktree)
 		wantRecords(t, path, "the map did not round-trip", want...)
 	})
 }
@@ -253,15 +224,11 @@ func FuzzAllocatePort(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, worktree string, taken int) {
 		base := basePort(worktree)
-		if base < firstPort || base > lastPort {
-			t.Fatalf("basePort(%q) = %d, outside %d-%d", worktree, base, firstPort, lastPort)
-		}
-		if again := basePort(worktree); again != base {
-			t.Fatalf("basePort(%q) is not deterministic: %d then %d", worktree, base, again)
-		}
-		if next := nextPort(base); next < firstPort || next > lastPort {
-			t.Fatalf("nextPort(%d) = %d, outside %d-%d", base, next, firstPort, lastPort)
-		}
+		require.Truef(t, base >= firstPort && base <= lastPort, "basePort(%q) = %d, outside %d-%d", worktree, base, firstPort, lastPort)
+		again := basePort(worktree)
+		require.Equalf(t, base, again, "basePort(%q) is not deterministic: %d then %d", worktree, base, again)
+		next := nextPort(base)
+		require.Truef(t, next >= firstPort && next <= lastPort, "nextPort(%d) = %d, outside %d-%d", base, next, firstPort, lastPort)
 
 		// Occupy a prefix of the walk, so allocation has to step past it.
 		occupied := min(max(taken, 0), 64)
@@ -270,15 +237,9 @@ func FuzzAllocatePort(f *testing.F) {
 			records = append(records, record{Worktree: worktree, Port: port, PID: 1})
 		}
 		got, err := allocatePort(worktree, records, func(int) bool { return false })
-		if err != nil {
-			t.Fatalf("allocatePort with %d of %d ports taken: %v", occupied, portCount, err)
-		}
-		if got < firstPort || got > lastPort {
-			t.Fatalf("allocatePort() = %d, outside %d-%d", got, firstPort, lastPort)
-		}
-		if slices.ContainsFunc(records, func(r record) bool { return r.Port == got }) {
-			t.Fatalf("allocatePort() = %d, a port already claimed", got)
-		}
+		require.NoErrorf(t, err, "allocatePort with %d of %d ports taken: %v", occupied, portCount, err)
+		require.Truef(t, got >= firstPort && got <= lastPort, "allocatePort() = %d, outside %d-%d", got, firstPort, lastPort)
+		require.Falsef(t, slices.ContainsFunc(records, func(r record) bool { return r.Port == got }), "allocatePort() = %d, a port already claimed", got)
 	})
 }
 
@@ -307,22 +268,14 @@ func FuzzAllocatePortAroundUnavailable(f *testing.F) {
 		}
 
 		got, err := allocatePort(worktree, nil, unavailable)
-		if err != nil {
-			t.Fatalf("allocatePort() failed with %d of %d ports free: %v", portCount-64, portCount, err)
-		}
-		if unavailable(got) {
-			t.Fatalf("allocatePort() = %d, a port that refuses to bind", got)
-		}
-		if got < firstPort || got > lastPort {
-			t.Fatalf("allocatePort() = %d, outside %d-%d", got, firstPort, lastPort)
-		}
+		require.NoErrorf(t, err, "allocatePort() failed with %d of %d ports free: %v", portCount-64, portCount, err)
+		require.Falsef(t, unavailable(got), "allocatePort() = %d, a port that refuses to bind", got)
+		require.Truef(t, got >= firstPort && got <= lastPort, "allocatePort() = %d, outside %d-%d", got, firstPort, lastPort)
 		// The walk is in order from the base, so the answer is the first port
 		// nothing objects to — anything later means a free port was stepped over
 		// and two worktrees that should differ can collide further along.
 		for port := base; port != got; port = nextPort(port) {
-			if !unavailable(port) {
-				t.Fatalf("allocatePort() = %d (offset %d), skipping free port %d (offset %d)", got, offset(got), port, offset(port))
-			}
+			require.Truef(t, unavailable(port), "allocatePort() = %d (offset %d), skipping free port %d (offset %d)", got, offset(got), port, offset(port))
 		}
 	})
 }
@@ -344,12 +297,9 @@ func FuzzContainingDir(f *testing.F) {
 		got, physical := containingDir(path)
 		// The result is a memo key, so two spellings of one directory must not
 		// become two entries and two git forks.
-		if clean := filepath.Clean(got); clean != got {
-			t.Fatalf("containingDir(%q) = %q, which is not cleaned (%q)", path, got, clean)
-		}
-		if filepath.IsAbs(path) && !filepath.IsAbs(got) {
-			t.Fatalf("containingDir(%q) = %q, relative for an absolute argument", path, got)
-		}
+		clean := filepath.Clean(got)
+		require.Equalf(t, got, clean, "containingDir(%q) = %q, which is not cleaned (%q)", path, got, clean)
+		require.Falsef(t, filepath.IsAbs(path) && !filepath.IsAbs(got), "containingDir(%q) = %q, relative for an absolute argument", path, got)
 		// The second result is handed to gopls verbatim (R10), including the
 		// spelling synthesized from a resolved parent for a file that does not
 		// exist yet — so it has to be a cleaned path of the same kind as the
@@ -357,12 +307,9 @@ func FuzzContainingDir(f *testing.F) {
 		if physical == "" {
 			return
 		}
-		if clean := filepath.Clean(physical); clean != physical {
-			t.Fatalf("containingDir(%q) physical = %q, which is not cleaned (%q)", path, physical, clean)
-		}
-		if filepath.IsAbs(path) && !filepath.IsAbs(physical) {
-			t.Fatalf("containingDir(%q) physical = %q, relative for an absolute argument", path, physical)
-		}
+		cleanPhysical := filepath.Clean(physical)
+		require.Equalf(t, physical, cleanPhysical, "containingDir(%q) physical = %q, which is not cleaned (%q)", path, physical, cleanPhysical)
+		require.Falsef(t, filepath.IsAbs(path) && !filepath.IsAbs(physical), "containingDir(%q) physical = %q, relative for an absolute argument", path, physical)
 	})
 }
 
@@ -385,9 +332,8 @@ func FuzzToolCallWorktrees(f *testing.F) {
 	f.Fuzz(func(t *testing.T, params []byte) {
 		r := newTestRouter(t, testHome)
 		first := r.toolCallWorktrees(r.ctx, params)
-		if again := r.toolCallWorktrees(r.ctx, params); !slices.Equal(first, again) {
-			t.Fatalf("toolCallWorktrees(%s) = %q, then %q from the memo", params, first, again)
-		}
+		again := r.toolCallWorktrees(r.ctx, params)
+		require.Truef(t, slices.Equal(first, again), "toolCallWorktrees(%s) = %q, then %q from the memo", params, first, again)
 	})
 }
 
@@ -425,9 +371,8 @@ func FuzzCancelTarget(f *testing.F) {
 		case 2:
 			want = otherWorktree
 		}
-		if got := r.cancelTarget(params); got != want {
-			t.Fatalf("cancelTarget(%s) = %q, want %q", params, got, want)
-		}
+		got := r.cancelTarget(params)
+		require.Equalf(t, want, got, "cancelTarget(%s) = %q, want %q", params, got, want)
 	})
 }
 
@@ -446,13 +391,9 @@ func FuzzTargetNamesALane(f *testing.F) {
 		got, err := r.target(&jsonrpc.Request{Method: method, Params: params})
 		if err != nil {
 			// The only refusal is a call spanning worktrees, which names them.
-			if got != "" {
-				t.Fatalf("target() refused with %q, want no worktree alongside the error", got)
-			}
+			require.Emptyf(t, got, "target() refused with %q, want no worktree alongside the error", got)
 			return
 		}
-		if got == "" {
-			t.Fatalf("target(%q, %s) = %q with no error: no lane would own it", method, params, got)
-		}
+		require.NotEmptyf(t, got, "target(%q, %s) = %q with no error: no lane would own it", method, params, got)
 	})
 }

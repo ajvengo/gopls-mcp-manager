@@ -3,7 +3,6 @@ package transport
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSSEFrameBoundsAndOwnership(t *testing.T) {
@@ -35,22 +35,14 @@ func TestSSEFrameBoundsAndOwnership(t *testing.T) {
 			budget := &Budget{limit: tc.budget}
 			c := &sseConn{budget: budget, maxBytes: tc.limit}
 			frame, err := c.readFrame(bufio.NewReader(strings.NewReader(tc.input)))
-			if (err != nil) != tc.fails {
-				t.Fatalf("read error = %v, want failure %v", err, tc.fails)
-			}
+			require.Equalf(t, tc.fails, err != nil, "read error = %v, want failure %v", err, tc.fails)
 			if err == nil {
 				_, data, err := parseSSEFrame(frame)
-				if err != nil || string(data) != tc.want {
-					t.Fatalf("data = %q, error %v", data, err)
-				}
-				if budget.used != cap(frame) {
-					t.Fatalf("charged %d, frame capacity %d", budget.used, cap(frame))
-				}
+				require.Truef(t, err == nil && string(data) == tc.want, "data = %q, error %v", data, err)
+				require.Equalf(t, cap(frame), budget.used, "charged %d, frame capacity %d", budget.used, cap(frame))
 				budget.release(cap(frame))
 			}
-			if budget.used != 0 || budget.peak > budget.limit {
-				t.Fatalf("budget after release: %+v", budget)
-			}
+			require.Falsef(t, budget.used != 0 || budget.peak > budget.limit, "budget after release: %+v", budget)
 		})
 	}
 }
@@ -66,19 +58,13 @@ func TestSSEReadAheadAndSlowConsumerClose(t *testing.T) {
 	t.Cleanup(server.Close)
 	budget := &Budget{limit: 4096}
 	conn, err := ConnectSSE(t.Context(), server.URL, 1024, budget)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	msg, err := conn.Read(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	response, ok := msg.(*jsonrpc.Response)
 	wantID, _ := jsonrpc.MakeID(float64(1))
-	if !ok || response.ID != wantID {
-		t.Fatalf("read-ahead response: %v", msg)
-	}
+	require.Truef(t, ok && response.ID == wantID, "read-ahead response: %v", msg)
 	// The second frame is retained by an unbuffered handoff, even though no
 	// consumer is reading. Close must return its charge without needing a Read.
 	deadline := time.Now().Add(time.Second)
@@ -90,13 +76,11 @@ func TestSSEReadAheadAndSlowConsumerClose(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("second frame did not arrive")
+			require.FailNow(t, "second frame did not arrive")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, conn.Close())
 	for {
 		budget.mu.Lock()
 		used := budget.used
@@ -105,7 +89,7 @@ func TestSSEReadAheadAndSlowConsumerClose(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("Close retained frame capacity")
+			require.FailNow(t, "Close retained frame capacity")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -116,9 +100,7 @@ func TestSSEOversizeBeforePost(t *testing.T) {
 	c := &sseConn{maxBytes: 8, done: make(chan struct{})}
 	id, _ := jsonrpc.MakeID("1")
 	err := c.Write(context.Background(), &jsonrpc.Request{ID: id, Method: "too large"})
-	if !errors.Is(err, ErrMessageTooLarge) {
-		t.Fatalf("write: %v", err)
-	}
+	require.ErrorIsf(t, err, ErrMessageTooLarge, "write: %v", err)
 }
 
 func BenchmarkSSEFrameDecode(b *testing.B) {
@@ -130,16 +112,11 @@ func BenchmarkSSEFrameDecode(b *testing.B) {
 			b.SetBytes(int64(len(input)))
 			for b.Loop() {
 				frame, err := c.readFrame(bufio.NewReader(strings.NewReader(input)))
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 				_, data, err := parseSSEFrame(frame)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if _, err := jsonrpc.DecodeMessage(data); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
+				_, err = jsonrpc.DecodeMessage(data)
+				require.NoError(b, err)
 				c.budget.release(cap(frame))
 			}
 		})
@@ -159,33 +136,24 @@ func BenchmarkSSETransportRoundTrip(b *testing.B) {
 			} else {
 				conn, err = ConnectSSE(b.Context(), upstream.URL, 4<<20, &Budget{limit: 64 << 20})
 			}
-			if err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
 			b.Cleanup(func() { _ = conn.Close() })
 			id, _ := jsonrpc.MakeID("1")
-			if err := conn.Write(b.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: []byte(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bench","version":"1"}}`)}); err != nil {
-				b.Fatal(err)
-			}
-			if _, err := conn.Read(b.Context()); err != nil {
-				b.Fatal(err)
-			}
-			if err := conn.Write(b.Context(), &jsonrpc.Request{Method: "notifications/initialized"}); err != nil {
-				b.Fatal(err)
-			}
+			err = conn.Write(b.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: []byte(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bench","version":"1"}}`)})
+			require.NoError(b, err)
+			_, err = conn.Read(b.Context())
+			require.NoError(b, err)
+			err = conn.Write(b.Context(), &jsonrpc.Request{Method: "notifications/initialized"})
+			require.NoError(b, err)
 			request := &jsonrpc.Request{ID: id, Method: "ping"}
 			b.ReportAllocs()
 			for b.Loop() {
-				if err := conn.Write(b.Context(), request); err != nil {
-					b.Fatal(err)
-				}
+				err := conn.Write(b.Context(), request)
+				require.NoError(b, err)
 				msg, err := conn.Read(b.Context())
-				if err != nil {
-					b.Fatal(err)
-				}
-				if response, ok := msg.(*jsonrpc.Response); !ok || response.Error != nil || response.ID != id {
-					b.Fatalf("ping response: %+v", msg)
-				}
+				require.NoError(b, err)
+				response, ok := msg.(*jsonrpc.Response)
+				require.Truef(b, ok && response.Error == nil && response.ID == id, "ping response: %+v", msg)
 			}
 		})
 	}

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"testing"
 	"testing/synctest"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // A lane not running yet makes queue admission independent of scheduling.
@@ -89,9 +90,8 @@ func TestCancellationBypassesFullDeliveryQueue(t *testing.T) {
 		r.track(mustID(t, "sent"), upstream, testHome)
 		go l.runControls()
 		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"sent"}`)})
-		if _, err := recvRequest(upstream.writes, "notifications/cancelled"); err != nil {
-			t.Fatal(err)
-		}
+		_, err := recvRequest(upstream.writes, "notifications/cancelled")
+		require.NoError(t, err)
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "sent"), "cancellation did not complete locally"), -32800)
 		wantClientQuiet(t, r, "cancellation replied twice")
 	})
@@ -161,7 +161,7 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		synctest.Wait()
 		select {
 		case <-cancelled:
-			t.Fatal("cancellation overtook its call's write")
+			require.FailNow(t, "cancellation overtook its call's write")
 		default:
 		}
 		close(release)
@@ -178,13 +178,10 @@ func TestSymlinkedDirectorySharesMemoForExistingAndMissingFiles(t *testing.T) {
 	mustWriteFile(t, filepath.Join(linked, "existing.go"), "package example\n")
 	r := newTestRouter(t, root)
 	for _, path := range []string{filepath.Join(alias, "existing.go"), filepath.Join(alias, "missing.go"), linked} {
-		if got := r.worktreeOf(r.ctx, path); got != linked {
-			t.Fatalf("worktreeOf(%q) = %q, want %q", path, got, linked)
-		}
+		got := r.worktreeOf(r.ctx, path)
+		require.Equalf(t, linked, got, "worktreeOf(%q) = %q, want %q", path, got, linked)
 	}
-	if len(r.worktrees) != 1 {
-		t.Fatalf("same physical directory paid for %d git lookups", len(r.worktrees))
-	}
+	require.Lenf(t, r.worktrees, 1, "same physical directory paid for %d git lookups", len(r.worktrees))
 }
 
 // The spelling that leaves this manager has to be the physical one: gopls
@@ -250,27 +247,17 @@ func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
 
 			got, rewritten := r.canonicalToolCall(params)
 			if test.want == "" {
-				if rewritten {
-					t.Fatalf("canonicalToolCall(%s) rewrote to %s, want it forwarded untouched", test.arguments, got)
-				}
-				if string(got) != string(params) {
-					t.Fatalf("canonicalToolCall returned %s, want %s", got, params)
-				}
+				require.Falsef(t, rewritten, "canonicalToolCall(%s) rewrote to %s, want it forwarded untouched", test.arguments, got)
+				require.Equalf(t, string(params), string(got), "canonicalToolCall returned %s, want %s", got, params)
 				return
 			}
-			if !rewritten {
-				t.Fatalf("canonicalToolCall(%s) reported no rewrite, want the physical spelling", test.arguments)
-			}
+			require.Truef(t, rewritten, "canonicalToolCall(%s) reported no rewrite, want the physical spelling", test.arguments)
 			var want, have map[string]any
-			if err := json.Unmarshal([]byte(`{"name":"go_symbol_references","arguments":`+test.want+`}`), &want); err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal(got, &have); err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(have, want) {
-				t.Fatalf("canonicalToolCall(%s) = %s, want %s", test.arguments, got, test.want)
-			}
+			err := json.Unmarshal([]byte(`{"name":"go_symbol_references","arguments":`+test.want+`}`), &want)
+			require.NoError(t, err)
+			err = json.Unmarshal(got, &have)
+			require.NoError(t, err)
+			require.Equalf(t, want, have, "canonicalToolCall(%s) = %s, want %s", test.arguments, got, test.want)
 		})
 	}
 }
@@ -300,13 +287,8 @@ func TestDeliveredToolCallCarriesThePhysicalSpelling(t *testing.T) {
 		} `json:"arguments"`
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(call.req.Params, &delivered); err != nil {
-		t.Fatal(err)
-	}
-	if delivered.Arguments.File != physical {
-		t.Errorf("delivered file = %q, want the physical spelling %q", delivered.Arguments.File, physical)
-	}
-	if delivered.Name != "go_symbol_references" || delivered.Arguments.Symbol != "Map.Range" {
-		t.Errorf("delivered call = %s, want the name and unmodelled arguments preserved", call.req.Params)
-	}
+	err := json.Unmarshal(call.req.Params, &delivered)
+	require.NoError(t, err)
+	assert.Equalf(t, physical, delivered.Arguments.File, "delivered file = %q, want the physical spelling %q", delivered.Arguments.File, physical)
+	assert.Truef(t, delivered.Name == "go_symbol_references" && delivered.Arguments.Symbol == "Map.Range", "delivered call = %s, want the name and unmodelled arguments preserved", call.req.Params)
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSweepBoundsConcurrencyAndCancelsBeforeMutation(t *testing.T) {
@@ -48,12 +48,10 @@ func TestSweepBoundsConcurrencyAndCancelsBeforeMutation(t *testing.T) {
 		mustRecv(t, entered, "probe worker did not start")
 	}
 	cancel()
-	if err := mustRecv(t, done, "cancelled sweep did not stop"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("sweep error = %v, want cancellation", err)
-	}
-	if got := peak.Load(); got != 8 {
-		t.Fatalf("peak probes = %d, want 8", got)
-	}
+	err := mustRecv(t, done, "cancelled sweep did not stop")
+	require.ErrorIsf(t, err, context.Canceled, "sweep error = %v, want cancellation", err)
+	got := peak.Load()
+	require.Equalf(t, int32(8), got, "peak probes = %d, want 8", got)
 	wantRecords(t, m.mapPath, "cancelled sweep changed registry", records...)
 }
 
@@ -93,9 +91,7 @@ func TestHTTPBodyBudgetIncludesSlowReaders(t *testing.T) {
 	for range 2 {
 		mustRecv(t, done, "HTTP exchange did not release")
 	}
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("budget overload = %d, want 503", response.Code)
-	}
+	require.Equalf(t, http.StatusServiceUnavailable, response.Code, "budget overload = %d, want 503", response.Code)
 }
 
 func TestHTTPRejectsOversizeAndReleasesReservation(t *testing.T) {
@@ -117,9 +113,7 @@ func TestHTTPRejectsOversizeAndReleasesReservation(t *testing.T) {
 		req.Header.Set("Accept", "application/json, text/event-stream")
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, req)
-		if response.Code != tc.status {
-			t.Fatalf("HTTP status = %d, want %d: %s", response.Code, tc.status, response.Body)
-		}
+		require.Equalf(t, tc.status, response.Code, "HTTP status = %d, want %d: %s", response.Code, tc.status, response.Body)
 	}
 }
 
@@ -128,9 +122,8 @@ func BenchmarkHTTPRoundTrip(b *testing.B) {
 	const body = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"where","arguments":{}}}`
 	b.ReportAllocs()
 	for b.Loop() {
-		if response := postMCP(b, endpoint, body); response.Error != nil {
-			b.Fatal(response.Error)
-		}
+		response := postMCP(b, endpoint, body)
+		require.NoError(b, response.Error)
 	}
 }
 
@@ -159,16 +152,12 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 		mustRecv(t, entered, "cold lookup did not start")
 		start := time.Now()
 		var result json.RawMessage
-		if err := b.call(t.Context(), "tools/call", json.RawMessage(`{"arguments":{}}`), &result); err != nil {
-			t.Fatal(err)
-		}
-		if time.Since(start) != 0 {
-			t.Fatal("warm HTTP call waited for the cold lookup budget")
-		}
+		require.NoError(t, b.call(t.Context(), "tools/call", json.RawMessage(`{"arguments":{}}`), &result))
+		elapsed := time.Since(start)
+		require.Zero(t, elapsed, "warm HTTP call waited for the cold lookup budget")
 		cancel()
-		if err := mustRecv(t, coldDone, "cancelled cold call did not finish"); !errors.Is(err, context.Canceled) {
-			t.Fatalf("cold error = %v", err)
-		}
+		err := mustRecv(t, coldDone, "cancelled cold call did not finish")
+		require.ErrorIsf(t, err, context.Canceled, "cold error = %v", err)
 	})
 }
 
@@ -178,19 +167,13 @@ func TestMemoExpiryRevalidatesRetargetedSymlink(t *testing.T) {
 	alias := symlinkAt(t, root)
 	r := newTestRouter(t, root)
 	path := filepath.Join(alias, "missing.go")
-	if got := r.worktreeOf(r.ctx, path); got != root {
-		t.Fatalf("initial target = %s, want %s", got, root)
-	}
-	if err := os.Remove(alias); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(linked, alias); err != nil {
-		t.Fatal(err)
-	}
+	got := r.worktreeOf(r.ctx, path)
+	require.Equalf(t, root, got, "initial target = %s, want %s", got, root)
+	require.NoError(t, os.Remove(alias))
+	require.NoError(t, os.Symlink(linked, alias))
 	r.memo.expires = time.Now().Add(-time.Second)
-	if got := r.worktreeOf(r.ctx, path); got != linked {
-		t.Fatalf("expired target = %s, want %s", got, linked)
-	}
+	got = r.worktreeOf(r.ctx, path)
+	require.Equalf(t, linked, got, "expired target = %s, want %s", got, linked)
 }
 
 func TestMemoEpochExpiresBothLevels(t *testing.T) {
@@ -201,18 +184,12 @@ func TestMemoEpochExpiresBothLevels(t *testing.T) {
 		r.paths["/old/file.go"] = pathMemo{worktree: testWorktree}
 		r.worktrees["/old"] = testWorktree
 		_, hit := r.cachedWorktrees(fileCallParams("/old/file.go"))
-		if !hit {
-			t.Fatal("seeded memo missed")
-		}
+		require.True(t, hit, "seeded memo missed")
 		time.Sleep(time.Second)
 		_, hit = r.cachedWorktrees(fileCallParams("/old/file.go"))
 		usage := r.requestUsage()
-		if hit || usage.Paths != 0 || usage.Directories != 0 || usage.MemoExpirations != 1 {
-			t.Fatalf("expired memo retained state: hit=%v usage=%+v", hit, usage)
-		}
-		if usage.MemoHits != 1 || usage.MemoMisses != 1 {
-			t.Fatalf("memo observations = %+v", usage)
-		}
+		require.Truef(t, !hit && usage.Paths == 0 && usage.Directories == 0 && usage.MemoExpirations == 1, "expired memo retained state: hit=%v usage=%+v", hit, usage)
+		require.Truef(t, usage.MemoHits == 1 && usage.MemoMisses == 1, "memo observations = %+v", usage)
 	})
 }
 
@@ -222,13 +199,9 @@ func TestMemoRefreshAtCapacityDoesNotEvict(t *testing.T) {
 	r.limits.CacheEntries = 1
 	memoize(r, r.paths, "/a", pathMemo{worktree: testHome})
 	memoize(r, r.paths, "/a", pathMemo{worktree: testWorktree})
-	if r.memo.rollovers != 0 || r.paths["/a"].worktree != testWorktree {
-		t.Fatal("updating an existing key rolled the memo over")
-	}
+	require.Truef(t, r.memo.rollovers == 0 && r.paths["/a"].worktree == testWorktree, "updating an existing key rolled the memo over")
 	memoize(r, r.paths, "/b", pathMemo{worktree: testHome})
-	if r.memo.rollovers != 1 || len(r.paths) != 1 {
-		t.Fatal("new key did not enforce capacity")
-	}
+	require.Truef(t, r.memo.rollovers == 1 && len(r.paths) == 1, "new key did not enforce capacity")
 }
 
 func TestLaneChurnRemainsAtRetentionCeiling(t *testing.T) {
@@ -247,13 +220,9 @@ func TestLaneChurnRemainsAtRetentionCeiling(t *testing.T) {
 			r.route(&jsonrpc.Request{ID: mustID(t, float64(i)), Method: "tools/call", Params: fileCallParams(file)})
 			msg := mustRecv(t, r.out, "churn request did not finish")
 			response, ok := msg.(*jsonrpc.Response)
-			if !ok || (response.Error != nil) != (i >= 4) {
-				t.Fatalf("request %d: %+v", i, msg)
-			}
+			require.Truef(t, ok && (response.Error != nil) == (i >= 4), "request %d: %+v", i, msg)
 		}
 		usage := r.requestUsage()
-		if dials != 4 || usage.Lanes != 4 || usage.Outstanding != 0 || usage.UpstreamOperations != 0 {
-			t.Fatalf("churn escaped bounds: dials=%d usage=%+v", dials, usage)
-		}
+		require.Truef(t, dials == 4 && usage.Lanes == 4 && usage.Outstanding == 0 && usage.UpstreamOperations == 0, "churn escaped bounds: dials=%d usage=%+v", dials, usage)
 	})
 }

@@ -10,13 +10,15 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEnsureCancelledAtLockDoesNotSpawn(t *testing.T) {
 	t.Parallel()
 	m := newTestManager(t)
 	m.start = func(context.Context, string, int) (*childProcess, error) {
-		t.Error("cancelled lock waiter spawned a server")
+		assert.Fail(t, "cancelled lock waiter spawned a server")
 		return nil, errors.New("unexpected spawn")
 	}
 	err := withFileLock(t.Context(), m.mapPath, func() error {
@@ -25,9 +27,7 @@ func TestEnsureCancelledAtLockDoesNotSpawn(t *testing.T) {
 		_, err := m.ensure(ctx, t.TempDir())
 		return err
 	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("lock waiter returned %v, want deadline exceeded", err)
-	}
+	require.ErrorIsf(t, err, context.DeadlineExceeded, "lock waiter returned %v, want deadline exceeded", err)
 	wantRecords(t, m.mapPath, "cancelled waiter wrote a record")
 }
 
@@ -44,12 +44,10 @@ func TestCancelledSweepPreservesRecords(t *testing.T) {
 		return probeGone
 	}
 	_, err := m.withRecords(ctx, func([]record) ([]record, error) {
-		t.Error("cancelled sweep entered the mutation")
+		assert.Fail(t, "cancelled sweep entered the mutation")
 		return nil, nil
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("sweep returned %v, want cancellation", err)
-	}
+	require.ErrorIsf(t, err, context.Canceled, "sweep returned %v, want cancellation", err)
 	wantRecords(t, m.mapPath, "cancelled probe deleted a shared record", r)
 }
 
@@ -66,9 +64,7 @@ func TestCancelledReadinessLeavesAnotherProcessesServerAlone(t *testing.T) {
 		return ctx.Err()
 	}
 	_, err := m.ensure(ctx, r.Worktree)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("readiness returned %v, want cancellation", err)
-	}
+	require.ErrorIsf(t, err, context.Canceled, "readiness returned %v, want cancellation", err)
 	wantRunning(t, cmd, "a waiter killed another process's server")
 	wantRecords(t, m.mapPath, "a waiter forgot another process's server", r)
 }
@@ -79,12 +75,9 @@ func TestReadinessProbeHonoursCancellation(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	err := awaitReady(ctx, silentPort(t))
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("readiness returned %v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(start); elapsed >= time.Second {
-		t.Fatalf("cancelled readiness took %s", elapsed)
-	}
+	require.ErrorIsf(t, err, context.DeadlineExceeded, "readiness returned %v, want deadline exceeded", err)
+	elapsed := time.Since(start)
+	require.Lessf(t, elapsed, time.Second, "cancelled readiness took %s", elapsed)
 }
 
 // PATH is process-wide. The marker ensures SIGTERM is ignored before the
@@ -96,9 +89,8 @@ func TestFailedChildIsReapedBeforeReturn(t *testing.T) {
 			worktree := t.TempDir()
 			bin := t.TempDir()
 			stub := filepath.Join(bin, goplsBinary)
-			if err := os.WriteFile(stub, []byte("#!/bin/sh\ntrap '' TERM\necho ready > ready\nexec sleep 30\n"), 0o700); err != nil {
-				t.Fatal(err)
-			}
+			err := os.WriteFile(stub, []byte("#!/bin/sh\ntrap '' TERM\necho ready > ready\nexec sleep 30\n"), 0o700)
+			require.NoError(t, err)
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			var child *childProcess
 			m.start = func(ctx context.Context, dir string, port int) (*childProcess, error) {
@@ -147,23 +139,20 @@ func TestFailedChildIsReapedBeforeReturn(t *testing.T) {
 				client.reads <- &jsonrpc.Request{ID: mustID(t, "init"), Method: "initialize"}
 				mustRecv(t, waiting, "readiness before session shutdown")
 				cancel()
-				if err := mustRecv(t, done, "session to finish cleanup"); err != nil {
-					t.Fatal(err)
-				}
-			} else if _, err := m.ensure(ctx, worktree); err == nil {
-				t.Fatal("failed child returned a successful ensure")
+				err := mustRecv(t, done, "session to finish cleanup")
+				require.NoError(t, err)
+			} else {
+				_, err := m.ensure(ctx, worktree)
+				require.Error(t, err, "failed child returned a successful ensure")
 			}
-			if child == nil {
-				t.Fatal("failure did not reach the child cleanup path")
-			}
+			require.NotNil(t, child, "failure did not reach the child cleanup path")
 			select {
 			case <-child.done:
 			default:
-				t.Fatal("ensure returned before the child was reaped")
+				require.FailNow(t, "ensure returned before the child was reaped")
 			}
-			if err := child.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
-				t.Fatalf("child is not reaped: %v", err)
-			}
+			err = child.Signal(syscall.Signal(0))
+			require.ErrorIsf(t, err, os.ErrProcessDone, "child is not reaped: %v", err)
 			if failure != "map write" {
 				wantRecords(t, m.mapPath, "failed child was not forgotten")
 			}

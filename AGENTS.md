@@ -22,7 +22,7 @@ Use standard Go formatting with tabs, short lowercase package names, and descrip
 
 ## Testing Guidelines
 
-Use the standard `testing` package and neighboring helpers. Name tests `TestXxx`, benchmarks `BenchmarkXxx`, and fuzz targets `FuzzXxx`. Use `t.Parallel()` where safe; tests changing process-wide environment must stay serial. Use `testing/synctest` for deterministic bridge timing; keep real listeners and child processes outside its bubbles. Add regression coverage for changed behavior. CI requires 85% statement coverage per package and overall using `scripts/check_coverage.py`. Run tests only for affected packages locally; CI runs the full race suite.
+Use the standard `testing` package with testify `require` for fatal checks and `assert` for non-fatal ones, plus neighboring helpers; only `assert` off the test goroutine (stubs, handlers, background goroutines), since `require` calls `FailNow`. Name tests `TestXxx`, benchmarks `BenchmarkXxx`, and fuzz targets `FuzzXxx`. Use `t.Parallel()` where safe; tests changing process-wide environment must stay serial. Use `testing/synctest` for deterministic bridge timing; keep real listeners and child processes outside its bubbles. Add regression coverage for changed behavior. CI requires 85% statement coverage per package and overall using `scripts/check_coverage.py`. Run tests only for affected packages locally; CI runs the full race suite.
 
 ## Commit & Pull Request Guidelines
 
