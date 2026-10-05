@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Opt-in because this starts real gopls processes and requires gopls on PATH.
@@ -21,9 +23,8 @@ import (
 // explicitly reaped; integration runs never touch the user's shared servers.
 func realGoplsFixture(t testing.TB) (*manager, string, string) {
 	t.Helper()
-	if _, err := exec.LookPath(goplsBinary); err != nil {
-		t.Fatal("integration tests require gopls on PATH:", err)
-	}
+	_, err := exec.LookPath(goplsBinary)
+	require.NoError(t, err, "integration tests require gopls on PATH")
 	root, linked := newLinkedWorktree(t)
 	for dir, marker := range map[string]string{root: "RootMarker", linked: "LinkedMarker"} {
 		mustWriteFile(t, filepath.Join(dir, "go.mod"), "module example.com/fixture\n\ngo 1.27\n")
@@ -35,9 +36,7 @@ func realGoplsFixture(t testing.TB) (*manager, string, string) {
 		child, err := m.startGopls(ctx, worktree, port)
 		if err == nil {
 			t.Cleanup(func() {
-				if err := child.stop(); err != nil {
-					t.Errorf("gopls cleanup: %v", err)
-				}
+				assert.NoErrorf(t, child.stop(), "gopls cleanup")
 			})
 		}
 		return child, err
@@ -59,9 +58,7 @@ func TestEndToEndRealGopls(t *testing.T) {
 				b.start()
 				defer b.close()
 				instructions, err := b.initialize(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 				server := httptest.NewServer(newHTTPHandler(b, instructions))
 				defer server.Close()
 				call = func(params json.RawMessage) *jsonrpc.Response {
@@ -81,16 +78,13 @@ func TestEndToEndRealGopls(t *testing.T) {
 				{"unqualified workspace after linked call", `{"name":"go_workspace","arguments":{}}`, wantUnqualifiedWorktree},
 			} {
 				response := call(json.RawMessage(tc.params))
-				if response.Error != nil || strings.Contains(string(response.Result), `"isError":true`) || !strings.Contains(string(response.Result), tc.want) {
-					t.Fatalf("%s: real gopls response to %s = %+v; want %s", tc.name, tc.params, response, tc.want)
-				}
+				ok := response.Error == nil && !strings.Contains(string(response.Result), `"isError":true`) && strings.Contains(string(response.Result), tc.want)
+				require.Truef(t, ok, "%s: real gopls response to %s = %+v; want %s", tc.name, tc.params, response, tc.want)
 			}
 		})
 	}
 	records, _, err := readMap(m.mapPath)
-	if err != nil || len(records) != 2 {
-		t.Fatalf("two frontends must share two worktree servers: records=%+v, error=%v", records, err)
-	}
+	require.Truef(t, err == nil && len(records) == 2, "two frontends must share two worktree servers: records=%+v, error=%v", records, err)
 }
 
 // Measures real gopls tool execution as well as HTTP/SSE routing. Child CPU and
@@ -101,21 +95,17 @@ func BenchmarkRealGoplsRoundTrip(b *testing.B) {
 	backend.start()
 	b.Cleanup(backend.close)
 	instructions, err := backend.initialize(b.Context())
-	if err != nil {
-		b.Fatal(err)
-	}
+	require.NoError(b, err)
 	server := httptest.NewServer(newHTTPHandler(backend, instructions))
 	b.Cleanup(server.Close)
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"go_file_context","arguments":{"file":` + strconv.Quote(filepath.Join(root, "fixture.go")) + `}}}`
 	// Load/index the fixture before timing steady-state tool calls.
-	if response := postMCP(b, server.URL, body); response.Error != nil {
-		b.Fatal(response.Error)
-	}
+	response := postMCP(b, server.URL, body)
+	require.NoError(b, response.Error)
 	b.ReportAllocs()
 	for b.Loop() {
 		response := postMCP(b, server.URL, body)
-		if response.Error != nil || !strings.Contains(string(response.Result), "RootMarker") {
-			b.Fatalf("real gopls tool response: %+v", response)
-		}
+		ok := response.Error == nil && strings.Contains(string(response.Result), "RootMarker")
+		require.Truef(b, ok, "real gopls tool response: %+v", response)
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAdmissionReapsAnsweringDeletedWorktreeBeforeCapacityCheck(t *testing.T) {
@@ -20,25 +22,22 @@ func TestAdmissionReapsAnsweringDeletedWorktreeBeforeCapacityCheck(t *testing.T)
 	go func() { _ = process.Wait(); close(exited) }()
 	stale := record{Worktree: filepath.Join(t.TempDir(), "deleted"), PID: process.Process.Pid, Port: port}
 	mustWriteMap(t, m.mapPath, []record{stale})
-	if verdict := recordAlive(t.Context(), stale); verdict != probeLive {
-		t.Fatalf("regression requires an answering server, got %v", verdict)
-	}
-	if err := m.prepareAdmission(t.Context(), "/new/worktree"); err != nil {
-		t.Fatal(err)
-	}
+	verdict := recordAlive(t.Context(), stale)
+	require.Equalf(t, probeLive, verdict, "regression requires an answering server, got %v", verdict)
+	err := m.prepareAdmission(t.Context(), "/new/worktree")
+	require.NoError(t, err)
 	select {
 	case <-exited:
 	case <-time.After(time.Second):
-		t.Fatal("stale process did not exit")
+		require.FailNow(t, "stale process did not exit")
 	}
 	m.start = func(context.Context, string, int) (*childProcess, error) {
 		return &childProcess{Process: &os.Process{Pid: os.Getpid()}, done: make(chan struct{})}, nil
 	}
 	wanted := t.TempDir()
 	claimed, started, err := m.claimPort(t.Context(), wanted)
-	if err != nil || started == nil || claimed.Worktree != wanted {
-		t.Fatalf("new server denied after stale slot cleanup: %+v %v", claimed, err)
-	}
+	require.Truef(t, err == nil && started != nil && claimed.Worktree == wanted,
+		"new server denied after stale slot cleanup: %+v %v", claimed, err)
 }
 
 func TestMaintenanceReapsUnrequestedRecordsAndStops(t *testing.T) {
@@ -61,19 +60,17 @@ func TestMaintenanceReapsUnrequestedRecordsAndStops(t *testing.T) {
 	select {
 	case <-probed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("idle maintenance never probed the stale server")
+		require.FailNow(t, "idle maintenance never probed the stale server")
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		records, _, err := readMap(m.mapPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		if len(records) == 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("stale record was not removed")
+			require.FailNow(t, "stale record was not removed")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -81,7 +78,7 @@ func TestMaintenanceReapsUnrequestedRecordsAndStops(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("maintenance did not stop on cancellation")
+		require.FailNow(t, "maintenance did not stop on cancellation")
 	}
 }
 
@@ -106,9 +103,8 @@ func TestAdmissionDoesNotWaitForUnrelatedUncertainTermination(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
-			if err := m.prepareAdmission(ctx, wanted); err != nil {
-				t.Fatal(err)
-			}
+			err := m.prepareAdmission(ctx, wanted)
+			require.NoError(t, err)
 		})
 	}
 }

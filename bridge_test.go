@@ -18,6 +18,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type fakeConn struct {
@@ -194,7 +196,7 @@ func fixedDial(r *router, conn mcp.Connection) {
 func forbidDial(t *testing.T, r *router, whatWouldBeWrong string) {
 	t.Helper()
 	r.dial = func(context.Context, string) (mcp.Connection, error) {
-		t.Error(whatWouldBeWrong)
+		assert.Fail(t, whatWouldBeWrong)
 		return nil, io.EOF
 	}
 }
@@ -224,9 +226,7 @@ func startClient(t *testing.T, r *router, depth int) chan<- jsonrpc.Message {
 // real file for git or EvalSymlinks to walk.
 func mustWriteFile(tb testing.TB, path, content string) {
 	tb.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, os.WriteFile(path, []byte(content), 0o600))
 }
 
 // bubble runs fn under synctest's clock, which only moves once every goroutine
@@ -286,9 +286,7 @@ func recvRequest(ch <-chan jsonrpc.Message, method string) (*jsonrpc.Request, er
 func mustRecv[T any](t *testing.T, ch <-chan T, wanted string) T {
 	t.Helper()
 	v, err := recvWithin(ch, wanted)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return v
 }
 
@@ -314,13 +312,9 @@ func upstreamPair(t *testing.T) (upstream, gopls mcp.Connection) {
 	t.Helper()
 	upstreamT, goplsT := mcp.NewInMemoryTransports()
 	upstream, err := upstreamT.Connect(t.Context())
-	if err != nil {
-		t.Fatalf("connect upstream: %v", err)
-	}
+	require.NoErrorf(t, err, "connect upstream: %v", err)
 	gopls, err = goplsT.Connect(t.Context())
-	if err != nil {
-		t.Fatalf("connect gopls: %v", err)
-	}
+	require.NoErrorf(t, err, "connect gopls: %v", err)
 	// Closed, not merely abandoned: each of these runs a decode pump of its own
 	// that no context cancels, and a bubble does not end while one is still
 	// parked on its half of the pipe.
@@ -342,7 +336,7 @@ func wantClientQuiet(t *testing.T, r *router, whatWouldBeWrong string) {
 	synctest.Wait()
 	select {
 	case msg := <-r.out:
-		t.Fatalf("%s: %v", whatWouldBeWrong, msg)
+		require.FailNow(t, fmt.Sprintf("%s: %v", whatWouldBeWrong, msg))
 	default:
 	}
 }
@@ -358,18 +352,12 @@ func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong st
 	select {
 	case msg := <-r.out:
 		resp, ok := msg.(*jsonrpc.Response)
-		if !ok {
-			t.Fatalf("client got %T, want an error *jsonrpc.Response", msg)
-		}
-		if resp.ID != id {
-			t.Errorf("failed id = %v, want the call %v", resp.ID, id)
-		}
-		if resp.Error == nil {
-			t.Errorf("call %v was answered without an error", id)
-		}
+		require.Truef(t, ok, "client got %T, want an error *jsonrpc.Response", msg)
+		assert.Equalf(t, id, resp.ID, "failed id = %v, want the call %v", resp.ID, id)
+		assert.NotNilf(t, resp.Error, "call %v was answered without an error", id)
 		return resp
 	default:
-		t.Fatal(whatWouldBeWrong)
+		require.FailNow(t, whatWouldBeWrong)
 		return nil
 	}
 }
@@ -379,9 +367,7 @@ func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong st
 func wantResponse(t testing.TB, msg jsonrpc.Message, id jsonrpc.ID) *jsonrpc.Response {
 	t.Helper()
 	resp, ok := msg.(*jsonrpc.Response)
-	if !ok || resp.ID != id {
-		t.Fatalf("upstream got %#v, want a response to %v", msg, id)
-	}
+	require.Truef(t, ok && resp.ID == id, "upstream got %#v, want a response to %v", msg, id)
 	return resp
 }
 
@@ -390,9 +376,8 @@ func wantResponse(t testing.TB, msg jsonrpc.Message, id jsonrpc.ID) *jsonrpc.Res
 func wantWireError(t *testing.T, resp *jsonrpc.Response, code int64) *jsonrpc.Error {
 	t.Helper()
 	var wire *jsonrpc.Error
-	if !errors.As(resp.Error, &wire) || wire.Code != code {
-		t.Fatalf("error = %v, want one with code %d", resp.Error, code)
-	}
+	ok := errors.As(resp.Error, &wire)
+	require.Truef(t, ok && wire.Code == code, "error = %v, want one with code %d", resp.Error, code)
 	return wire
 }
 
@@ -404,12 +389,9 @@ func wantWireError(t *testing.T, resp *jsonrpc.Response, code int64) *jsonrpc.Er
 func wantOneRoot(t *testing.T, resp *jsonrpc.Response) *mcp.Root {
 	t.Helper()
 	var got mcp.ListRootsResult
-	if err := json.Unmarshal(resp.Result, &got); err != nil {
-		t.Fatalf("unmarshal roots answer %s: %v", resp.Result, err)
-	}
-	if len(got.Roots) != 1 {
-		t.Fatalf("got %d roots, want exactly the upstream's own: %#v", len(got.Roots), got.Roots)
-	}
+	err := json.Unmarshal(resp.Result, &got)
+	require.NoErrorf(t, err, "unmarshal roots answer %s: %v", resp.Result, err)
+	require.Lenf(t, got.Roots, 1, "got %d roots, want exactly the upstream's own: %#v", len(got.Roots), got.Roots)
 	return got.Roots[0]
 }
 
@@ -419,9 +401,7 @@ func wantOneRoot(t *testing.T, resp *jsonrpc.Response) *mcp.Root {
 func mustID(tb testing.TB, raw any) jsonrpc.ID {
 	tb.Helper()
 	id, err := jsonrpc.MakeID(raw)
-	if err != nil {
-		tb.Fatalf("MakeID(%v): %v", raw, err)
-	}
+	require.NoErrorf(tb, err, "MakeID(%v): %v", raw, err)
 	return id
 }
 
@@ -493,16 +473,14 @@ func TestRootlessInitializeIsForwardedWithWorkingRoots(t *testing.T) {
 			Params: json.RawMessage(`{"capabilities":{"sampling":{}}}`),
 		}
 		forwarded := mustRecv(t, upstream.writes, "the forwarded initialize").(*jsonrpc.Request)
-		if got, want := string(forwarded.Params), `{"capabilities":{"roots":{},"sampling":{}}}`; got != want {
-			t.Fatalf("forwarded initialize params = %s, want %s", got, want)
-		}
+		got, want := string(forwarded.Params), `{"capabilities":{"roots":{},"sampling":{}}}`
+		require.Equalf(t, want, got, "forwarded initialize params = %s, want %s", got, want)
 
 		rootsID := mustID(t, "roots-after-initialize")
 		upstreamReads <- &jsonrpc.Request{ID: rootsID, Method: "roots/list"}
 		resp := wantResponse(t, mustRecv(t, upstream.writes, "the local roots/list answer"), rootsID)
-		if root := wantOneRoot(t, resp); root.URI != "file:///tmp/home" {
-			t.Fatalf("root uri = %q, want the home tree", root.URI)
-		}
+		root := wantOneRoot(t, resp)
+		require.Equalf(t, "file:///tmp/home", root.URI, "root uri = %q, want the home tree", root.URI)
 	})
 }
 
@@ -535,9 +513,8 @@ func TestAColdWorktreeDoesNotHoldUpAnother(t *testing.T) {
 		}
 		clientReads <- &jsonrpc.Request{ID: mustID(t, "list"), Method: "tools/list"}
 
-		if _, err := recvRequest(warm.writes, "tools/list"); err != nil {
-			t.Fatalf("%v — want the tools/list that followed the cold call, while the cold worktree is still dialling", err)
-		}
+		_, err := recvRequest(warm.writes, "tools/list")
+		require.NoErrorf(t, err, "%v — want the tools/list that followed the cold call, while the cold worktree is still dialling", err)
 	})
 }
 
@@ -551,7 +528,7 @@ func TestHomeUpstreamEOFDoesNotCloseClient(t *testing.T) {
 
 	select {
 	case err := <-r.errs:
-		t.Fatalf("home upstream EOF closed the client: %v", err)
+		require.FailNow(t, fmt.Sprintf("home upstream EOF closed the client: %v", err))
 	default:
 	}
 }
@@ -595,9 +572,7 @@ func TestSendReconnectsAndInitializesRestartedHome(t *testing.T) {
 		t.Cleanup(func() { close(fresh.reads) })
 
 		sendCall(t, l, "call-7")
-		if err := mustRecv(t, done, "the reconnect assertions to finish"); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, mustRecv(t, done, "the reconnect assertions to finish"))
 
 		wantClientQuiet(t, r, "successful reconnect returned an error to the client")
 	})
@@ -625,12 +600,8 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 		// The retry is the whole point: with a reader racing the write for the id,
 		// send() finds the call already answered and this write never comes.
 		got := mustRecv(t, fresh.writes, "the retried initialize on a second connection").(*jsonrpc.Request)
-		if got.ID != id || got.Method != "initialize" {
-			t.Fatalf("retry wrote %#v, want original initialize id %v", got, id)
-		}
-		if dials != 2 {
-			t.Fatalf("dial count = %d, want one retry", dials)
-		}
+		require.Truef(t, got.ID == id && got.Method == "initialize", "retry wrote %#v, want original initialize id %v", got, id)
+		require.Equalf(t, 2, dials, "dial count = %d, want one retry", dials)
 		// Asserted while the retry is still owed, and only then killed: closing the
 		// connection under a call in flight fails that call on purpose, so the other
 		// order races the reader for the verdict and answers a different question.
@@ -658,7 +629,7 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 		wantClientError(t, r, id, "a second initialize was left unanswered")
 		select {
 		case msg := <-held.writes:
-			t.Fatalf("upstream got a second initialize %#v, want nothing written to it", msg)
+			require.FailNow(t, fmt.Sprintf("upstream got a second initialize %#v, want nothing written to it", msg))
 		default:
 		}
 	})
@@ -719,15 +690,12 @@ func TestAWedgedUpstreamFailsItsCallWithinOneBudget(t *testing.T) {
 				// the same nothing — and spent exactly once. The elapsed time is what
 				// says the two attempts shared one deadline rather than getting a full
 				// one each.
-				if elapsed := time.Since(start); elapsed != sendBudget {
-					t.Errorf("gave up after %s, want the whole %s budget spent once", elapsed, sendBudget)
-				}
+				elapsed := time.Since(start)
+				assert.Equalf(t, sendBudget, elapsed, "gave up after %s, want the whole %s budget spent once", elapsed, sendBudget)
 				// The budget is spent, so the retry must not dial again: that costs an
 				// unbounded flock wait to reach a handshake that expires on its first
 				// write.
-				if dials != 1 {
-					t.Errorf("dial count = %d, want no retry once the deadline has passed", dials)
-				}
+				assert.Equalf(t, 1, dials, "dial count = %d, want no retry once the deadline has passed", dials)
 			})
 		})
 	}
@@ -759,18 +727,13 @@ func TestADialContextLivesExactlyAsLongAsItsConnection(t *testing.T) {
 		// Long past the deadline the dial was given, and the connection is still
 		// the lane's: a context carrying that deadline would be done by now.
 		time.Sleep(2 * sendBudget)
-		if err := dialled.Err(); err != nil {
-			t.Errorf("the dialled context is %v after the budget expired, want a context still good for the stream", err)
-		}
+		err := dialled.Err()
+		assert.NoErrorf(t, err, "the dialled context is %v after the budget expired, want a context still good for the stream", err)
 
 		// The close every site that gives a connection up performs, and that
 		// lane.run performs on its way out.
-		if err := l.conn.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if dialled.Err() == nil {
-			t.Error("the dialled context is still live after its connection was closed, want it released with the connection")
-		}
+		require.NoError(t, l.conn.Close())
+		assert.Error(t, dialled.Err(), "the dialled context is still live after its connection was closed, want it released with the connection")
 	})
 }
 
@@ -827,9 +790,7 @@ func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 			Method: "notifications/cancelled",
 			Params: json.RawMessage(`{"requestId":"call-in-flight"}`),
 		})
-		if got != testHome {
-			t.Fatalf("cancelling a call its dead upstream already failed went to %q, want home %q", got, testHome)
-		}
+		require.Equalf(t, testHome, got, "cancelling a call its dead upstream already failed went to %q, want home %q", got, testHome)
 	})
 }
 
@@ -970,12 +931,9 @@ func TestRootsAskedDuringHandshakeIsAnsweredLocally(t *testing.T) {
 			return nil
 		})
 
-		if _, err := newLane(r, testWorktree).upstream(t.Context(), false); err != nil {
-			t.Fatalf("handshake: %v", err)
-		}
-		if err := mustRecv(t, done, "the fake gopls to finish the handshake"); err != nil {
-			t.Fatal(err)
-		}
+		_, err := newLane(r, testWorktree).upstream(t.Context(), false)
+		require.NoErrorf(t, err, "handshake: %v", err)
+		require.NoError(t, mustRecv(t, done, "the fake gopls to finish the handshake"))
 
 		wantClientQuiet(t, r, "roots/list from inside the handshake reached the client")
 	})
@@ -994,20 +952,15 @@ func TestUpstreamRootsAnsweredWithItsOwnWorktree(t *testing.T) {
 		r := newTestRouter(t, testHome)
 		go r.readFromUpstream(upstream, worktree)
 
-		if err := gopls.Write(ctx, &jsonrpc.Request{ID: id, Method: "roots/list"}); err != nil {
-			t.Fatalf("write roots/list: %v", err)
-		}
+		err := gopls.Write(ctx, &jsonrpc.Request{ID: id, Method: "roots/list"})
+		require.NoErrorf(t, err, "write roots/list: %v", err)
 		msg, err := gopls.Read(ctx)
-		if err != nil {
-			t.Fatalf("read reply: %v", err)
-		}
+		require.NoErrorf(t, err, "read reply: %v", err)
 		root := wantOneRoot(t, wantResponse(t, msg, id))
-		if want := "file:///tmp/a%20worktree/wt"; root.URI != want {
-			t.Errorf("root uri = %q, want %q", root.URI, want)
-		}
-		if want := "wt"; root.Name != want {
-			t.Errorf("root name = %q, want %q", root.Name, want)
-		}
+		wantURI := "file:///tmp/a%20worktree/wt"
+		assert.Equalf(t, wantURI, root.URI, "root uri = %q, want %q", root.URI, wantURI)
+		wantName := "wt"
+		assert.Equalf(t, wantName, root.Name, "root name = %q, want %q", root.Name, wantName)
 
 		wantClientQuiet(t, r, "roots/list was forwarded to the client")
 	})
@@ -1032,17 +985,13 @@ func TestWorktreePathResolvesEachPathToItsOwnWorktree(t *testing.T) {
 	}
 	rootNested, linkedNested := filepath.Join(root, "nested"), filepath.Join(linked, "nested")
 	for _, dir := range []string{rootNested, linkedNested} {
-		if err := os.Mkdir(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.Mkdir(dir, 0o700))
 	}
 	// A link pointing into the other worktree: the reduction to a directory is
 	// lexical, so without resolving first the link's own parent is what git
 	// would be asked about, and here the two disagree.
 	link := filepath.Join(root, "link.go")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Symlink(target, link))
 
 	tests := []struct {
 		name string
@@ -1064,17 +1013,11 @@ func TestWorktreePathResolvesEachPathToItsOwnWorktree(t *testing.T) {
 			t.Parallel()
 			got, err := worktreePath(t.Context(), test.path)
 			if test.want == "" {
-				if err == nil {
-					t.Fatalf("worktreePath(%q) = %q, want no answer", test.path, got)
-				}
+				require.Errorf(t, err, "worktreePath(%q) = %q, want no answer", test.path, got)
 				return
 			}
-			if err != nil {
-				t.Fatalf("worktreePath(%q): %v", test.path, err)
-			}
-			if got != test.want {
-				t.Fatalf("worktreePath(%q) = %q, want %q", test.path, got, test.want)
-			}
+			require.NoErrorf(t, err, "worktreePath(%q): %v", test.path, err)
+			require.Equalf(t, test.want, got, "worktreePath(%q) = %q, want %q", test.path, got, test.want)
 		})
 	}
 }
@@ -1116,9 +1059,7 @@ func TestToolCallRoutesToTheWorktreeOwningItsPath(t *testing.T) {
 			t.Parallel()
 			r := newTestRouter(t, testHome)
 			got := r.toolCallWorktrees(r.ctx, json.RawMessage(`{"arguments":`+test.arguments+`}`))
-			if !slices.Equal(got, test.want) {
-				t.Fatalf("toolCallWorktrees(%s) = %q, want %q", test.arguments, got, test.want)
-			}
+			require.Truef(t, slices.Equal(got, test.want), "toolCallWorktrees(%s) = %q, want %q", test.arguments, got, test.want)
 		})
 	}
 }
@@ -1149,18 +1090,12 @@ func TestToolCallSpanningTwoWorktreesIsRefused(t *testing.T) {
 	select {
 	case msg := <-r.out:
 		wire := wantWireError(t, wantResponse(t, msg, id), jsonrpc.CodeInvalidParams)
-		if !strings.Contains(wire.Message, root) || !strings.Contains(wire.Message, linked) {
-			t.Fatalf("error %q names neither worktree, want both", wire.Message)
-		}
+		require.Truef(t, strings.Contains(wire.Message, root) && strings.Contains(wire.Message, linked), "error %q names neither worktree, want both", wire.Message)
 	default:
-		t.Fatal("spanning call was routed instead of refused")
+		require.FailNow(t, "spanning call was routed instead of refused")
 	}
-	if len(r.lanes) != 0 {
-		t.Fatalf("refused call opened %d lane(s), want none", len(r.lanes))
-	}
-	if r.sticky != working {
-		t.Fatalf("sticky = %q after a refused call, want %q left untouched", r.sticky, working)
-	}
+	require.Lenf(t, r.lanes, 0, "refused call opened %d lane(s), want none", len(r.lanes))
+	require.Equalf(t, working, r.sticky, "sticky = %q after a refused call, want %q left untouched", r.sticky, working)
 }
 
 // What worktreeOf answers, and what it costs to answer it: each row queries a
@@ -1234,13 +1169,10 @@ func TestWorktreeOfResolvesAndMemoizes(t *testing.T) {
 			t.Parallel()
 			r := newTestRouter(t, testHome)
 			for i, path := range test.paths {
-				if got := r.worktreeOf(r.ctx, path); got != test.want[i] {
-					t.Fatalf("worktreeOf(%q) = %q, want %q", path, got, test.want[i])
-				}
+				got := r.worktreeOf(r.ctx, path)
+				require.Equalf(t, test.want[i], got, "worktreeOf(%q) = %q, want %q", path, got, test.want[i])
 			}
-			if len(r.worktrees) != test.wantMemo {
-				t.Fatalf("memo holds %d directory entries, want %d: %v", len(r.worktrees), test.wantMemo, r.worktrees)
-			}
+			require.Lenf(t, r.worktrees, test.wantMemo, "memo holds %d directory entries, want %d: %v", len(r.worktrees), test.wantMemo, r.worktrees)
 		})
 	}
 }
@@ -1255,17 +1187,15 @@ func TestTargetFallsBackToTheLastPathBearingCall(t *testing.T) {
 	r := newTestRouter(t, testHome)
 
 	bearing := json.RawMessage(`{"arguments":{"file":"` + filepath.Join(linked, "x.go") + `"}}`)
-	if got, _ := r.target(&jsonrpc.Request{Method: "tools/call", Params: bearing}); got != linked {
-		t.Fatalf("path-bearing tools/call went to %q, want %q", got, linked)
-	}
+	got, _ := r.target(&jsonrpc.Request{Method: "tools/call", Params: bearing})
+	require.Equalf(t, linked, got, "path-bearing tools/call went to %q, want %q", got, linked)
 
 	params := json.RawMessage(`{"arguments":{"query":"Foo"}}`)
-	if got, _ := r.target(&jsonrpc.Request{Method: "tools/call", Params: params}); got != linked {
-		t.Fatalf("path-less tools/call went to %q, want the worktree the call before it named", got)
-	}
-	if got, _ := r.target(&jsonrpc.Request{Method: "tools/list"}); got != r.home {
-		t.Fatalf("non-call request went to %q, want home", got)
-	}
+	got, _ = r.target(&jsonrpc.Request{Method: "tools/call", Params: params})
+	require.Equalf(t, linked, got, "path-less tools/call went to %q, want the worktree the call before it named", got)
+
+	got, _ = r.target(&jsonrpc.Request{Method: "tools/list"})
+	require.Equalf(t, r.home, got, "non-call request went to %q, want home", got)
 }
 
 // A cancellation can arrive while its call is still queued at a lane that has
@@ -1296,9 +1226,7 @@ func TestCancellationFindsACallItsLaneHasNotSentYet(t *testing.T) {
 			Method: "notifications/cancelled",
 			Params: json.RawMessage(`{"requestId":"slow-call"}`),
 		})
-		if got != cold {
-			t.Fatalf("cancellation of a queued call went to %q, want %q", got, cold)
-		}
+		require.Equalf(t, cold, got, "cancellation of a queued call went to %q, want %q", got, cold)
 	})
 }
 
@@ -1362,9 +1290,7 @@ func TestCancellationFollowsTheRequestToItsUpstream(t *testing.T) {
 				Method: "notifications/cancelled",
 				Params: json.RawMessage(`{"requestId":` + test.requestID + `}`),
 			})
-			if got != test.want {
-				t.Fatalf("cancellation of %s went to %q, want %q", test.requestID, got, test.want)
-			}
+			require.Equalf(t, test.want, got, "cancellation of %s went to %q, want %q", test.requestID, got, test.want)
 		})
 	}
 }
@@ -1387,24 +1313,18 @@ func TestCancellationFollowsACallOntoItsRetryConnection(t *testing.T) {
 		id := sendCall(t, l, "call-retried")
 		// The retry is only as good as the connection it landed on, so the call
 		// is read off fresh before the route is asked about.
-		if _, err := recvRequest(fresh.writes, "notifications/initialized"); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := recvRequest(fresh.writes, "tools/call"); err != nil {
-			t.Fatal(err)
-		}
+		_, err := recvRequest(fresh.writes, "notifications/initialized")
+		require.NoError(t, err)
+		_, err = recvRequest(fresh.writes, "tools/call")
+		require.NoError(t, err)
 
 		// Encoded from the type the router decodes into, rather than spelled by
 		// hand: a test that splices the id into JSON itself also assumes it is a
 		// string, and would keep passing if the field were renamed under it.
 		params, err := json.Marshal(mcp.CancelledParams{RequestID: id.Raw()})
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		got, _ := r.target(&jsonrpc.Request{Method: "notifications/cancelled", Params: params})
-		if got != testWorktree {
-			t.Errorf("cancellation of a retried call went to %q, want %q", got, testWorktree)
-		}
+		assert.Equalf(t, testWorktree, got, "cancellation of a retried call went to %q, want %q", got, testWorktree)
 	})
 }
 
@@ -1441,9 +1361,8 @@ func TestServeSwallowsTheEndOfTheClientAndReportsAnythingElse(t *testing.T) {
 			// would hang here rather than answer. The context is the test's own and
 			// is never cancelled — serve derives what it cancels, so a session that
 			// leaned on the caller for that would hang here too.
-			if err := serve(t.Context(), nil, testHome, tc.conn); !errors.Is(err, tc.want) {
-				t.Fatalf("serve() = %v, want %v", err, tc.want)
-			}
+			err := serve(t.Context(), nil, testHome, tc.conn)
+			require.ErrorIsf(t, err, tc.want, "serve() = %v, want %v", err, tc.want)
 		})
 	}
 }
@@ -1467,12 +1386,9 @@ func TestWriteToClientReportsAFailedWriteOnce(t *testing.T) {
 
 	r.writeToClient(conn) // returns, or this test times out
 
-	if err := <-r.errs; !errors.Is(err, io.ErrClosedPipe) {
-		t.Fatalf("writeToClient() reported %v, want the write's own error", err)
-	}
-	if writes != 1 {
-		t.Fatalf("writeToClient() attempted %d writes after the first one failed, want it to stop at 1", writes)
-	}
+	err := <-r.errs
+	require.ErrorIsf(t, err, io.ErrClosedPipe, "writeToClient() reported %v, want the write's own error", err)
+	require.Equalf(t, 1, writes, "writeToClient() attempted %d writes after the first one failed, want it to stop at 1", writes)
 }
 
 // The session ending is the other way out, and it is the ordinary one: serve
@@ -1488,7 +1404,7 @@ func TestWriteToClientStopsWithTheSessionWithoutReportingIt(t *testing.T) {
 
 	select {
 	case err := <-r.errs:
-		t.Fatalf("writeToClient() reported %v for a session that ended normally", err)
+		require.FailNow(t, fmt.Sprintf("writeToClient() reported %v for a session that ended normally", err))
 	default:
 	}
 }
@@ -1508,24 +1424,19 @@ func newLinkedWorktree(t testing.TB) (root, linked string) {
 func symlinkAt(t *testing.T, target string) string {
 	t.Helper()
 	link := filepath.Join(t.TempDir(), "alias")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Symlink(target, link))
 	return link
 }
 
 func mustEvalSymlinks(t testing.TB, path string) string {
 	t.Helper()
 	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return resolved
 }
 
 func runGit(t testing.TB, args ...string) {
 	t.Helper()
-	if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, output)
-	}
+	output, err := exec.Command("git", args...).CombinedOutput()
+	require.NoErrorf(t, err, "git %v: %v\n%s", args, err, output)
 }

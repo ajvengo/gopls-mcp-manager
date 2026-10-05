@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestFromEnvRejectsInvalidSettings(t *testing.T) {
@@ -18,27 +20,24 @@ func TestFromEnvRejectsInvalidSettings(t *testing.T) {
 		for _, value := range []string{"0", "-1", "invalid"} {
 			t.Run(name+"/"+value, func(t *testing.T) {
 				t.Setenv(name, value)
-				if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), name) {
-					t.Fatalf("invalid %s=%s accepted: %v", name, value, err)
-				}
+				_, err := FromEnv()
+				require.Truef(t, err != nil && strings.Contains(err.Error(), name), "invalid %s=%s accepted: %v", name, value, err)
 			})
 		}
 	}
 	for _, value := range []string{"-1s", "invalid"} {
 		t.Run("execution/"+value, func(t *testing.T) {
 			t.Setenv("GOPLS_MANAGER_EXECUTION_TIMEOUT", value)
-			if _, err := FromEnv(); err == nil {
-				t.Fatal("invalid execution timeout accepted")
-			}
+			_, err := FromEnv()
+			require.Error(t, err, "invalid execution timeout accepted")
 		})
 	}
 	for _, name := range []string{"GOPLS_MANAGER_HTTP_BODY_BUDGET", "GOPLS_MANAGER_SSE_BUFFER_BUDGET"} {
 		t.Run(name+"/smaller than message", func(t *testing.T) {
 			t.Setenv("GOPLS_MANAGER_MAX_MESSAGE_BYTES", "100")
 			t.Setenv(name, "99")
-			if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), name) {
-				t.Fatalf("budget smaller than one message accepted: %v", err)
-			}
+			_, err := FromEnv()
+			require.Truef(t, err != nil && strings.Contains(err.Error(), name), "budget smaller than one message accepted: %v", err)
 		})
 	}
 }
@@ -54,16 +53,12 @@ func TestFromEnvOverrides(t *testing.T) {
 	want.PerLane, want.Lanes, want.CacheEntries = 12, 2, 3
 	want.CacheTTL, want.Execution, want.Metrics = time.Minute, 2*time.Minute, true
 	got, err := FromEnv()
-	if err != nil || got != want {
-		t.Fatalf("overrides = %+v, %v; want %+v", got, err, want)
-	}
+	require.Truef(t, err == nil && got == want, "overrides = %+v, %v; want %+v", got, err, want)
 	t.Setenv("GOPLS_MANAGER_EXECUTION_TIMEOUT", "0s")
 	t.Setenv("GOPLS_MANAGER_METRICS", "true")
 	want.Execution, want.Metrics = 0, false
 	got, err = FromEnv()
-	if err != nil || got != want {
-		t.Fatalf("disabled timeout and metrics = %+v, %v; want %+v", got, err, want)
-	}
+	require.Truef(t, err == nil && got == want, "disabled timeout and metrics = %+v, %v; want %+v", got, err, want)
 }
 
 func TestWithDefaults(t *testing.T) {
@@ -84,9 +79,8 @@ func TestWithDefaults(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := tc.in.WithDefaults(); got != tc.want {
-				t.Fatalf("WithDefaults(%+v) = %+v, want %+v", tc.in, got, tc.want)
-			}
+			got := tc.in.WithDefaults()
+			require.Equalf(t, tc.want, got, "WithDefaults(%+v) = %+v, want %+v", tc.in, got, tc.want)
 		})
 	}
 }

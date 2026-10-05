@@ -12,6 +12,8 @@ import (
 	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAbandonedOperationsBoundFurtherDelivery(t *testing.T) {
@@ -32,17 +34,13 @@ func TestAbandonedOperationsBoundFurtherDelivery(t *testing.T) {
 			_ = wantClientError(t, r, id, "call did not finish locally")
 		}
 		usage := r.requestUsage()
-		if delivered != 2 || usage.Outstanding != 0 || usage.UpstreamOperations != 2 || usage.AbandonedOperations != 2 {
-			t.Fatalf("unresolved work escaped bound: writes=%d usage=%+v", delivered, usage)
-		}
+		require.Truef(t, delivered == 2 && usage.Outstanding == 0 && usage.UpstreamOperations == 2 && usage.AbandonedOperations == 2, "unresolved work escaped bound: writes=%d usage=%+v", delivered, usage)
 		go r.readFromUpstream(conn, testHome)
 		conn.reads <- &jsonrpc.Response{ID: mustID(t, "0"), Result: json.RawMessage(`{}`)}
 		synctest.Wait()
 		wantClientQuiet(t, r, "late response completed cancellation twice")
 		_ = sendCall(t, l, "after-result")
-		if delivered != 3 || r.requestUsage().UpstreamOperations != 2 {
-			t.Fatal("terminal result did not release exactly one credit")
-		}
+		require.Truef(t, delivered == 3 && r.requestUsage().UpstreamOperations == 2, "terminal result did not release exactly one credit")
 	})
 }
 
@@ -58,14 +56,13 @@ func TestDisconnectedOperationsDoNotReleaseCredits(t *testing.T) {
 		_ = wantClientError(t, r, id, "disconnect did not fail client")
 		replacement := newFakeConn()
 		replacement.onWrite = func(context.Context, jsonrpc.Message) error {
-			t.Error("replacement bypassed operation cap")
+			assert.Fail(t, "replacement bypassed operation cap")
 			return nil
 		}
 		id = sendCall(t, connectedLane(r, testHome, replacement), "replacement")
 		_ = wantClientError(t, r, id, "operation cap did not reject replacement")
-		if usage := r.requestUsage(); usage.UpstreamOperations != 1 || usage.AbandonedOperations != 1 {
-			t.Fatalf("disconnect lost accounting: %+v", usage)
-		}
+		usage := r.requestUsage()
+		require.Truef(t, usage.UpstreamOperations == 1 && usage.AbandonedOperations == 1, "disconnect lost accounting: %+v", usage)
 	})
 }
 
@@ -80,12 +77,9 @@ func TestExecutionTimeoutQueuesAdvisoryCancellation(t *testing.T) {
 		time.Sleep(time.Second)
 		_ = wantClientError(t, r, id, "execution did not time out")
 		control := mustRecv(t, l.controls, "timeout did not queue cancellation")
-		if control.conn != conn || control.req.Method != "notifications/cancelled" {
-			t.Fatal("timeout cancellation has wrong owner")
-		}
-		if usage := r.requestUsage(); usage.UpstreamOperations != 1 || usage.AbandonedOperations != 1 {
-			t.Fatalf("timeout released unconfirmed work: %+v", usage)
-		}
+		require.Truef(t, control.conn == conn && control.req.Method == "notifications/cancelled", "timeout cancellation has wrong owner")
+		usage := r.requestUsage()
+		require.Truef(t, usage.UpstreamOperations == 1 && usage.AbandonedOperations == 1, "timeout released unconfirmed work: %+v", usage)
 	})
 }
 
@@ -101,13 +95,11 @@ func TestAbandonedIDCannotBeReusedOnItsConnection(t *testing.T) {
 		_ = wantClientError(t, r, id, "cancel did not complete")
 		_ = sendCall(t, l, "same")
 		_ = wantClientError(t, r, id, "unresolved id was reused")
-		if _, claimed := r.finish(id, conn, nil); claimed {
-			t.Fatal("old response claimed a new client")
-		}
+		_, claimed := r.finish(id, conn, nil)
+		require.False(t, claimed, "old response claimed a new client")
 		_ = sendCall(t, l, "same")
-		if usage := r.requestUsage(); usage.UpstreamOperations != 1 || usage.AbandonedOperations != 0 {
-			t.Fatalf("resolved id could not be reused: %+v", usage)
-		}
+		usage := r.requestUsage()
+		require.Truef(t, usage.UpstreamOperations == 1 && usage.AbandonedOperations == 0, "resolved id could not be reused: %+v", usage)
 	})
 }
 
@@ -133,27 +125,22 @@ func TestDeliveryCompletionCannotTouchReusedID(t *testing.T) {
 				var replacement *callState
 				conn.onWrite = func(context.Context, jsonrpc.Message) error {
 					if tc.response {
-						if _, ok := r.finish(id, conn, nil); !ok {
-							t.Fatal("early response had no owner")
-						}
+						_, ok := r.finish(id, conn, nil)
+						require.True(t, ok, "early response had no owner")
 					} else {
 						r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"reused"}`)})
 						_ = wantClientError(t, r, id, "cancelled call did not complete")
 					}
-					if _, err := r.admit(id, nil); err != nil {
-						t.Fatal(err)
-					}
+					_, err := r.admit(id, nil)
+					require.NoError(t, err)
 					replacement = r.awaitingUpstream[id].state
 					return tc.writeErr
 				}
-				if _, err := r.admit(id, nil); err != nil {
-					t.Fatal(err)
-				}
+				_, err := r.admit(id, nil)
+				require.NoError(t, err)
 				connectedLane(r, testHome, conn).send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"}, r.awaitingUpstream[id].state)
 				owner, ok := r.awaitingUpstream[id]
-				if !ok || owner.state != replacement || owner.conn != nil || owner.state.timer != nil {
-					t.Fatalf("old write touched replacement: %+v", owner)
-				}
+				require.Truef(t, ok && owner.state == replacement && owner.conn == nil && owner.state.timer == nil, "old write touched replacement: %+v", owner)
 				wantClientQuiet(t, r, "old write completed replacement")
 			})
 		})
@@ -172,12 +159,13 @@ func TestCancelledQueueEntryCannotClaimReusedID(t *testing.T) {
 		replacement, _ := r.prepare(req)
 		defer replacement.cancel()
 		conn := newFakeConn()
-		conn.onWrite = func(context.Context, jsonrpc.Message) error { t.Error("cancelled queue entry delivered"); return nil }
+		conn.onWrite = func(context.Context, jsonrpc.Message) error {
+			assert.Fail(t, "cancelled queue entry delivered")
+			return nil
+		}
 		connectedLane(r, testHome, conn).send(old.ctx, old.req, old.state)
 		owner, ok := r.awaitingUpstream[id]
-		if !ok || owner.state != replacement.state || replacement.ctx.Err() != nil || owner.conn != nil {
-			t.Fatalf("stale queue entry touched new owner: %+v", owner)
-		}
+		require.Truef(t, ok && owner.state == replacement.state && replacement.ctx.Err() == nil && owner.conn == nil, "stale queue entry touched new owner: %+v", owner)
 		wantClientQuiet(t, r, "stale queue entry failed new request")
 	})
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/require"
 )
 
 // benchRouter is the warm router the routing benchmarks below share.
@@ -20,9 +21,7 @@ func benchRouter(b *testing.B) (*router, string) {
 	b.Helper()
 	dir := b.TempDir()
 	dir, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		b.Fatal(err)
-	}
+	require.NoError(b, err)
 	// Use the same physical spelling for existing and nonexistent fixture files.
 	// Symlink memo consistency is covered separately by the routing tests.
 	file := filepath.Join(dir, "main.go")
@@ -61,9 +60,11 @@ func BenchmarkTargetToolCall(b *testing.B) {
 	r, file := benchRouter(b)
 	req := toolCall(b, fileCallParams(file))
 	b.ReportAllocs()
+	// Checks inside b.Loop stay behind an if: every testify call runs
+	// b.Helper, a stack walk the benchmark would otherwise measure.
 	for b.Loop() {
 		if worktree, _ := r.target(req); worktree == "" {
-			b.Fatal("no worktree")
+			require.FailNow(b, "no worktree")
 		}
 	}
 }
@@ -87,7 +88,7 @@ func BenchmarkCanonicalToolCall(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				if _, rewritten := r.canonicalToolCall(params); rewritten != (bench.physical != "") {
-					b.Fatal("unexpected rewrite")
+					require.FailNow(b, "unexpected rewrite")
 				}
 			}
 		})
@@ -112,7 +113,7 @@ func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if worktree, _ := r.target(req); worktree == "" {
-			b.Fatal("no worktree")
+			require.FailNow(b, "no worktree")
 		}
 	}
 }
@@ -180,7 +181,7 @@ func BenchmarkCallRoundTrip(b *testing.B) {
 		id, _ := jsonrpc.MakeID(i)
 		client <- &jsonrpc.Request{ID: id, Method: "tools/call", Params: params}
 		if resp, ok := (<-sink.writes).(*jsonrpc.Response); !ok || resp.Error != nil {
-			b.Fatalf("call %v was not answered: %#v", i, resp)
+			require.FailNow(b, fmt.Sprintf("call %v was not answered: %#v", i, resp))
 		}
 	}
 }
@@ -203,13 +204,9 @@ func BenchmarkStdioCodec(b *testing.B) {
 	file := filepath.Join(b.TempDir(), "main.go")
 	left, right := mcp.NewInMemoryTransports()
 	writer, err := left.Connect(b.Context())
-	if err != nil {
-		b.Fatal(err)
-	}
+	require.NoError(b, err)
 	reader, err := right.Connect(b.Context())
-	if err != nil {
-		b.Fatal(err)
-	}
+	require.NoError(b, err)
 	req := toolCall(b, fileCallParams(file))
 	go func() {
 		for b.Context().Err() == nil {
@@ -221,7 +218,7 @@ func BenchmarkStdioCodec(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, err := reader.Read(b.Context()); err != nil {
-			b.Fatal(err)
+			require.NoError(b, err)
 		}
 	}
 }
@@ -259,13 +256,11 @@ func BenchmarkWithRecords(b *testing.B) {
 			// Every record answers alive without a syscall: the probes are another
 			// benchmark's subject, and a real one here would drown the file work.
 			m.alive = func(context.Context, record) probeVerdict { return probeLive }
-			if err := writeMap(m.mapPath, records); err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, writeMap(m.mapPath, records))
 			b.ReportAllocs()
 			for b.Loop() {
 				if _, err := m.withRecords(b.Context(), bench.body); err != nil {
-					b.Fatal(err)
+					require.NoError(b, err)
 				}
 			}
 		})
@@ -335,7 +330,7 @@ func BenchmarkWorktreeOfNewPath(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if r.worktreeOf(r.ctx, filepath.Join(dir, fmt.Sprintf("f%d.go", i))) == "" {
-			b.Fatal("no worktree")
+			require.FailNow(b, "no worktree")
 		}
 		i++
 	}

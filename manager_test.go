@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/ajvengo/gopls-mcp-manager/internal/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBasePortIsStableAndInRange(t *testing.T) {
@@ -26,12 +28,9 @@ func TestBasePortIsStableAndInRange(t *testing.T) {
 	const worktree = "/Users/example/src/repository"
 
 	got := basePort(worktree)
-	if got < firstPort || got > lastPort {
-		t.Fatalf("basePort(%q) = %d, outside %d-%d", worktree, got, firstPort, lastPort)
-	}
-	if again := basePort(worktree); again != got {
-		t.Fatalf("basePort(%q) changed from %d to %d", worktree, got, again)
-	}
+	require.Falsef(t, got < firstPort || got > lastPort, "basePort(%q) = %d, outside %d-%d", worktree, got, firstPort, lastPort)
+	again := basePort(worktree)
+	require.Equalf(t, got, again, "basePort(%q) changed from %d to %d", worktree, got, again)
 }
 
 func TestAllocatePortProbesPastMappedAndOccupiedPorts(t *testing.T) {
@@ -42,13 +41,9 @@ func TestAllocatePortProbesPastMappedAndOccupiedPorts(t *testing.T) {
 	unavailable := func(port int) bool { return port == nextPort(start) }
 
 	got, err := allocatePort(worktree, records, unavailable)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	want := nextPort(nextPort(start))
-	if got != want {
-		t.Fatalf("allocatePort() = %d, want %d", got, want)
-	}
+	require.Equalf(t, want, got, "allocatePort() = %d, want %d", got, want)
 }
 
 // Every record must be offered to alive(), which kills what it rejects. A
@@ -69,12 +64,8 @@ func TestCleanRecordsOffersEveryRecordAndDropsOnlyTheDead(t *testing.T) {
 	want := []record{records[0], records[2]}
 
 	got := cleanRecords(records, alive)
-	if offered.Load() != int64(len(records)) {
-		t.Fatalf("alive() saw %d of %d records", offered.Load(), len(records))
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("cleanRecords() = %#v, want %#v", got, want)
-	}
+	require.Equalf(t, int64(len(records)), offered.Load(), "alive() saw %d of %d records", offered.Load(), len(records))
+	require.Truef(t, slices.Equal(got, want), "cleanRecords() = %#v, want %#v", got, want)
 }
 
 // The probes must run at once — see cleanRecords for what that buys. Under the
@@ -94,17 +85,15 @@ func TestCleanRecordsProbesEveryRecordAtOnce(t *testing.T) {
 			time.Sleep(probe)
 			return true
 		})
-		if elapsed := time.Since(start); elapsed != probe {
-			t.Fatalf("%d probes of %s each took %s, want them run at once", len(records), probe, elapsed)
-		}
+		elapsed := time.Since(start)
+		require.Equalf(t, probe, elapsed, "%d probes of %s each took %s, want them run at once", len(records), probe, elapsed)
 	})
 }
 
 func mustWriteMap(t testing.TB, path string, records []record) {
 	t.Helper()
-	if err := writeMap(path, records); err != nil {
-		t.Fatal(err)
-	}
+	err := writeMap(path, records)
+	require.NoError(t, err)
 }
 
 // appendToMap puts text after whatever the map already holds, which is the only
@@ -113,23 +102,17 @@ func mustWriteMap(t testing.TB, path string, records []record) {
 func appendToMap(t *testing.T, path string, text string) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(text); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	_, err = f.WriteString(text)
+	require.NoError(t, err)
+	err = f.Close()
+	require.NoError(t, err)
 }
 
 func mustReadMap(t *testing.T, path string) []record {
 	t.Helper()
 	records, _, err := readMap(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return records
 }
 
@@ -138,9 +121,8 @@ func mustReadMap(t *testing.T, path string) []record {
 // what a call happened to return.
 func wantRecords(t *testing.T, path string, whatWouldBeWrong string, want ...record) {
 	t.Helper()
-	if got := mustReadMap(t, path); !slices.Equal(got, want) {
-		t.Fatalf("%s: records = %#v, want %#v", whatWouldBeWrong, got, want)
-	}
+	got := mustReadMap(t, path)
+	require.Truef(t, slices.Equal(got, want), "%s: records = %#v, want %#v", whatWouldBeWrong, got, want)
 }
 
 // newTestManager returns a manager over a map file of its own. Its limits are
@@ -172,12 +154,8 @@ func TestMapRoundTripEscapesPaths(t *testing.T) {
 	mustWriteMap(t, m.mapPath, want)
 	wantRecords(t, m.mapPath, "the map did not round-trip", want...)
 	info, err := os.Stat(m.mapPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("map permissions = %o, want 600", info.Mode().Perm())
-	}
+	require.NoError(t, err)
+	require.Equalf(t, os.FileMode(0o600), info.Mode().Perm(), "map permissions = %o, want 600", info.Mode().Perm())
 }
 
 // idleAs runs a process whose command line is exactly args, which is what
@@ -188,9 +166,8 @@ func TestMapRoundTripEscapesPaths(t *testing.T) {
 func idleAs(t *testing.T, args ...string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command("sh", append([]string{"-c", "sleep 10; :"}, args...)...)
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
+	err := cmd.Start()
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	return cmd
 }
@@ -208,9 +185,8 @@ func startFakeGopls(t *testing.T, port int) *exec.Cmd {
 // else's process killed outright.
 func wantRunning(t *testing.T, cmd *exec.Cmd, whatWouldBeWrong string) {
 	t.Helper()
-	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Fatalf("%s: %v", whatWouldBeWrong, err)
-	}
+	err := cmd.Process.Signal(syscall.Signal(0))
+	require.NoErrorf(t, err, "%s", whatWouldBeWrong)
 }
 
 // listenInAllocationRange holds a port from inside the range ports are
@@ -233,9 +209,7 @@ func listenInAllocationRange(t testing.TB, worktree string) (net.Listener, int) 
 		listener = held
 		return false
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 	return listener, port
 }
@@ -244,9 +218,7 @@ func listenInAllocationRange(t testing.TB, worktree string) (net.Listener, int) 
 func listenLocal(tb testing.TB) (net.Listener, int) {
 	tb.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatal(err)
-	}
+	require.NoError(tb, err)
 	tb.Cleanup(func() { _ = listener.Close() })
 	return listener, listener.Addr().(*net.TCPAddr).Port
 }
@@ -328,9 +300,8 @@ func silentPort(tb testing.TB) int {
 func deadPort(tb testing.TB) int {
 	tb.Helper()
 	listener, port := listenLocal(tb)
-	if err := listener.Close(); err != nil {
-		tb.Fatal(err)
-	}
+	err := listener.Close()
+	require.NoError(tb, err)
 	return port
 }
 
@@ -359,13 +330,10 @@ func answeringPort(tb testing.TB, status int) (port int, answered func() bool) {
 func wantSignalled(t *testing.T, cmd *exec.Cmd, whatWouldBeWrong string) {
 	t.Helper()
 	err := cmd.Wait()
-	if err == nil {
-		t.Fatal(whatWouldBeWrong)
-	}
+	require.Error(t, err, whatWouldBeWrong)
 	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.Sys().(syscall.WaitStatus).Signal() != syscall.SIGTERM {
-		t.Fatalf("server exited with %v, want SIGTERM", err)
-	}
+	require.Truef(t, errors.As(err, &exit) && exit.Sys().(syscall.WaitStatus).Signal() == syscall.SIGTERM,
+		"server exited with %v, want SIGTERM", err)
 }
 
 // verdict is what must have become of the process holding a record's pid once
@@ -476,9 +444,8 @@ func TestRecordAlive(t *testing.T) {
 			port: refusedPort,
 			proc: func(t *testing.T, port int) *exec.Cmd {
 				cmd := startFakeGopls(t, port)
-				if err := cmd.Process.Kill(); err != nil {
-					t.Fatal(err)
-				}
+				err := cmd.Process.Kill()
+				require.NoError(t, err)
 				_ = cmd.Wait() // reaped, so the pid is gone rather than a zombie
 				return cmd
 			},
@@ -531,15 +498,12 @@ func TestRecordAlive(t *testing.T) {
 			if test.startedAt != nil {
 				r.StartedAt = test.startedAt()
 			}
-			if got := recordAlive(t.Context(), r); (got == probeLive || got == probeUncertain) != test.wantAlive {
-				t.Errorf("recordAlive() = %v, want %v", got, test.wantAlive)
+			got := recordAlive(t.Context(), r)
+			assert.Equalf(t, test.wantAlive, got == probeLive || got == probeUncertain, "recordAlive() = %v, want %v", got, test.wantAlive)
+			if test.want == signalled {
+				assert.Equal(t, probeTerminate, recordAlive(t.Context(), r), "refused owned endpoint was not marked for termination")
 			}
-			if test.want == signalled && recordAlive(t.Context(), r) != probeTerminate {
-				t.Error("refused owned endpoint was not marked for termination")
-			}
-			if answered != nil && !answered() {
-				t.Fatal("the probe never reached the server, so this row's verdict was reached by the wrong route")
-			}
+			require.Truef(t, answered == nil || answered(), "the probe never reached the server, so this row's verdict was reached by the wrong route")
 			switch test.want {
 			case spared:
 				wantRunning(t, cmd, "a server that should have been spared was signalled")
@@ -566,18 +530,12 @@ func TestReadMapSkipsUnparseableLines(t *testing.T) {
 		`{"Worktree":"/repo/bad-port","Port":0,"PID":13}`+"\n")
 
 	got, intact, err := readMap(m.mapPath)
-	if err != nil {
-		t.Fatalf("readMap() failed on a damaged file: %v", err)
-	}
-	if !slices.Equal(got, []record{good}) {
-		t.Fatalf("readMap() = %#v, want just %#v", got, good)
-	}
+	require.NoErrorf(t, err, "readMap() failed on a damaged file")
+	require.Truef(t, slices.Equal(got, []record{good}), "readMap() = %#v, want just %#v", got, good)
 	// The damage is only ever repaired by the next write, and withRecords skips
 	// that write when the records come back unchanged — so a read that dropped
 	// lines and reported the file intact would leave them there for good.
-	if intact {
-		t.Fatal("readMap() called a file it dropped four lines from intact, so nothing would rewrite it")
-	}
+	require.Falsef(t, intact, "readMap() called a file it dropped four lines from intact, so nothing would rewrite it")
 }
 
 // The write is what costs: a temp file, an fsync and a rename inside a lock
@@ -613,21 +571,16 @@ func TestWithRecordsWritesOnlyWhenTheFileWouldChange(t *testing.T) {
 			// Far enough back that the fresh mtime a rename leaves cannot be mistaken
 			// for it, whatever the filesystem's timestamp resolution.
 			stale := time.Now().Add(-time.Hour)
-			if err := os.Chtimes(m.mapPath, stale, stale); err != nil {
-				t.Fatal(err)
-			}
+			err := os.Chtimes(m.mapPath, stale, stale)
+			require.NoError(t, err)
 
-			if _, err := m.withRecords(t.Context(), func(rs []record) ([]record, error) { return rs, nil }); err != nil {
-				t.Fatal(err)
-			}
+			_, err = m.withRecords(t.Context(), func(rs []record) ([]record, error) { return rs, nil })
+			require.NoError(t, err)
 
 			info, err := os.Stat(m.mapPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if written := !info.ModTime().Equal(stale); written != tc.wantWrite {
-				t.Fatalf("withRecords() rewrote the map = %t, want %t", written, tc.wantWrite)
-			}
+			require.NoError(t, err)
+			written := !info.ModTime().Equal(stale)
+			require.Equalf(t, tc.wantWrite, written, "withRecords() rewrote the map = %t, want %t", written, tc.wantWrite)
 			// Either way the file ends up saying the same thing: the row above is
 			// about what it cost to get there, not about what it holds.
 			wantRecords(t, m.mapPath, "the map lost the record it should have kept", kept)
@@ -643,9 +596,8 @@ func stubGopls(t *testing.T) {
 	script := "#!/bin/sh\nsleep 30\n"
 	// Named from the constant the manager spawns and matches on: a stub under any
 	// other name would be invisible to both.
-	if err := os.WriteFile(filepath.Join(dir, goplsBinary), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(filepath.Join(dir, goplsBinary), []byte(script), 0o700)
+	require.NoError(t, err)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
@@ -659,26 +611,18 @@ func TestClaimPortReturnsBeforeItsGoplsIsReady(t *testing.T) {
 
 	start := time.Now()
 	claimed, started, err := m.claimPort(t.Context(), worktree)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if started == nil {
-		t.Fatal("claimPort() started nothing for a worktree the map had no record of")
-	}
+	require.NoError(t, err)
+	require.NotNilf(t, started, "claimPort() started nothing for a worktree the map had no record of")
 	t.Cleanup(func() { _ = started.Signal(syscall.SIGTERM) })
-	if elapsed := time.Since(start); elapsed >= readyTimeout {
-		t.Errorf("claimPort() took %s, want a return long before the %s readiness budget", elapsed, readyTimeout)
-	}
+	elapsed := time.Since(start)
+	assert.Lessf(t, elapsed, readyTimeout, "claimPort() took %s, want a return long before the %s readiness budget", elapsed, readyTimeout)
 
 	// The reservation is what makes releasing the lock safe: it holds the port
 	// and dates the record, so another process's sweep spares the starting gopls.
 	records := mustReadMap(t, m.mapPath)
-	if !slices.Equal(records, []record{claimed}) || claimed.PID != started.Pid {
-		t.Fatalf("records = %#v, want just the claim %#v for pid %d", records, claimed, started.Pid)
-	}
-	if !withinStartGrace(records[0]) {
-		t.Errorf("record stamped %d is outside its own start grace, want one a sweep would spare", records[0].StartedAt)
-	}
+	require.Truef(t, slices.Equal(records, []record{claimed}) && claimed.PID == started.Pid,
+		"records = %#v, want just the claim %#v for pid %d", records, claimed, started.Pid)
+	assert.Truef(t, withinStartGrace(records[0]), "record stamped %d is outside its own start grace, want one a sweep would spare", records[0].StartedAt)
 }
 
 // Several processes reach ensure for one worktree at once — worktree isolation
@@ -702,26 +646,20 @@ func TestConcurrentClaimPortSpawnsOnce(t *testing.T) {
 
 	var starter *childProcess
 	for i := range callers {
-		if errs[i] != nil {
-			t.Fatalf("caller %d: claimPort() = %v", i, errs[i])
-		}
-		if claims[i] != claims[0] {
-			t.Errorf("caller %d claimed %#v, want the one claim %#v they all share", i, claims[i], claims[0])
-		}
+		require.NoErrorf(t, errs[i], "caller %d: claimPort() = %v", i, errs[i])
+		assert.Equalf(t, claims[0], claims[i], "caller %d claimed %#v, want the one claim %#v they all share", i, claims[i], claims[0])
 		if spawned[i] == nil {
 			continue
 		}
 		if starter != nil {
-			t.Errorf("two callers both started a gopls: pids %d and %d", starter.Pid, spawned[i].Pid)
+			assert.Failf(t, "two callers both started a gopls", "pids %d and %d", starter.Pid, spawned[i].Pid)
 			_ = spawned[i].Signal(syscall.SIGTERM)
 			continue
 		}
 		starter = spawned[i]
 		t.Cleanup(func() { _ = starter.Signal(syscall.SIGTERM) })
 	}
-	if starter == nil {
-		t.Fatal("no caller started a gopls, though the map held no record for the worktree")
-	}
+	require.NotNil(t, starter, "no caller started a gopls, though the map held no record for the worktree")
 
 	// The map is the durable claim, and where a lost write or a second spawn
 	// shows even when the returned values happen to agree.
@@ -754,15 +692,10 @@ func TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting(t *testing.T) {
 
 	start := time.Now()
 	got, err := m.ensure(t.Context(), worktree)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != port {
-		t.Fatalf("ensure() = %d, want the recorded port %d", got, port)
-	}
-	if elapsed := time.Since(start); elapsed < binding {
-		t.Errorf("ensure() answered after %s, before the endpoint came up at %s", elapsed, binding)
-	}
+	require.NoError(t, err)
+	require.Equalf(t, port, got, "ensure() = %d, want the recorded port %d", got, port)
+	elapsed := time.Since(start)
+	assert.GreaterOrEqualf(t, elapsed, binding, "ensure() answered after %s, before the endpoint came up at %s", elapsed, binding)
 }
 
 // A gopls this process started and that never became ready is this process's to
@@ -792,20 +725,17 @@ func TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady(t *testing.T)
 		return errors.New("never bound")
 	}
 
-	if port, err := m.ensure(t.Context(), worktree); err == nil {
-		t.Fatalf("ensure() = %d for a gopls that never became ready, want an error", port)
-	}
+	port, err := m.ensure(t.Context(), worktree)
+	require.Errorf(t, err, "ensure() = %d for a gopls that never became ready, want an error", port)
 
-	if pid == 0 {
-		t.Fatal("no record named the worktree while its start was still being waited for")
-	}
+	require.NotZerof(t, pid, "no record named the worktree while its start was still being waited for")
 	// Polled rather than asked once: the signal is delivered synchronously but
 	// the process leaves a zombie behind until startGopls' reaper collects it,
 	// and kill(pid, 0) succeeds against a zombie.
 	deadline := time.Now().Add(5 * time.Second)
 	for syscall.Kill(pid, 0) == nil {
 		if time.Now().After(deadline) {
-			t.Fatalf("pid %d still exists, want the gopls that never served signalled", pid)
+			require.FailNowf(t, "the gopls that never served was not signalled", "pid %d still exists", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -827,9 +757,8 @@ func TestEnsureLeavesAnotherProcessesFailedStartAlone(t *testing.T) {
 	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	m.ready = func(context.Context, int) error { return errors.New("never bound") }
 
-	if port, err := m.ensure(t.Context(), worktree); err == nil {
-		t.Fatalf("ensure() = %d for a gopls that never became ready, want an error", port)
-	}
+	port, err := m.ensure(t.Context(), worktree)
+	require.Errorf(t, err, "ensure() = %d for a gopls that never became ready, want an error", port)
 
 	wantRecords(t, m.mapPath, "ensure dropped a record belonging to another process's start", theirs)
 }
@@ -853,9 +782,8 @@ func TestForgetDropsOnlyTheNamedRecord(t *testing.T) {
 	}
 	mustWriteMap(t, m.mapPath, []record{kept[0], failed, kept[1], kept[2]})
 
-	if err := m.forget(t.Context(), failed); err != nil {
-		t.Fatal(err)
-	}
+	err := m.forget(t.Context(), failed)
+	require.NoError(t, err)
 
 	wantRecords(t, m.mapPath, "forget dropped the wrong records", kept...)
 }
@@ -893,9 +821,8 @@ func TestListReportsAWriterThatStoppedReading(t *testing.T) {
 			mustWriteMap(t, m.mapPath, []record{live})
 			m.alive = func(context.Context, record) probeVerdict { return probeLive }
 
-			if err := m.list(t.Context(), &failingWriter{after: tc.after}); !errors.Is(err, io.ErrClosedPipe) {
-				t.Fatalf("list() = %v for a writer that stopped reading, want its error", err)
-			}
+			err := m.list(t.Context(), &failingWriter{after: tc.after})
+			require.ErrorIsf(t, err, io.ErrClosedPipe, "list() = %v for a writer that stopped reading, want its error", err)
 		})
 	}
 }
@@ -910,12 +837,8 @@ func TestReadMapReportsAFileItCannotRead(t *testing.T) {
 	// to an unreadable file that does not depend on running as an unprivileged
 	// user, since root reads a 0000 file perfectly well.
 	records, intact, err := readMap(t.TempDir())
-	if err == nil {
-		t.Fatalf("readMap() = %#v, intact %v for a path it cannot read, want an error", records, intact)
-	}
-	if intact {
-		t.Fatal("readMap() called a file it could not read intact, which would let the next write skip its repair")
-	}
+	require.Errorf(t, err, "readMap() = %#v, intact %v for a path it cannot read, want an error", records, intact)
+	require.Falsef(t, intact, "readMap() called a file it could not read intact, which would let the next write skip its repair")
 }
 
 // withRecords hands the body's own refusal back rather than writing what it
@@ -930,12 +853,8 @@ func TestWithRecordsWritesNothingWhenTheBodyRefuses(t *testing.T) {
 	refused := errors.New("no port left")
 
 	got, err := m.withRecords(t.Context(), func([]record) ([]record, error) { return nil, refused })
-	if !errors.Is(err, refused) {
-		t.Fatalf("withRecords() = %v, want the body's own error", err)
-	}
-	if got != nil {
-		t.Fatalf("withRecords() = %#v alongside an error, want nothing", got)
-	}
+	require.ErrorIsf(t, err, refused, "withRecords() = %v, want the body's own error", err)
+	require.Nilf(t, got, "withRecords() = %#v alongside an error, want nothing", got)
 	wantRecords(t, m.mapPath, "withRecords wrote what a failed body returned", stored)
 }
 
@@ -953,12 +872,9 @@ func TestListShowsLiveRecordsAndCleansDeadRecords(t *testing.T) {
 		}
 		return probeGone
 	}
-	if err := m.list(t.Context(), &output); err != nil {
-		t.Fatal(err)
-	}
+	err := m.list(t.Context(), &output)
+	require.NoError(t, err)
 	const wantOutput = "PORT\tPID\tWORKTREE\n62001\t11\t/repo/live\n"
-	if output.String() != wantOutput {
-		t.Fatalf("list output = %q, want %q", output.String(), wantOutput)
-	}
+	require.Equalf(t, wantOutput, output.String(), "list output = %q, want %q", output.String(), wantOutput)
 	wantRecords(t, m.mapPath, "list did not persist its sweep", live)
 }

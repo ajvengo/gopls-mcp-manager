@@ -18,6 +18,8 @@ import (
 	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStatusMeasuresWithoutChangingRegistry(t *testing.T) {
@@ -28,51 +30,37 @@ func TestStatusMeasuresWithoutChangingRegistry(t *testing.T) {
 	mustWriteMap(t, m.mapPath, []record{r})
 	appendToMap(t, m.mapPath, "broken record\n")
 	before, err := os.ReadFile(m.mapPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var out bytes.Buffer
-	if err := m.status(t.Context(), &out); err != nil {
-		t.Fatal(err)
-	}
+	err = m.status(t.Context(), &out)
+	require.NoError(t, err)
 	var report struct {
 		RecordedServers int
 		RegistryIntact  bool
 		Servers         []serverUsage
 	}
-	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
-		t.Fatal(err)
-	}
-	if report.RecordedServers != 1 || report.RegistryIntact || len(report.Servers) != 1 {
-		t.Fatalf("bad status: %s", &out)
-	}
+	err = json.Unmarshal(out.Bytes(), &report)
+	require.NoError(t, err)
+	require.Falsef(t, report.RecordedServers != 1 || report.RegistryIntact || len(report.Servers) != 1, "bad status: %s", &out)
 	usage := report.Servers[0]
-	if usage.Identity != "matched" || usage.RSSKiB == nil || *usage.RSSKiB < 0 || usage.ActiveClients != nil {
-		t.Fatalf("bad process accounting: %s", &out)
-	}
+	require.Falsef(t, usage.Identity != "matched" || usage.RSSKiB == nil || *usage.RSSKiB < 0 || usage.ActiveClients != nil, "bad process accounting: %s", &out)
 	after, err := os.ReadFile(m.mapPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("status mutated registry")
-	}
+	require.NoError(t, err)
+	require.Truef(t, bytes.Equal(before, after), "status mutated registry")
 	wantRunning(t, cmd, "status signalled the server")
 }
 
 func BenchmarkRegistryProbeLockTime(b *testing.B) {
 	m := newTestManager(b)
-	if err := writeMap(m.mapPath, testRecords(8)); err != nil {
-		b.Fatal(err)
-	}
+	err := writeMap(m.mapPath, testRecords(8))
+	require.NoError(b, err)
 	m.alive = func(context.Context, record) probeVerdict { time.Sleep(10 * time.Millisecond); return probeLive }
 	var held atomic.Int64
 	m.observe = func(t lockTiming) { held.Add(int64(t.Held)) }
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := m.withRecords(b.Context(), func(rs []record) ([]record, error) { return rs, nil }); err != nil {
-			b.Fatal(err)
-		}
+		_, err := m.withRecords(b.Context(), func(rs []record) ([]record, error) { return rs, nil })
+		require.NoError(b, err)
 	}
 	b.ReportMetric(float64(held.Load())/float64(b.N), "lock-held-ns/op")
 }
@@ -87,41 +75,33 @@ func TestSweepRetainsAProcessIgnoringTermination(t *testing.T) {
 	}
 	cmd := exec.Command("sh", "-c", "trap '' TERM; echo ready; while :; do sleep 1; done", goplsBinary, "mcp", "-listen", mcpAddress(port))
 	out, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	err = cmd.Start()
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
-	if _, err := bufio.NewReader(out).ReadString('\n'); err != nil {
-		t.Fatal(err)
-	}
+	_, err = bufio.NewReader(out).ReadString('\n')
+	require.NoError(t, err)
 	r := record{Worktree: "/repo/ignores-term", PID: cmd.Process.Pid, Port: port}
 	mustWriteMap(t, m.mapPath, []record{r})
 	// Probe verdict is injected to keep the port independent of other tests.
 	m.alive = func(context.Context, record) probeVerdict { return probeTerminate }
-	if err := m.list(t.Context(), io.Discard); err != nil {
-		t.Fatal(err)
-	}
+	err = m.list(t.Context(), io.Discard)
+	require.NoError(t, err)
 	r.Terminating = true
 	wantRecords(t, m.mapPath, "signal lost the process record", r)
 	wantRunning(t, cmd, "helper did not ignore SIGTERM")
 	m.start = func(context.Context, string, int) (*childProcess, error) {
-		t.Error("spawned beside a terminating process")
+		assert.Fail(t, "spawned beside a terminating process")
 		return nil, errors.New("unexpected spawn")
 	}
-	if _, err := m.ensure(t.Context(), r.Worktree); err == nil {
-		t.Fatal("ensure returned a terminating server")
-	}
-	if err := cmd.Process.Kill(); err != nil {
-		t.Fatal(err)
-	}
+	_, err = m.ensure(t.Context(), r.Worktree)
+	require.Error(t, err, "ensure returned a terminating server")
+	err = cmd.Process.Kill()
+	require.NoError(t, err)
 	_ = cmd.Wait()
 	m.alive = recordAlive
-	if err := m.list(t.Context(), io.Discard); err != nil {
-		t.Fatal(err)
-	}
+	err = m.list(t.Context(), io.Discard)
+	require.NoError(t, err)
 	wantRecords(t, m.mapPath, "confirmed exit was not forgotten")
 }
 
@@ -142,9 +122,8 @@ func TestSweepSignalsOnlyAfterPersistingTermination(t *testing.T) {
 		r.Terminating = true
 		wantRecords(t, m.mapPath, "termination was not persisted before signalling", r)
 	}
-	if err := m.list(t.Context(), io.Discard); err != nil {
-		t.Fatal(err)
-	}
+	err := m.list(t.Context(), io.Discard)
+	require.NoError(t, err)
 	wantSignalled(t, cmd, "sweep did not send SIGTERM")
 	wantRecords(t, m.mapPath, "signal alone removed record", r)
 }
@@ -168,12 +147,9 @@ func TestSweepReconcilesOnlyTheProbedIdentity(t *testing.T) {
 			defer cancel()
 			_, err := m.withMap(ctx, func([]record) ([]record, error) { return []record{replacement}, nil })
 			close(release)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := mustRecv(t, done, "reconciled sweep"); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
+			err = mustRecv(t, done, "reconciled sweep")
+			require.NoError(t, err)
 			wantRecords(t, m.mapPath, "stale probe changed replacement", replacement)
 		})
 	}
@@ -217,9 +193,7 @@ func TestExecutionDeadlineCompletesOnce(t *testing.T) {
 		conn.reads <- &jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}
 		synctest.Wait()
 		wantClientQuiet(t, r, "late answer completed an expired call twice")
-		if len(r.awaitingUpstream) != 0 {
-			t.Fatal("expired request retained")
-		}
+		require.Lenf(t, r.awaitingUpstream, 0, "expired request retained")
 	})
 }
 
@@ -234,13 +208,10 @@ func TestExecutionTimeoutDoesNotParkCallbacksBehindOutput(t *testing.T) {
 		r.track(id, newFakeConn(), testHome)
 		r.startExecution(id, r.awaitingUpstream[id].state)
 		time.Sleep(time.Second)
-		if err := mustRecv(t, r.errs, "session failure instead of blocked timer"); err == nil {
-			t.Fatal("missing output failure")
-		}
+		err := mustRecv(t, r.errs, "session failure instead of blocked timer")
+		require.Error(t, err, "missing output failure")
 		synctest.Wait()
-		if len(r.awaitingUpstream) != 0 {
-			t.Fatal("expired call still retained")
-		}
+		require.Lenf(t, r.awaitingUpstream, 0, "expired call still retained")
 	})
 }
 
@@ -259,20 +230,12 @@ func TestRoutingBudgetDoesNotMultiplyOrGrowWorkers(t *testing.T) {
 		for range 2 {
 			start := time.Now()
 			_, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: json.RawMessage(`{"arguments":{"file":"/uncached/file.go"}}`)})
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("routing returned %v", err)
-			}
-			if time.Since(start) != routingBudget {
-				t.Fatal("routing multiplied its budget")
-			}
+			require.ErrorIsf(t, err, context.DeadlineExceeded, "routing returned %v", err)
+			require.Truef(t, time.Since(start) == routingBudget, "routing multiplied its budget")
 		}
-		if calls.Load() != 1 {
-			t.Fatal("stalled resolution grew more workers")
-		}
+		require.Equalf(t, int64(1), calls.Load(), "stalled resolution grew more workers")
 		close(blocked)
 		synctest.Wait()
-		if r.sticky != testWorktree {
-			t.Fatal("expired routing changed sticky state")
-		}
+		require.Equalf(t, testWorktree, r.sticky, "expired routing changed sticky state")
 	})
 }

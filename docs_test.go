@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -32,13 +35,9 @@ func TestDocsNameTestsThatExist(t *testing.T) {
 	declared := make(map[string]bool)
 	rows := make(map[string]bool)
 	testFiles, err := filepath.Glob("*_test.go")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	internalFiles, err := filepath.Glob("internal/*/*_test.go")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	testFiles = append(testFiles, internalFiles...)
 	for _, path := range testFiles {
 		source := mustReadString(t, path)
@@ -57,34 +56,28 @@ func TestDocsNameTestsThatExist(t *testing.T) {
 		prose := spacePattern.ReplaceAllString(mustReadString(t, doc), " ")
 		for _, m := range citedPattern.FindAllStringSubmatch(prose, -1) {
 			citedTests++
-			if !declared[m[1]] {
-				t.Errorf("%s names %s, which no test declares", doc, m[1])
-			}
+			assert.Truef(t, declared[m[1]], "%s names %s, which no test declares", doc, m[1])
 		}
 		for _, citation := range citedRowPattern.FindAllStringSubmatch(prose, -1) {
 			for _, m := range quotedPattern.FindAllStringSubmatch(citation[1], -1) {
 				citedRows++
-				if !rows[m[1]] {
-					t.Errorf("%s names case %q, which no table row declares", doc, m[1])
-				}
+				assert.Truef(t, rows[m[1]], "%s names case %q, which no table row declares", doc, m[1])
 			}
 		}
 	}
 	switch {
 	case len(declared) == 0:
-		t.Fatal("no tests found, so this check would pass on anything")
+		require.FailNow(t, "no tests found, so this check would pass on anything")
 	case citedTests == 0:
-		t.Fatal("no test citation found in the docs, so this check would pass on anything")
+		require.FailNow(t, "no test citation found in the docs, so this check would pass on anything")
 	case citedRows == 0:
-		t.Fatal("no case citation found in the docs, so the case check would pass on anything")
+		require.FailNow(t, "no case citation found in the docs, so the case check would pass on anything")
 	}
 }
 
 func mustReadString(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return string(b)
 }

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWithRootsCapability(t *testing.T) {
@@ -28,9 +30,8 @@ func TestWithRootsCapability(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := string(WithRootsCapability(json.RawMessage(test.in))); got != test.want {
-				t.Errorf("WithRootsCapability(%s) = %s, want %s", test.in, got, test.want)
-			}
+			got := string(WithRootsCapability(json.RawMessage(test.in)))
+			assert.Equalf(t, test.want, got, "WithRootsCapability(%s) = %s, want %s", test.in, got, test.want)
 		})
 	}
 }
@@ -54,9 +55,7 @@ func TestWithPhysicalPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got, changed := WithPhysicalPaths(json.RawMessage(tc.params), tc.file, tc.dir, tc.files)
-			if string(got) != tc.want || changed != tc.changed {
-				t.Fatalf("rewritten = %s, %v; want %s, %v", got, changed, tc.want, tc.changed)
-			}
+			require.Truef(t, string(got) == tc.want && changed == tc.changed, "rewritten = %s, %v; want %s, %v", got, changed, tc.want, tc.changed)
 		})
 	}
 }
@@ -68,9 +67,7 @@ func TestRewriteNestedRejectsInvalidEdit(t *testing.T) {
 		object["bad"] = json.RawMessage(`{`)
 		return true
 	})
-	if changed || !bytes.Equal(got, params) {
-		t.Fatalf("invalid edit escaped: %s, %v", got, changed)
-	}
+	require.Truef(t, !changed && bytes.Equal(got, params), "invalid edit escaped: %s, %v", got, changed)
 }
 
 // The splice is byte-level, so it is asserted through the decoder that reads it.
@@ -89,23 +86,17 @@ func TestWithCompleteResultType(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			result := new(mcp.CallToolResult)
-			if err := json.Unmarshal(WithCompleteResultType(json.RawMessage(test.result)), result); err != nil {
-				t.Fatalf("decoding the spliced %s: %v", test.result, err)
-			}
+			err := json.Unmarshal(WithCompleteResultType(json.RawMessage(test.result)), result)
+			require.NoErrorf(t, err, "decoding the spliced %s: %v", test.result, err)
 			wire, err := json.Marshal(result)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(wire), `"resultType":"`+test.want+`"`) {
-				t.Errorf("WithCompleteResultType(%s) reached the client as %s, want resultType %q", test.result, wire, test.want)
-			}
+			require.NoError(t, err)
+			assert.Truef(t, strings.Contains(string(wire), `"resultType":"`+test.want+`"`), "WithCompleteResultType(%s) reached the client as %s, want resultType %q", test.result, wire, test.want)
 		})
 	}
 	// A message that is not an object is not ours to rewrite.
 	for _, result := range []string{`null`, `[]`, `"text"`, ``} {
-		if got := WithCompleteResultType(json.RawMessage(result)); string(got) != result {
-			t.Errorf("WithCompleteResultType(%s) = %s, want it forwarded untouched", result, got)
-		}
+		got := WithCompleteResultType(json.RawMessage(result))
+		assert.Equalf(t, result, string(got), "WithCompleteResultType(%s) = %s, want it forwarded untouched", result, got)
 	}
 }
 
@@ -130,9 +121,7 @@ func FuzzWithRootsCapability(f *testing.F) {
 		if err := json.Unmarshal(params, &object); err != nil || object == nil {
 			// Nothing it can safely rewrite: it must hand the params back as-is
 			// rather than inventing a shape the client never sent.
-			if !bytes.Equal(got, params) {
-				t.Fatalf("withRootsCapability rewrote params it could not parse:\n got %s\nwant %s", got, params)
-			}
+			require.Truef(t, bytes.Equal(got, params), "withRootsCapability rewrote params it could not parse:\n got %s\nwant %s", got, params)
 			return
 		}
 		if bytes.Equal(got, params) {
@@ -140,17 +129,13 @@ func FuzzWithRootsCapability(f *testing.F) {
 			// object to add roots to, so there is nothing safe to rewrite.
 			return
 		}
-		if !json.Valid(got) {
-			t.Fatalf("WithRootsCapability(%s) = %s, which is not valid JSON", params, got)
-		}
+		require.Truef(t, json.Valid(got), "WithRootsCapability(%s) = %s, which is not valid JSON", params, got)
 		var rewritten map[string]json.RawMessage
-		if err := json.Unmarshal(got, &rewritten); err != nil {
-			t.Fatalf("WithRootsCapability(%s) = %s, no longer an object: %v", params, got, err)
-		}
+		err := json.Unmarshal(got, &rewritten)
+		require.NoErrorf(t, err, "WithRootsCapability(%s) = %s, no longer an object: %v", params, got, err)
 		before := spellingBudget(object, "capabilities")
-		if after := foldCount(rewritten, "capabilities"); after > before {
-			t.Fatalf("WithRootsCapability(%s) = %s: %d keys fold to \"capabilities\", want at most %d", params, got, after, before)
-		}
+		after := foldCount(rewritten, "capabilities")
+		require.Falsef(t, after > before, "WithRootsCapability(%s) = %s: %d keys fold to \"capabilities\", want at most %d", params, got, after, before)
 		// Decoded the way gopls decodes it, rather than through jsonKey: a
 		// jsonKey that picked the wrong key would otherwise send this assertion
 		// looking under the same wrong key and pass.
@@ -159,12 +144,9 @@ func FuzzWithRootsCapability(f *testing.F) {
 				Roots json.RawMessage `json:"roots"`
 			} `json:"capabilities"`
 		}
-		if err := json.Unmarshal(got, &out); err != nil {
-			t.Fatalf("WithRootsCapability(%s) = %s, which gopls could not decode: %v", params, got, err)
-		}
-		if absentJSON(out.Capabilities.Roots) {
-			t.Fatalf("WithRootsCapability(%s) = %s: rewritten, but with no roots capability", params, got)
-		}
+		err = json.Unmarshal(got, &out)
+		require.NoErrorf(t, err, "WithRootsCapability(%s) = %s, which gopls could not decode: %v", params, got, err)
+		require.Falsef(t, absentJSON(out.Capabilities.Roots), "WithRootsCapability(%s) = %s: rewritten, but with no roots capability", params, got)
 	})
 }
 
@@ -190,19 +172,15 @@ func FuzzJSONKey(f *testing.F) {
 			t.Skip() // not an object, so there are no keys to pick between
 		}
 		key := jsonKey(decoded, name)
-		if key != name && !strings.EqualFold(key, name) {
-			t.Fatalf("jsonKey(%s, %q) = %q, a key no decoder would read as %q", object, name, key, name)
-		}
-		if _, present := decoded[key]; !present && key != name {
-			t.Fatalf("jsonKey(%s, %q) = %q, which the object does not have", object, name, key)
-		}
+		require.Falsef(t, key != name && !strings.EqualFold(key, name), "jsonKey(%s, %q) = %q, a key no decoder would read as %q", object, name, key, name)
+		_, present := decoded[key]
+		require.Falsef(t, !present && key != name, "jsonKey(%s, %q) = %q, which the object does not have", object, name, key)
 		// The property the caller needs: writing under the key it hands back
 		// never leaves the object with more spellings of name than it had.
 		before := spellingBudget(decoded, name)
 		decoded[key] = json.RawMessage(`{}`)
-		if after := foldCount(decoded, name); after > before {
-			t.Fatalf("writing under jsonKey(%s, %q) = %q left %d keys folding to it, want at most %d", object, name, key, after, before)
-		}
+		after := foldCount(decoded, name)
+		require.Falsef(t, after > before, "writing under jsonKey(%s, %q) = %q left %d keys folding to it, want at most %d", object, name, key, after, before)
 	})
 }
 
