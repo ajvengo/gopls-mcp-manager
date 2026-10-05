@@ -174,6 +174,7 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 | GOPLS_MANAGER_HTTP_BODY_BUDGET | 67108864 | Maximum reserved HTTP request-body bytes; must hold at least one maximum-size message |
 | GOPLS_MANAGER_SSE_BUFFER_BUDGET | 67108864 | Shared live SSE frame capacity, including replacement buffers during growth; at least one maximum-size message |
 | GOPLS_MANAGER_LOG_TRIM_BYTES | 67108864 | `trim-logs` clears files larger than this; no automatic trimming |
+| GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | lsof rows of all recorded gopls together; maintenance evicts the least frequently used servers above it |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
 
@@ -216,9 +217,35 @@ version with the same ceiling. Older binaries, unrecorded servers and differing
 settings can bypass the policy. The ceiling bounds cooperating recorded spawns,
 not RSS. Existing records remain reusable even above a lowered ceiling.
 
-There is no automatic lane or process eviction. [LEASES.md](LEASES.md) describes cross-client
-attachment and operation ownership, fencing, and the evidence required before
-introducing automatic reclamation. SPEC.md contains the behavioral contract.
+### Open-file budget
+
+On macOS a gopls holds one descriptor per file and directory in its worktree:
+`gopls mcp` hard-codes an fsnotify watcher over the roots it is given, and
+fsnotify's kqueue backend opens every entry of every watched directory — `.md`,
+`.py` and `.yaml` included. A manager cannot change that without hiding new
+files from gopls, so it bounds how many trees are watched at once instead.
+
+Every maintenance sweep (startup, then every 30 s in each bridge/HTTP manager)
+counts the lsof rows of every recorded gopls. While the total exceeds
+GOPLS_MANAGER_MAX_OPEN_FILES, it terminates servers in least-frequently-used
+order through the usual identity-checked termination path. Each manager adds its
+delivered `tools/call` count to the shared record (`Uses`, `UsedAt`), and the count
+halves every hour, so every manager ranks servers the same way. Servers younger
+than five minutes, and terminating ones, are never chosen, though they still count
+toward the total. Neither is a server with a pending upstream call that started
+less than 30 s ago, in any manager. Each manager mirrors its pending operations
+into `~/.local/share/gopls-mcp-pending/<pid>`, and the sweep checks the set
+again just before the termination verdict. Older pending calls do not protect a
+server, since a lost connection never resolves its call. An evicted worktree
+restarts on its next call, which pays a cold index. A call that arrives between
+that final check and SIGTERM, or one pending for more than 30 s, fails like a
+call on a dying gopls. If lsof is missing or fails, the budget is skipped for that
+sweep. `status` reports per-server and total `OpenFiles`. The budget is checked
+between sweeps, not enforced on every spawn, and gopls' telemetry child is not counted.
+
+Lanes are not evicted. [LEASES.md](LEASES.md) describes cross-client attachment
+and operation ownership, which would let eviction spare servers with work in
+flight. SPEC.md contains the behavioral contract.
 
 ## State on disk
 

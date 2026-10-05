@@ -25,6 +25,11 @@ type record struct {
 	// behaviour those records already had.
 	StartedAt   int64
 	Terminating bool `json:",omitempty"`
+	// Uses is the server's tools/call count, halved every useHalfLife, as of
+	// UsedAt in unix seconds; see frequency. Shared through the map so every
+	// manager evicts by the same ranking.
+	Uses   float64 `json:",omitempty"`
+	UsedAt int64   `json:",omitempty"`
 }
 
 // keepRecords is the body that changes nothing: withRecords sweeps whatever the

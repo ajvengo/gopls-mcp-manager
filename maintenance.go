@@ -4,16 +4,31 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"syscall"
 	"time"
 )
 
+// sweepMaintenance reaps servers whose worktree is gone and evicts those over
+// the open-file budget. Both reach a signal only through identityVerdict and
+// withRecords' persisted termination, like any other condemned record.
 func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
+	victims, err := m.evictionVictims(ctx)
+	if err != nil {
+		return nil, err
+	}
 	maintenance := *m
 	maintenance.alive = func(ctx context.Context, r record) probeVerdict {
 		verdict := m.alive(ctx, r)
 		if verdict != probeLive || withinStartGrace(r) {
 			return verdict
+		}
+		// Asked again just before the verdict: a call may have reached this
+		// server since the victims were picked.
+		if slices.Contains(victims, r) {
+			if busy, err := m.busyWorktrees(time.Now()); err == nil && !busy[r.Worktree] {
+				return identityVerdict(ctx, r)
+			}
 		}
 		info, err := os.Stat(r.Worktree)
 		if err == nil && info.IsDir() {

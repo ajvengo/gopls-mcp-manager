@@ -43,6 +43,7 @@ func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connec
 	}
 	r.operations[key] = operation{worktree: worktree}
 	r.operationsPerWorktree[worktree]++
+	r.m.beginPending(key, worktree)
 	owner.conn, owner.cancel, owner.placed = conn, cancel, placed
 	r.awaitingUpstream[id] = owner
 	return nil
@@ -54,6 +55,7 @@ func (r *router) endOperationLocked(key operationKey) {
 	if op, ok := r.operations[key]; ok {
 		delete(r.operations, key)
 		release(r.operationsPerWorktree, op.worktree)
+		r.m.endPending(key)
 	}
 }
 

@@ -17,6 +17,9 @@ type Limits struct {
 	MessageBytes, HTTPBytes, SSEBytes int
 	SharedServers                     int
 	LogBytes                          int
+	// OpenFiles caps the lsof rows of every recorded gopls together; the
+	// command's budget.go says why that count grows with the worktree.
+	OpenFiles int
 	// Metrics is GOPLS_MANAGER_METRICS, kept here so the one env var that is
 	// not a limit is still read in the one place that reads the environment.
 	Metrics bool
@@ -40,7 +43,7 @@ func (l Limits) WithDefaults() Limits {
 		{&l.Lanes, &d.Lanes}, {&l.CacheEntries, &d.CacheEntries},
 		{&l.MessageBytes, &d.MessageBytes}, {&l.HTTPBytes, &d.HTTPBytes},
 		{&l.SSEBytes, &d.SSEBytes}, {&l.SharedServers, &d.SharedServers},
-		{&l.LogBytes, &d.LogBytes},
+		{&l.LogBytes, &d.LogBytes}, {&l.OpenFiles, &d.OpenFiles},
 	} {
 		if *field.target <= 0 {
 			*field.target = *field.fallback
@@ -55,7 +58,8 @@ func (l Limits) WithDefaults() Limits {
 // Default returns an independent value containing the shipped limits.
 func Default() Limits {
 	return Limits{PerLane: 128, Session: 1024, Lanes: 64, CacheEntries: 4096, CacheTTL: 5 * time.Minute,
-		MessageBytes: 4 << 20, HTTPBytes: 64 << 20, SSEBytes: 64 << 20, SharedServers: 64, LogBytes: 64 << 20}
+		MessageBytes: 4 << 20, HTTPBytes: 64 << 20, SSEBytes: 64 << 20, SharedServers: 64, LogBytes: 64 << 20,
+		OpenFiles: 30000}
 }
 
 // FromEnv applies and validates GOPLS_MANAGER_* overrides to Default.
@@ -74,6 +78,7 @@ func FromEnv() (Limits, error) {
 		{"GOPLS_MANAGER_SSE_BUFFER_BUDGET", &limits.SSEBytes},
 		{"GOPLS_MANAGER_MAX_SERVERS", &limits.SharedServers},
 		{"GOPLS_MANAGER_LOG_TRIM_BYTES", &limits.LogBytes},
+		{"GOPLS_MANAGER_MAX_OPEN_FILES", &limits.OpenFiles},
 	} {
 		if raw := os.Getenv(setting.name); raw != "" {
 			value, err := strconv.Atoi(raw)

@@ -33,6 +33,10 @@ type manager struct {
 	// every assertion about it.
 	ready func(context.Context, int) error
 	start func(context.Context, string, int) (*childProcess, error)
+	// openFiles counts open files per record pid; nil skips the open-file budget.
+	openFiles func(context.Context, []record) (map[int]int, error)
+	uses      *useCounts    // nil counts nothing
+	pending   *pendingCalls // nil tracks and publishes nothing
 }
 
 // gopls is resolved by startGopls, not here: list's whole job is to find and
@@ -46,9 +50,12 @@ func newManager() (*manager, error) {
 		return nil, err
 	}
 	m := &manager{
-		mapPath: filepath.Join(home, ".local", "share", "gopls-ports.map"),
-		alive:   recordAlive,
-		ready:   awaitReady,
+		mapPath:   filepath.Join(home, ".local", "share", "gopls-ports.map"),
+		alive:     recordAlive,
+		ready:     awaitReady,
+		openFiles: countOpenFiles,
+		uses:      &useCounts{counts: make(map[string]int)},
+		pending:   newPendingCalls(),
 	}
 	m.start = m.startGopls
 	m.limits, err = config.FromEnv()

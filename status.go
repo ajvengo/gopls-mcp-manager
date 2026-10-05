@@ -18,6 +18,7 @@ type serverUsage struct {
 	// Null is deliberate: process existence is not proof of client activity.
 	ActiveClients *int
 	LogBytes      *int64
+	OpenFiles     *int // lsof rows, shown only for a matched identity
 }
 
 // status is observational: unlike list it never sweeps, signals or writes the
@@ -55,6 +56,11 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 			}
 		}
 	}
+	var files map[int]int
+	if len(records) != 0 && m.openFiles != nil {
+		files, _ = m.openFiles(ctx, records) // unknown on failure, like RSS
+	}
+	openFiles := 0
 	for _, r := range records {
 		usage := serverUsage{record: r, Identity: "unknown"}
 		if info, err := os.Lstat(m.logPath(r.Worktree)); err == nil && info.Mode().IsRegular() {
@@ -68,6 +74,10 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 				if rss, err := strconv.ParseInt(fields[0], 10, 64); err == nil && rss >= 0 {
 					usage.RSSKiB = &rss
 				}
+				if n, ok := files[r.PID]; ok {
+					usage.OpenFiles = &n
+					openFiles += n
+				}
 			}
 		}
 		servers = append(servers, usage)
@@ -79,7 +89,9 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 	return json.NewEncoder(w).Encode(struct {
 		RecordedServers int
 		RegistryIntact  bool
+		OpenFiles       int
+		OpenFileBudget  int
 		Servers         []serverUsage
 		Logs            logUsage
-	}{len(servers), intact, servers, logs})
+	}{len(servers), intact, openFiles, m.limits.OpenFiles, servers, logs})
 }

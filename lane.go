@@ -214,6 +214,9 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 			// to decide whether the client saw a transparent retry or an error.
 			l.cache(conn)
 			l.r.startExecution(id, state)
+			if req.Method == "tools/call" {
+				l.r.m.used(l.worktree)
+			}
 			return
 		}
 		// A failed write and conn's own reader seeing the upstream die are the

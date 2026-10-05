@@ -4,7 +4,7 @@
 
 This Go module provides one MCP endpoint backed by a gopls process per Git worktree. Root-level Go files implement the CLI, HTTP/stdio frontends, routing, request queues, and shared-process lifecycle. `internal/config/` owns limits and environment validation; `internal/transport/` owns JSON-RPC framing, stdio/SSE connections, and buffer accounting. Internal packages must not import the root command.
 
-`internal/protocol/` owns pure MCP message adaptations. Tests and benchmarks live beside implementations in `*_test.go`; saved fuzz inputs live in package-local `testdata/fuzz/`. Read `SPEC.md` for behavioral contracts and `README.md` for usage. `LEASES.md` describes proposed ownership and eviction work, not implemented functionality.
+`internal/protocol/` owns pure MCP message adaptations. Tests and benchmarks live beside implementations in `*_test.go`; saved fuzz inputs live in package-local `testdata/fuzz/`. Read `SPEC.md` for behavioral contracts and `README.md` for usage. `LEASES.md` describes proposed ownership and idle-eviction work; only the open-file budget (`budget.go`, SPEC L6) evicts today.
 
 ## Build, Test, and Development Commands
 
