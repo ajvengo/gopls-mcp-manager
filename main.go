@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -93,14 +94,12 @@ func run(args []string, stdout io.Writer) error {
 		return err
 	}
 	maintenanceCtx, cancelMaintenance := context.WithCancel(ctx)
-	maintenanceDone := make(chan struct{})
-	go func() {
-		defer close(maintenanceDone)
-		m.maintain(maintenanceCtx, 30*time.Second)
-	}()
+	var background sync.WaitGroup
+	background.Go(func() { m.maintain(maintenanceCtx, 30*time.Second) })
+	background.Go(func() { m.publishPending(maintenanceCtx) })
 	defer func() {
 		cancelMaintenance()
-		<-maintenanceDone
+		background.Wait()
 	}()
 	if command == "http" {
 		address := "127.0.0.1:6099"

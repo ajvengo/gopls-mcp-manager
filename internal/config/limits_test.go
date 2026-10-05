@@ -13,6 +13,7 @@ func TestFromEnvRejectsInvalidSettings(t *testing.T) {
 		"GOPLS_MANAGER_MAX_MESSAGE_BYTES", "GOPLS_MANAGER_HTTP_BODY_BUDGET",
 		"GOPLS_MANAGER_SSE_BUFFER_BUDGET", "GOPLS_MANAGER_MAX_SERVERS",
 		"GOPLS_MANAGER_LOG_TRIM_BYTES", "GOPLS_MANAGER_CACHE_TTL",
+		"GOPLS_MANAGER_MAX_OPEN_FILES",
 	} {
 		for _, value := range []string{"0", "-1", "invalid"} {
 			t.Run(name+"/"+value, func(t *testing.T) {
@@ -68,7 +69,7 @@ func TestFromEnvOverrides(t *testing.T) {
 func TestWithDefaults(t *testing.T) {
 	t.Parallel()
 	configured := Limits{PerLane: 1, Session: 2, Lanes: 3, CacheEntries: 4,
-		MessageBytes: 5, HTTPBytes: 6, SSEBytes: 7, SharedServers: 8, LogBytes: 9,
+		MessageBytes: 5, HTTPBytes: 6, SSEBytes: 7, SharedServers: 8, LogBytes: 9, OpenFiles: 10,
 		CacheTTL: time.Minute, Execution: time.Second, Metrics: true}
 	partial := Default()
 	partial.Execution, partial.Metrics = time.Second, true

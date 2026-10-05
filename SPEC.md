@@ -463,6 +463,28 @@ is outside the flock, while the persisted record reserves its port.
 → `TestClaimPortReturnsBeforeItsGoplsIsReady`,
 `TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`
 
+L6. Every maintenance sweep first adds this manager's delivered tools/call
+counts to the matching non-terminating records (`Uses` aged to now with a 1 h
+half-life, `UsedAt` now). It then counts lsof rows for every recorded pid,
+each pid once. While the total exceeds GOPLS_MANAGER_MAX_OPEN_FILES, it picks
+records in ascending aged-use order, then oldest UsedAt. Terminating records
+and records started less than 5 min ago are never picked but still count.
+Nor is a worktree with an upstream operation (beginOperation to
+endOperationLocked) that started less than 30 s ago in any manager.
+Each manager publishes the newest such start per worktree to
+`gopls-mcp-pending/<pid>` beside the map. Writes are coalesced and atomic,
+the file is removed when nothing is pending or at exit, and a file whose pid
+is gone is deleted by readers. Entries older than 30 s, or dated in the
+future, protect nothing. A picked record that probes live is checked against
+pending operations again and only then judged by identity, so it reaches
+SIGTERM only through L2. A missing or failing lsof skips the budget
+for that sweep but not the rest of it.
+→ `TestOverBudgetEvictsLeastFrequentlyUsed`, `TestFlushUsesAgesAndAddsCounts`,
+`TestMaintenanceEvictsLeastFrequentlyUsedOverBudget`,
+`TestMaintenanceSweepsWhenOpenFilesCannotBeCounted`, `TestDeliveredToolCallsCountUses`,
+`TestMaintenanceSparesServersWithFreshPendingCalls`,
+`TestBusyWorktreesAgesEntriesAndDropsDeadManagers`, `TestPublishPendingFollowsOperations`
+
 ## 9. Spawning
 
 Started as `gopls mcp -listen 127.0.0.1:<port>` with `cwd` set to the worktree
@@ -572,8 +594,11 @@ have no hard disk ceiling, and no archives are retained.
   outstanding limits bound retained requests, not execution duration.
   Cancellation or timeout cannot prove that a gopls mutation stopped.
 - Cooperating recorded spawns are capped, but shared-process RAM is not.
-  No idle lane or process eviction is enabled. Cross-client attachment and
-  operation ownership must precede automatic reclamation; see LEASES.md.
+  The only process eviction is the open-file budget (L6). It spares servers
+  with pending calls under 30 s old. A call landing between its final check
+  and SIGTERM, or pending longer, fails as on a dying gopls. Lanes are
+  never evicted. Cross-client attachment and operation ownership would let
+  eviction spare busy servers; see LEASES.md.
 - Message and frame limits bound wire data, not total heap or decoded-object
   overhead. Queued decoded results and GC high-water allocations remain outside
   the HTTP and SSE byte budgets. Log retention requires explicit maintenance.
@@ -607,6 +632,7 @@ Environment variables are parsed when constructing the manager:
 | GOPLS_MANAGER_HTTP_BODY_BUDGET | 67108864 | HTTP body reservations; at least one maximum-size message |
 | GOPLS_MANAGER_SSE_BUFFER_BUDGET | 67108864 | Live SSE frame capacity including temporary growth buffers; at least one maximum-size message |
 | GOPLS_MANAGER_LOG_TRIM_BYTES | 67108864 | Files above this threshold are cleared by explicit `trim-logs` |
+| GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | Total lsof rows of recorded gopls before maintenance evicts (L6) |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional post-delivery timeout |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON observations on stderr |
 
@@ -624,7 +650,8 @@ local termination and shutdown cleanup, not just successful upstream answers.
 
 The status command is read-only, emits JSON and never invokes a sweep. It reports
 recorded server count, registry integrity, termination state and RSS in KiB when
-one bounded ps snapshot matches the recorded gopls identity. Missing measurements are null. Active
+one bounded ps snapshot matches the recorded gopls identity, and lsof rows
+(`OpenFiles`, with their total beside the budget) under the same match. Missing measurements are null. Active
 client count is always null until cross-client accounting exists.
 Log observations include per-record sizes and aggregate managed-log bytes,
 file count, largest size and count above the trim threshold.

@@ -1,7 +1,8 @@
 # Cross-client leases before eviction
 
 Status: supervisor design only. Recorded-spawn admission and router-local
-operation credits are implemented; automatic eviction and leases are not.
+operation credits are implemented, as is open-file-budget eviction
+(SPEC.md L6), which does not wait for leases; idle eviction and leases are not.
 
 ## Decision
 
@@ -91,7 +92,8 @@ renewal, clock changes and laptop suspend, PID reuse, failed SIGTERM/SIGKILL,
 and registry write failures. Measure cold-index cost, RSS recovery, attachment
 counts and request latency under realistic worktree churn. Set the memory or
 eviction policy only after that evidence is available. The implemented spawn
-ceiling does not enable eviction.
+ceiling does not enable eviction; the open-file budget is the one exception,
+accepted because kqueue descriptors otherwise grow without bound.
 
 Current choice: operator-managed lifetime with explicit spawn admission. It
 avoids supervisor recovery and protocol migration but leaves reclamation manual.

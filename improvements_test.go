@@ -263,11 +263,17 @@ func TestStatusSnapshotKeepsIdentityPerRecord(t *testing.T) {
 		{Worktree: "/missing", Port: firstPort + 2, PID: 2147483647},
 	}
 	mustWriteMap(t, m.mapPath, records)
+	m.openFiles = func(context.Context, []record) (map[int]int, error) {
+		return map[int]int{process.Process.Pid: 7}, nil
+	}
 	var output bytes.Buffer
 	if err := m.status(t.Context(), &output); err != nil {
 		t.Fatal(err)
 	}
-	var report struct{ Servers []serverUsage }
+	var report struct {
+		OpenFiles int
+		Servers   []serverUsage
+	}
 	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
@@ -275,9 +281,13 @@ func TestStatusSnapshotKeepsIdentityPerRecord(t *testing.T) {
 		t.Fatalf("status: %s", &output)
 	}
 	for i, identity := range []string{"matched", "different process", "unknown"} {
-		if report.Servers[i].Identity != identity || (report.Servers[i].RSSKiB != nil) != (i == 0) {
-			t.Fatalf("row %d: %+v", i, report.Servers[i])
+		row := report.Servers[i]
+		if row.Identity != identity || (row.RSSKiB != nil) != (i == 0) || (row.OpenFiles != nil) != (i == 0) {
+			t.Fatalf("row %d: %+v", i, row)
 		}
+	}
+	if report.OpenFiles != 7 {
+		t.Fatalf("open files = %d, want only the matched row's 7", report.OpenFiles)
 	}
 	wantRecords(t, m.mapPath, "status changed records", records...)
 }
