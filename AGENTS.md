@@ -14,7 +14,7 @@ Use Go 1.27 as specified in `go.mod`. Git and a gopls binary supporting `gopls m
 - `go run . http 127.0.0.1:6099 /absolute/path/to/repo` starts the loopback HTTP MCP endpoint at `/mcp`.
 - `go run . bridge /absolute/path/to/repo` starts the stdio bridge.
 - `go test -race .` checks root integration and lifecycle behavior; test changed internal packages explicitly. See `README.md` for coverage, real-gopls integration, and pprof commands.
-- `golangci-lint fmt` formats Go code; `golangci-lint run ./...` must pass before committing. CI uses v2.13.2 and builds Linux/amd64 and Darwin/arm64.
+- `golangci-lint fmt` formats Go code; `golangci-lint run ./...` must pass before committing. CI uses v2.14.0 and builds Linux/amd64 and Darwin/arm64.
 
 ## Coding Style & Naming Conventions
 
