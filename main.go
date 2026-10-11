@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -58,7 +59,7 @@ func run(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(stdout).Encode(logs)
+		return json.MarshalEncode(jsontext.NewEncoder(stdout), logs)
 	}
 	if command == "status" {
 		return m.status(ctx, stdout)

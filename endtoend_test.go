@@ -3,7 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"io"
 	"net"
 	"net/http"
@@ -39,7 +40,7 @@ func stdioFixture(tb testing.TB, m *manager, home string) mcp.Connection {
 			assert.Fail(tb, "stdio server did not stop")
 		}
 	})
-	init := &jsonrpc.Request{ID: mustID(tb, "initialize"), Method: "initialize", Params: json.RawMessage(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}`)}
+	init := &jsonrpc.Request{ID: mustID(tb, "initialize"), Method: "initialize", Params: jsontext.Value(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}`)}
 	response := stdioRoundTrip(tb, tb.Context(), client, init)
 	require.Nilf(tb, response.Error, "initialize: %+v", response)
 	require.NoError(tb, client.Write(tb.Context(), &jsonrpc.Request{Method: "notifications/initialized"}))
@@ -125,7 +126,7 @@ func TestHTTPServerStartupErrors(t *testing.T) {
 func BenchmarkStdioRoundTrip(b *testing.B) {
 	m, _, _, _ := sseFixture(b, testHome)
 	client := stdioFixture(b, m, testHome)
-	request := &jsonrpc.Request{ID: mustID(b, "call"), Method: "tools/call", Params: json.RawMessage(`{"name":"where","arguments":{}}`)}
+	request := &jsonrpc.Request{ID: mustID(b, "call"), Method: "tools/call", Params: jsontext.Value(`{"name":"where","arguments":{}}`)}
 	b.ReportAllocs()
 	for b.Loop() {
 		response := stdioRoundTrip(b, b.Context(), client, request)

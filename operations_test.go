@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"testing"
@@ -36,7 +37,7 @@ func TestAbandonedOperationsBoundFurtherDelivery(t *testing.T) {
 		usage := r.requestUsage()
 		require.Truef(t, delivered == 2 && usage.Outstanding == 0 && usage.UpstreamOperations == 2 && usage.AbandonedOperations == 2, "unresolved work escaped bound: writes=%d usage=%+v", delivered, usage)
 		go r.readFromUpstream(conn, testHome)
-		conn.reads <- &jsonrpc.Response{ID: mustID(t, "0"), Result: json.RawMessage(`{}`)}
+		conn.reads <- &jsonrpc.Response{ID: mustID(t, "0"), Result: jsontext.Value(`{}`)}
 		synctest.Wait()
 		wantClientQuiet(t, r, "late response completed cancellation twice")
 		_ = sendCall(t, l, "after-result")
@@ -91,7 +92,7 @@ func TestAbandonedIDCannotBeReusedOnItsConnection(t *testing.T) {
 		conn.onWrite = func(context.Context, jsonrpc.Message) error { return nil }
 		l := connectedLane(r, testHome, conn)
 		id := sendCall(t, l, "same")
-		r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"same"}`)})
+		r.cancelCall(&jsonrpc.Request{Params: jsontext.Value(`{"requestId":"same"}`)})
 		_ = wantClientError(t, r, id, "cancel did not complete")
 		_ = sendCall(t, l, "same")
 		_ = wantClientError(t, r, id, "unresolved id was reused")
@@ -128,7 +129,7 @@ func TestDeliveryCompletionCannotTouchReusedID(t *testing.T) {
 						_, ok := r.finish(id, conn, nil)
 						require.True(t, ok, "early response had no owner")
 					} else {
-						r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"reused"}`)})
+						r.cancelCall(&jsonrpc.Request{Params: jsontext.Value(`{"requestId":"reused"}`)})
 						_ = wantClientError(t, r, id, "cancelled call did not complete")
 					}
 					_, err := r.admit(id, nil)
@@ -154,7 +155,7 @@ func TestCancelledQueueEntryCannotClaimReusedID(t *testing.T) {
 		id := mustID(t, "reused")
 		req := &jsonrpc.Request{ID: id, Method: "tools/call"}
 		old, _ := r.prepare(req)
-		r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"reused"}`)})
+		r.cancelCall(&jsonrpc.Request{Params: jsontext.Value(`{"requestId":"reused"}`)})
 		_ = wantClientError(t, r, id, "queued cancellation did not complete")
 		replacement, _ := r.prepare(req)
 		defer replacement.cancel()

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -38,7 +40,7 @@ func newHTTPBackend(parent context.Context, m *manager, home string) *httpBacken
 	r.stateless = true
 	// The internal legacy session has its own capabilities and lifecycle.
 	// HTTP initialization and client roots never mutate this shared session.
-	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: json.RawMessage(
+	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: jsontext.Value(
 		`{"protocolVersion":"2025-06-18","capabilities":{"roots":{}},"clientInfo":{"name":"gopls-mcp-manager","version":"1"}}`)})
 	return &httpBackend{r: r, cancel: cancel, done: make(chan struct{}),
 		queue: make(chan delivery, laneQueue), pending: make(map[jsonrpc.ID]chan *jsonrpc.Response)}
@@ -183,7 +185,7 @@ func (b *httpBackend) call(ctx context.Context, method string, params any, resul
 		}
 		// The raw result is owned by a response nobody else holds, so handing it
 		// over beats copying and revalidating it (see withCompleteResultType).
-		if raw, ok := result.(*json.RawMessage); ok {
+		if raw, ok := result.(*jsontext.Value); ok {
 			*raw = resp.Result
 			return nil
 		}
@@ -246,8 +248,19 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 				}
 				return result, err
 			case "tools/call":
-				var raw json.RawMessage
-				if err := b.call(ctx, method, req.GetParams(), &raw); err != nil {
+				var raw jsontext.Value
+				// The SDK's omitempty tag drops an empty arguments object under
+				// v2. Override that field explicitly without changing the rest of
+				// the SDK parameters or enabling legacy JSON behavior.
+				params := req.GetParams().(*mcp.CallToolParamsRaw)
+				upstream := struct {
+					*mcp.CallToolParamsRaw
+					Arguments jsontext.Value `json:"arguments"`
+				}{params, params.Arguments}
+				if len(upstream.Arguments) == 0 {
+					upstream.Arguments = jsontext.Value(`{}`)
+				}
+				if err := b.call(ctx, method, upstream, &raw); err != nil {
 					return nil, err
 				}
 				result := new(mcp.CallToolResult)
@@ -273,6 +286,27 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 			b.r.rejected("http_capacity")
 			http.Error(w, "HTTP request capacity reached", http.StatusServiceUnavailable)
 			return
+		}
+		if req.Method == http.MethodPost {
+			bodyReader := req.Body
+			defer func() { _ = bodyReader.Close() }()
+			// Validate before the SDK's own parser, which permits duplicate names
+			// and invalid UTF-8. Keep its negotiation and protocol handling.
+			body, err := io.ReadAll(http.MaxBytesReader(w, bodyReader, int64(b.r.limits.MessageBytes)))
+			if err != nil {
+				var oversized *http.MaxBytesError
+				code := http.StatusBadRequest
+				if errors.As(err, &oversized) {
+					code = http.StatusRequestEntityTooLarge
+				}
+				http.Error(w, err.Error(), code)
+				return
+			}
+			if !jsontext.Value(body).IsValid() {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		requestCtx := context.WithValue(req.Context(), httpRequestContextKey{}, req.Context())
 		handler.ServeHTTP(w, req.WithContext(requestCtx))

@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+
 	"fmt"
 	"net/http"
 	"os"
@@ -36,14 +37,14 @@ func benchRouter(b *testing.B) (*router, string) {
 
 // toolCall is the message every benchmark here routes: one tools/call under a
 // fixed id, differing only in the arguments it names.
-func toolCall(tb testing.TB, params json.RawMessage) *jsonrpc.Request {
+func toolCall(tb testing.TB, params jsontext.Value) *jsonrpc.Request {
 	return &jsonrpc.Request{ID: mustID(tb, float64(1)), Method: "tools/call", Params: params}
 }
 
 // fileCallParams is the tool call every benchmark here sends: one naming one
 // file, which is what target has to resolve a worktree from.
-func fileCallParams(file string) json.RawMessage {
-	return json.RawMessage(`{"name":"go_file_context","arguments":{"file":` + strconv.Quote(file) + `}}`)
+func fileCallParams(file string) jsontext.Value {
+	return jsontext.Value(`{"name":"go_file_context","arguments":{"file":` + strconv.Quote(file) + `}}`)
 }
 
 // The whole routing decision for the message an agent sends most: unmarshal
@@ -109,7 +110,7 @@ func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 		files[i] = strconv.Quote(path)
 		r.paths[path] = pathMemo{worktree: r.home}
 	}
-	req := toolCall(b, json.RawMessage(`{"name":"go_diagnostics","arguments":{"files":[`+strings.Join(files, ",")+`]}}`))
+	req := toolCall(b, jsontext.Value(`{"name":"go_diagnostics","arguments":{"files":[`+strings.Join(files, ",")+`]}}`))
 	b.ReportAllocs()
 	for b.Loop() {
 		if worktree, _ := r.target(req); worktree == "" {
@@ -130,7 +131,7 @@ func loopbackConn() *fakeConn {
 			return nil // a notification: nothing to answer, and nobody waiting
 		}
 		select {
-		case c.reads <- &jsonrpc.Response{ID: req.ID, Result: json.RawMessage(`{}`)}:
+		case c.reads <- &jsonrpc.Response{ID: req.ID, Result: jsontext.Value(`{}`)}:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()

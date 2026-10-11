@@ -3,7 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -24,12 +25,12 @@ type record struct {
 	// map written before the field existed, which reads as "no grace" — the
 	// behaviour those records already had.
 	StartedAt   int64
-	Terminating bool `json:",omitempty"`
+	Terminating bool `json:",omitzero"`
 	// Uses is the server's tools/call count, halved every useHalfLife, as of
 	// UsedAt in unix seconds; see frequency. Shared through the map so every
 	// manager evicts by the same ranking.
-	Uses   float64 `json:",omitempty"`
-	UsedAt int64   `json:",omitempty"`
+	Uses   float64 `json:",omitzero"`
+	UsedAt int64   `json:",omitzero"`
 }
 
 // keepRecords is the body that changes nothing: withRecords sweeps whatever the
@@ -100,18 +101,19 @@ func writeMap(path string, records []record) error {
 	// bufio.Writer latches its first write error and returns it from Flush, so
 	// that one check covers every line below.
 	w := bufio.NewWriter(tmp)
-	enc := json.NewEncoder(w)
+	enc := jsontext.NewEncoder(w)
 	for _, r := range records {
-		// A Unix path is arbitrary bytes, but json.Marshal replaces invalid
-		// UTF-8 with U+FFFD instead of failing — so such a record would come
-		// back naming a worktree nobody asked for. Refused rather than written:
+		// A Unix path is arbitrary bytes, but JSON strings require UTF-8.
+		// Refuse an unrepresentable path with a worktree-specific error:
 		// read back, it would never match its own worktree, so every ensure
 		// would start another gopls beside the last and forget would never find
 		// the record to drop.
 		if !utf8.ValidString(r.Worktree) {
 			return fmt.Errorf("worktree path is not valid UTF-8: %q", r.Worktree)
 		}
-		_ = enc.Encode(r)
+		if err := json.MarshalEncode(enc, r); err != nil {
+			return err
+		}
 	}
 	if err := w.Flush(); err != nil {
 		return err

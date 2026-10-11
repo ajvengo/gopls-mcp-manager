@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -71,7 +72,7 @@ func TestQueuedCancellationPreventsDelivery(t *testing.T) {
 		l := pausedLane(t, r, testHome)
 		forbidDial(t, r, "cancelled queued work dialled an upstream")
 		id := queuedCall(t, r, "cancelled")
-		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"cancelled"}`)})
+		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"cancelled"}`)})
 		close(l.reqs)
 		go l.run()
 		mustRecv(t, l.done, "cancelled lane to drain")
@@ -89,7 +90,7 @@ func TestCancellationBypassesFullDeliveryQueue(t *testing.T) {
 		upstream := newFakeConn()
 		r.track(mustID(t, "sent"), upstream, testHome)
 		go l.runControls()
-		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"sent"}`)})
+		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"sent"}`)})
 		_, err := recvRequest(upstream.writes, "notifications/cancelled")
 		require.NoError(t, err)
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "sent"), "cancellation did not complete locally"), -32800)
@@ -105,7 +106,7 @@ func TestFullControlQueueDoesNotBlockRouting(t *testing.T) {
 		for i := range laneQueue + 1 {
 			id := fmt.Sprintf("sent-%d", i)
 			r.track(mustID(t, id), newFakeConn(), testHome)
-			r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(fmt.Sprintf(`{"requestId":%q}`, id))})
+			r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(fmt.Sprintf(`{"requestId":%q}`, id))})
 			_ = wantWireError(t, wantClientError(t, r, mustID(t, id), "cancellation did not complete locally"), -32800)
 		}
 		queuedCall(t, r, "still-routes")
@@ -125,7 +126,7 @@ func TestDeliveryCancellationStopsADial(t *testing.T) {
 		}
 		id := queuedCall(t, r, "dialling")
 		synctest.Wait()
-		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"dialling"}`)})
+		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"dialling"}`)})
 		_ = wantWireError(t, wantClientError(t, r, id, "cancelled dial did not stop"), -32800)
 		r.closeLanes()
 	})
@@ -157,7 +158,7 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		queuedCall(t, r, "writing")
 		go l.run()
 		mustRecv(t, writing, "the call's write to begin")
-		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"writing"}`)})
+		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"writing"}`)})
 		synctest.Wait()
 		select {
 		case <-cancelled:
@@ -240,7 +241,7 @@ func TestToolCallForwardsPhysicalPathSpelling(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			r := newTestRouter(t, root)
-			params := json.RawMessage(`{"name":"go_symbol_references","arguments":` + test.arguments + `}`)
+			params := jsontext.Value(`{"name":"go_symbol_references","arguments":` + test.arguments + `}`)
 			// Routing is what populates the memo this reads; canonicalToolCall
 			// never waits for a filesystem syscall of its own.
 			r.toolCallWorktrees(r.ctx, params)
@@ -274,7 +275,7 @@ func TestDeliveredToolCallCarriesThePhysicalSpelling(t *testing.T) {
 
 	r := newTestRouter(t, root)
 	l := pausedLane(t, r, linked)
-	params := json.RawMessage(`{"name":"go_symbol_references","arguments":{"file":` +
+	params := jsontext.Value(`{"name":"go_symbol_references","arguments":{"file":` +
 		strconv.Quote(filepath.Join(alias, "existing.go")) + `,"symbol":"Map.Range"}}`)
 	r.route(&jsonrpc.Request{ID: mustID(t, "aliased"), Method: "tools/call", Params: params})
 

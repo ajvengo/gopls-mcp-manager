@@ -4,7 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -173,7 +174,7 @@ func TestOutstandingLimitsSurviveFastDelivery(t *testing.T) {
 		queuedCall(t, r, "other")
 		id = queuedCall(t, r, "session-full")
 		_ = wantWireError(t, wantClientError(t, r, id, "session limit was ignored"), -32000)
-		r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"0"}`)})
+		r.cancelCall(&jsonrpc.Request{Params: jsontext.Value(`{"requestId":"0"}`)})
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "0"), "cancel did not release slot"), -32800)
 		queuedCall(t, r, "released-slot")
 		wantClientQuiet(t, r, "released slot was not reusable")
@@ -190,7 +191,7 @@ func TestExecutionDeadlineCompletesOnce(t *testing.T) {
 		time.Sleep(time.Second)
 		_ = wantWireError(t, wantClientError(t, r, id, "accepted call never expired"), -32000)
 		go r.readFromUpstream(conn, testHome)
-		conn.reads <- &jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}
+		conn.reads <- &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}
 		synctest.Wait()
 		wantClientQuiet(t, r, "late answer completed an expired call twice")
 		require.Lenf(t, r.awaitingUpstream, 0, "expired request retained")
@@ -221,7 +222,7 @@ func TestRoutingBudgetDoesNotMultiplyOrGrowWorkers(t *testing.T) {
 		r.sticky = testWorktree
 		blocked := make(chan struct{})
 		var calls atomic.Int64
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
+		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
 			calls.Add(1)
 			<-blocked // models a filesystem syscall ignoring cancellation
 			return []string{"/repo/late"}
@@ -229,7 +230,7 @@ func TestRoutingBudgetDoesNotMultiplyOrGrowWorkers(t *testing.T) {
 		go r.resolver.run(t.Context())
 		for range 2 {
 			start := time.Now()
-			_, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: json.RawMessage(`{"arguments":{"file":"/uncached/file.go"}}`)})
+			_, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: jsontext.Value(`{"arguments":{"file":"/uncached/file.go"}}`)})
 			require.ErrorIsf(t, err, context.DeadlineExceeded, "routing returned %v", err)
 			require.Truef(t, time.Since(start) == routingBudget, "routing multiplied its budget")
 		}

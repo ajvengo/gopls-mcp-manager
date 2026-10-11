@@ -336,6 +336,30 @@ together so their lock, generation and cancellation ownership remains private.
 Package-specific tests and transport benchmarks live beside their implementations;
 integration and shared-process tests remain at the root.
 
+Root files group related responsibilities:
+
+| File | Responsibility |
+| --- | --- |
+| `main.go` | CLI commands and startup |
+| `bridge.go`, `http.go` | Router construction, stdio sessions/upstream replies, and HTTP frontend |
+| `routing.go`, `paths.go` | Admission, routing decisions, bounded resolution, and path memos |
+| `lane.go`, `requests.go` | Per-worktree delivery, cancellation, and request/operation accounting |
+| `manager.go`, `registry.go` | Shared server acquisition and durable registry reconciliation |
+| `process.go`, `probe.go` | Child lifetime and conservative process/endpoint identity checks |
+| `maintenance.go`, `pending.go` | Open-file eviction and cross-manager pending-operation protection |
+| `status.go` | Status snapshots and explicit log trimming |
+
+Transport scalar decoding stays with stdio framing; shared SSE frame accounting
+stays with SSE framing. Small test-only routing and registry helpers live in
+`main_test.go`. File consolidation does not change package or lifetime boundaries.
+
+Project JSON uses strict `encoding/json/v2` and `encoding/json/jsontext`:
+field names are case-sensitive, duplicate names and invalid UTF-8 are rejected,
+and raw payloads use `jsontext.Value`. Use the documented lowercase MCP argument
+names and capitalized registry fields. HTTP rejects invalid JSON before SDK
+handling; stdio and SSE reject it at framing/decoding. The SDK remains responsible
+for MCP negotiation, writes, and batch correlation.
+
 ```sh
 go test -race -coverprofile=/tmp/gopls-manager.cover . ./internal/config ./internal/transport ./internal/protocol
 python3 scripts/check_coverage.py /tmp/gopls-manager.cover --minimum 85
