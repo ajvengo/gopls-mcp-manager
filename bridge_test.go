@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -110,7 +111,7 @@ func newHandshakingConn() *fakeConn {
 	}
 	c.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
 		if req, ok := msg.(*jsonrpc.Request); ok && req.Method == "initialize" {
-			c.reads <- &jsonrpc.Response{ID: req.ID, Result: json.RawMessage(`{}`)}
+			c.reads <- &jsonrpc.Response{ID: req.ID, Result: jsontext.Value(`{}`)}
 			return nil
 		}
 		return c.queue(ctx, msg)
@@ -147,7 +148,7 @@ const clientInitializeParams = `{"capabilities":{"roots":{"listChanged":true}}}`
 // handshakeReady gives the router the client initialize every private handshake
 // replays. Without one, upstream() refuses to open any connection but the first.
 func handshakeReady(r *router) {
-	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: json.RawMessage(clientInitializeParams)})
+	r.initialize.Store(&jsonrpc.Request{Method: "initialize", Params: jsontext.Value(clientInitializeParams)})
 }
 
 // sendCall puts a tools/call on l under a fresh id and hands the id back.
@@ -470,7 +471,7 @@ func TestRootlessInitializeIsForwardedWithWorkingRoots(t *testing.T) {
 		clientReads <- &jsonrpc.Request{
 			ID:     mustID(t, "initialize-rootless"),
 			Method: "initialize",
-			Params: json.RawMessage(`{"capabilities":{"sampling":{}}}`),
+			Params: jsontext.Value(`{"capabilities":{"sampling":{}}}`),
 		}
 		forwarded := mustRecv(t, upstream.writes, "the forwarded initialize").(*jsonrpc.Request)
 		got, want := string(forwarded.Params), `{"capabilities":{"roots":{},"sampling":{}}}`
@@ -509,7 +510,7 @@ func TestAColdWorktreeDoesNotHoldUpAnother(t *testing.T) {
 		clientReads <- &jsonrpc.Request{
 			ID:     mustID(t, "call-into-the-cold"),
 			Method: "tools/call",
-			Params: json.RawMessage(`{"arguments":{"query":"Foo"}}`),
+			Params: jsontext.Value(`{"arguments":{"query":"Foo"}}`),
 		}
 		clientReads <- &jsonrpc.Request{ID: mustID(t, "list"), Method: "tools/list"}
 
@@ -560,7 +561,7 @@ func TestSendReconnectsAndInitializesRestartedHome(t *testing.T) {
 			if string(initialize.Params) != clientInitializeParams {
 				return fmt.Errorf("replayed initialize params = %s, want the client's %s", initialize.Params, clientInitializeParams)
 			}
-			fresh.reads <- &jsonrpc.Response{ID: initialize.ID, Result: json.RawMessage(`{}`)}
+			fresh.reads <- &jsonrpc.Response{ID: initialize.ID, Result: jsontext.Value(`{}`)}
 			if _, err := recvRequest(fresh.writes, "notifications/initialized"); err != nil {
 				return err
 			}
@@ -592,7 +593,7 @@ func TestSendRetriesInitialInitializeWithoutPrivateHandshake(t *testing.T) {
 			return fresh, nil
 		}
 		id := mustID(t, "client-initialize")
-		initialize := &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)}
+		initialize := &jsonrpc.Request{ID: id, Method: "initialize", Params: jsontext.Value(`{}`)}
 		r.initialize.Store(initialize)
 
 		r.track(id, nil, home)
@@ -624,7 +625,7 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 
 		id := mustID(t, "client-initialize")
 		r.track(id, nil, l.worktree)
-		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: json.RawMessage(`{}`)}, nil)
+		l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "initialize", Params: jsontext.Value(`{}`)}, nil)
 
 		wantClientError(t, r, id, "a second initialize was left unanswered")
 		select {
@@ -788,7 +789,7 @@ func TestUpstreamDeathFailsItsInFlightCalls(t *testing.T) {
 		// was sent to: still owed, the cancellation would go there instead.
 		got, _ := r.target(&jsonrpc.Request{
 			Method: "notifications/cancelled",
-			Params: json.RawMessage(`{"requestId":"call-in-flight"}`),
+			Params: jsontext.Value(`{"requestId":"call-in-flight"}`),
 		})
 		require.Equalf(t, testHome, got, "cancelling a call its dead upstream already failed went to %q, want home %q", got, testHome)
 	})
@@ -803,7 +804,7 @@ func TestUpstreamAnswerToAnAlreadyFailedCallIsDropped(t *testing.T) {
 		id := mustID(t, "already-failed")
 		r := newTestRouter(t, testHome)
 		// Nothing owes this id: send() claimed it and answered the client already.
-		r.readFromUpstream(deadConn(&jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}), testWorktree)
+		r.readFromUpstream(deadConn(&jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}), testWorktree)
 
 		wantClientQuiet(t, r, "a call the bridge had already answered was answered a second time")
 	})
@@ -861,7 +862,7 @@ func TestCallAnsweredBeforeItsWriteReturnsLeavesNothingOwed(t *testing.T) {
 		// where failing the test is safe; see inBackground.
 		conn := &fakeConn{reads: make(chan jsonrpc.Message, 1)}
 		conn.onWrite = func(context.Context, jsonrpc.Message) error {
-			conn.reads <- &jsonrpc.Response{ID: id, Result: json.RawMessage(`{}`)}
+			conn.reads <- &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}
 			// The reader has now forgotten the call, before send() records it.
 			mustRecv(t, r.out, "the answer the reader forwarded during this write")
 			return nil
@@ -922,7 +923,7 @@ func TestRootsAskedDuringHandshakeIsAnsweredLocally(t *testing.T) {
 			if resp, ok := msg.(*jsonrpc.Response); !ok || resp.ID != rootsID {
 				return fmt.Errorf("mid-handshake roots/list got %#v, want an answer to %v", msg, rootsID)
 			}
-			if err := gopls.Write(ctx, &jsonrpc.Response{ID: initialize.ID, Result: json.RawMessage(`{}`)}); err != nil {
+			if err := gopls.Write(ctx, &jsonrpc.Response{ID: initialize.ID, Result: jsontext.Value(`{}`)}); err != nil {
 				return fmt.Errorf("answer initialize: %w", err)
 			}
 			if _, err := gopls.Read(ctx); err != nil { // notifications/initialized
@@ -1058,7 +1059,7 @@ func TestToolCallRoutesToTheWorktreeOwningItsPath(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			r := newTestRouter(t, testHome)
-			got := r.toolCallWorktrees(r.ctx, json.RawMessage(`{"arguments":`+test.arguments+`}`))
+			got := r.toolCallWorktrees(r.ctx, jsontext.Value(`{"arguments":`+test.arguments+`}`))
 			require.Truef(t, slices.Equal(got, test.want), "toolCallWorktrees(%s) = %q, want %q", test.arguments, got, test.want)
 		})
 	}
@@ -1083,7 +1084,7 @@ func TestToolCallSpanningTwoWorktreesIsRefused(t *testing.T) {
 	r.sticky = working
 	id := mustID(t, "spanning-call")
 	arguments := `{"files":[` + strconv.Quote(filepath.Join(linked, "main.go")) + `,` + strconv.Quote(filepath.Join(root, "main.go")) + `]}`
-	r.route(&jsonrpc.Request{ID: id, Method: "tools/call", Params: json.RawMessage(`{"arguments":` + arguments + `}`)})
+	r.route(&jsonrpc.Request{ID: id, Method: "tools/call", Params: jsontext.Value(`{"arguments":` + arguments + `}`)})
 
 	// Refused on the reader's own goroutine, so the response is already queued
 	// and no lane was ever asked for.
@@ -1186,11 +1187,11 @@ func TestTargetFallsBackToTheLastPathBearingCall(t *testing.T) {
 	_, linked := newLinkedWorktree(t)
 	r := newTestRouter(t, testHome)
 
-	bearing := json.RawMessage(`{"arguments":{"file":"` + filepath.Join(linked, "x.go") + `"}}`)
+	bearing := jsontext.Value(`{"arguments":{"file":"` + filepath.Join(linked, "x.go") + `"}}`)
 	got, _ := r.target(&jsonrpc.Request{Method: "tools/call", Params: bearing})
 	require.Equalf(t, linked, got, "path-bearing tools/call went to %q, want %q", got, linked)
 
-	params := json.RawMessage(`{"arguments":{"query":"Foo"}}`)
+	params := jsontext.Value(`{"arguments":{"query":"Foo"}}`)
 	got, _ = r.target(&jsonrpc.Request{Method: "tools/call", Params: params})
 	require.Equalf(t, linked, got, "path-less tools/call went to %q, want the worktree the call before it named", got)
 
@@ -1218,13 +1219,13 @@ func TestCancellationFindsACallItsLaneHasNotSentYet(t *testing.T) {
 		r.route(&jsonrpc.Request{
 			ID:     mustID(t, "slow-call"),
 			Method: "tools/call",
-			Params: json.RawMessage(`{"arguments":{"query":"Foo"}}`),
+			Params: jsontext.Value(`{"arguments":{"query":"Foo"}}`),
 		})
 		synctest.Wait()
 
 		got, _ := r.target(&jsonrpc.Request{
 			Method: "notifications/cancelled",
-			Params: json.RawMessage(`{"requestId":"slow-call"}`),
+			Params: jsontext.Value(`{"requestId":"slow-call"}`),
 		})
 		require.Equalf(t, cold, got, "cancellation of a queued call went to %q, want %q", got, cold)
 	})
@@ -1241,7 +1242,7 @@ func TestCancellationForADisconnectedUpstreamIsDroppedNotDialled(t *testing.T) {
 
 		cancel := &jsonrpc.Request{
 			Method: "notifications/cancelled",
-			Params: json.RawMessage(`{"requestId":"call-3"}`),
+			Params: jsontext.Value(`{"requestId":"call-3"}`),
 		}
 		// A lane that never dialled, and one whose connection dies under this
 		// very write — the retry starts from the same "no upstream to tell", so
@@ -1288,7 +1289,7 @@ func TestCancellationFollowsTheRequestToItsUpstream(t *testing.T) {
 			t.Parallel()
 			got, _ := r.target(&jsonrpc.Request{
 				Method: "notifications/cancelled",
-				Params: json.RawMessage(`{"requestId":` + test.requestID + `}`),
+				Params: jsontext.Value(`{"requestId":` + test.requestID + `}`),
 			})
 			require.Equalf(t, test.want, got, "cancellation of %s went to %q, want %q", test.requestID, got, test.want)
 		})
@@ -1381,8 +1382,8 @@ func TestWriteToClientReportsAFailedWriteOnce(t *testing.T) {
 	}}
 	// Two queued, so that a writer which kept going after the failure would take
 	// the second one and be caught doing it.
-	r.out <- &jsonrpc.Response{ID: mustID(t, float64(1)), Result: json.RawMessage(`{}`)}
-	r.out <- &jsonrpc.Response{ID: mustID(t, float64(2)), Result: json.RawMessage(`{}`)}
+	r.out <- &jsonrpc.Response{ID: mustID(t, float64(1)), Result: jsontext.Value(`{}`)}
+	r.out <- &jsonrpc.Response{ID: mustID(t, float64(2)), Result: jsontext.Value(`{}`)}
 
 	r.writeToClient(conn) // returns, or this test times out
 
@@ -1409,13 +1410,32 @@ func TestWriteToClientStopsWithTheSessionWithoutReportingIt(t *testing.T) {
 	}
 }
 
+func TestPathArgumentsUseStrictJSON(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, params, file string
+	}{
+		{"exact names", `{"arguments":{"file":"/repo/a.go"}}`, "/repo/a.go"},
+		{"uppercase container", `{"Arguments":{"file":"/repo/a.go"}}`, ""},
+		{"uppercase field", `{"arguments":{"File":"/repo/a.go"}}`, ""},
+		{"duplicate paths", `{"arguments":{"file":"/repo/a.go","file":"/repo/b.go"}}`, ""},
+		{"invalid UTF-8", "{\"arguments\":{\"file\":\"/repo/\xff.go\"}}", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			args := parsePathArguments(jsontext.Value(tc.params))
+			require.Equal(t, tc.file, args.File)
+		})
+	}
+}
+
 // newLinkedWorktree returns a fresh repository and a linked worktree of it.
 func newLinkedWorktree(t testing.TB) (root, linked string) {
 	t.Helper()
 	root = filepath.Join(t.TempDir(), "main")
 	linked = filepath.Join(t.TempDir(), "linked")
 	runGit(t, "init", root)
-	runGit(t, "-C", root, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial")
+	runGit(t, "-C", root, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial")
 	runGit(t, "-C", root, "worktree", "add", "--detach", linked)
 	return mustEvalSymlinks(t, root), mustEvalSymlinks(t, linked)
 }

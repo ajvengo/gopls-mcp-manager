@@ -8,8 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -225,4 +228,75 @@ func TestNewManagerFailsWithNoHomeDirectory(t *testing.T) {
 
 	m, err := newManager()
 	require.Errorf(t, err, "newManager() = %#v with no home directory, want an error", m)
+}
+
+// track seeds or updates an outstanding request for tests of delivered traffic.
+func (r *router) track(id jsonrpc.ID, conn mcp.Connection, worktree string) {
+	if !id.IsValid() {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	owner := r.awaitingUpstream[id]
+	if owner.worktree != worktree {
+		if owner.worktree != "" {
+			r.perWorktree[owner.worktree]--
+		}
+		r.perWorktree[worktree]++
+	}
+	if owner.state == nil {
+		owner.state = &callState{}
+	}
+	owner.conn, owner.worktree = conn, worktree
+	r.awaitingUpstream[id] = owner
+}
+
+// route and target are the two ingress steps run back to back, which is what a
+// test wants to say and what no production path says: the stdio reader admits
+// on one goroutine and routes on another, so that a cancellation is not queued
+// behind the call it cancels. They live here so the routing file describes only
+// what the binary runs.
+
+// route admits req without waiting for lane capacity. Its budget starts here,
+// so waiting in the queue does not buy another delivery budget.
+func (r *router) route(req *jsonrpc.Request) {
+	if call, ok := r.admitted(req); ok {
+		r.routePrepared(call)
+	}
+}
+
+// target picks the worktree that should answer req, or reports why no single
+// one can — see toolCallWorktrees.
+func (r *router) target(req *jsonrpc.Request) (string, error) {
+	return r.targetContext(r.ctx, req)
+}
+
+// cleanRecords drops the records whose server is gone. Every record is offered
+// to alive, which reaps what it rejects, so none may be skipped — including a
+// second record for a worktree ensure will never answer with, since the record
+// is the only handle on that process and its port really is taken.
+//
+// The probes run at once, so alive has to be safe to call from several
+// goroutines. Every caller holds the map's exclusive flock across this and a
+// probe waits out its own timeout, so in sequence a few servers too busy to
+// answer would keep every other invocation of this tool — and so every other
+// worktree's next tool call — waiting for the sum of them. Nothing bounds the
+// fan-out because nothing needs to: the records are one per live gopls, and a
+// machine that could run enough of those to matter here has already run out of
+// memory.
+func cleanRecords(records []record, alive func(record) bool) []record {
+	live := make([]bool, len(records))
+	var probes sync.WaitGroup
+	for i, r := range records {
+		probes.Go(func() { live[i] = alive(r) })
+	}
+	probes.Wait()
+
+	kept := make([]record, 0, len(records))
+	for i, r := range records {
+		if live[i] {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }

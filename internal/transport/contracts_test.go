@@ -2,7 +2,8 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+
 	"fmt"
 	"io"
 	"net/http"
@@ -46,6 +47,8 @@ func TestSSEReadContracts(t *testing.T) {
 		{name: "response after keepalive", frame: ": keepalive\n\nid: 2\nretry: 100\n\ndata: " + response + "\n\n"},
 		{name: "request", frame: "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"roots/list\"}\n\n"},
 		{name: "invalid JSON", frame: "data: not json\n\n", fails: true},
+		{name: "duplicate names", frame: "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":1,\"x\":2}}\n\n", fails: true},
+		{name: "invalid UTF-8", frame: "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\xff\"}\n\n", fails: true},
 		{name: "invalid protocol", frame: "data: {\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{}}\n\n", fails: true},
 		{name: "malformed field", frame: "broken\n\n", fails: true},
 		{name: "closed stream", fails: true},
@@ -79,13 +82,13 @@ func TestSSEWriteContracts(t *testing.T) {
 		name                     string
 		status                   int
 		endpoint                 string
-		params                   json.RawMessage
+		params                   jsontext.Value
 		closed, cancelled, fails bool
 	}{
 		{name: "accepted", status: http.StatusAccepted},
 		{name: "rejected", status: http.StatusServiceUnavailable, fails: true},
 		{name: "invalid endpoint", endpoint: ":invalid", fails: true},
-		{name: "encoding failure", params: json.RawMessage(`{`), fails: true},
+		{name: "encoding failure", params: jsontext.Value(`{`), fails: true},
 		{name: "cancelled", cancelled: true, fails: true},
 		{name: "closed", closed: true, fails: true},
 	} {

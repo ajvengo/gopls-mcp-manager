@@ -3,7 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -88,7 +89,7 @@ func TestIngressCancellationBypassesBlockedResolution(t *testing.T) {
 		handshakeReady(r)
 		r.sticky = testWorktree
 		entered, release := make(chan struct{}), make(chan struct{})
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
+		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
 			close(entered)
 			<-release
 			return []string{"/late/worktree"}
@@ -97,11 +98,11 @@ func TestIngressCancellationBypassesBlockedResolution(t *testing.T) {
 		r.dial = func(context.Context, string) (mcp.Connection, error) { return loopbackConn(), nil }
 		client := startClient(t, r, 4)
 		id := mustID(t, "resolving")
-		client <- &jsonrpc.Request{ID: id, Method: "tools/call", Params: json.RawMessage(`{"arguments":{"file":"/cold/file.go"}}`)}
+		client <- &jsonrpc.Request{ID: id, Method: "tools/call", Params: jsontext.Value(`{"arguments":{"file":"/cold/file.go"}}`)}
 		mustRecv(t, entered, "filesystem lookup")
 		start := time.Now()
 		client <- &jsonrpc.Request{ID: mustID(t, "pathless"), Method: "tools/call"}
-		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"resolving"}`)}
+		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"resolving"}`)}
 		_ = wantWireError(t, wantClientError(t, r, id, "cancellation waited for filesystem"), -32800)
 		response := mustRecv(t, r.out, "pathless call after cancellation")
 		resp, ok := response.(*jsonrpc.Response)
@@ -135,7 +136,7 @@ func TestFullIngressQueueStillAcceptsCancellation(t *testing.T) {
 		handshakeReady(r)
 		l := pausedLane(t, r, testHome)
 		entered, release := make(chan struct{}), make(chan struct{})
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
+		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
 			close(entered)
 			<-release
 			return []string{testHome}
@@ -148,12 +149,12 @@ func TestFullIngressQueueStillAcceptsCancellation(t *testing.T) {
 			client <- &jsonrpc.Request{ID: mustID(t, fmt.Sprint(i)), Method: "tools/call"}
 		}
 		client <- &jsonrpc.Request{ID: mustID(t, "overflow"), Method: "tools/call"}
-		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"0"}`)}
+		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"0"}`)}
 		start := time.Now()
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "overflow"), "full ingress blocked reader"), -32000)
 		_ = wantWireError(t, wantClientError(t, r, mustID(t, "0"), "full ingress blocked cancellation"), -32800)
 		require.Zerof(t, time.Since(start), "cancellation waited for resolution timeout")
-		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: json.RawMessage(`{"requestId":"resolving"}`)}
+		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"resolving"}`)}
 		_ = wantClientError(t, r, mustID(t, "resolving"), "resolving call not cancelled")
 		close(release)
 		synctest.Wait()
@@ -212,7 +213,7 @@ func TestMemoCapacityRevalidatesEvictedPaths(t *testing.T) {
 	require.False(t, ok, "old memo survived capacity rollover")
 	_, ok = r.paths["/0"]
 	require.False(t, ok, "old memo survived capacity rollover")
-	r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
+	r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
 		return []string{testWorktree}
 	}}
 	go r.resolver.run(t.Context())
@@ -262,7 +263,7 @@ func TestAccountingTerminalPathsAndSnapshots(t *testing.T) {
 			r.track(id, conn, testHome)
 		}
 		r.finish(mustID(t, "reply"), conn, nil)
-		r.cancelCall(&jsonrpc.Request{Params: json.RawMessage(`{"requestId":"cancel"}`)})
+		r.cancelCall(&jsonrpc.Request{Params: jsontext.Value(`{"requestId":"cancel"}`)})
 		_ = wantClientError(t, r, mustID(t, "cancel"), "cancel not completed")
 		r.failInFlight(conn, testHome, io.EOF)
 		_ = mustRecv(t, r.out, "disconnect result")

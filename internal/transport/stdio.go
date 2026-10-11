@@ -4,7 +4,8 @@ package transport
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"io"
 	"sync"
 
@@ -89,19 +90,18 @@ func (c *stdioConn) deliver(msg jsonrpc.Message, err error) bool {
 
 func (c *stdioConn) read() {
 	input := &messageReader{Reader: c.input, limit: int64(c.maxBytes)}
-	dec := json.NewDecoder(input)
+	dec := jsontext.NewDecoder(input)
 	for {
 		input.offset = dec.InputOffset()
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
+		raw, err := dec.ReadValue()
+		if err != nil {
 			c.deliver(nil, err)
 			return
 		}
 		// Match the SDK's framing check on buffered trailing data.
-		var next [1]byte
-		if n, _ := dec.Buffered().Read(next[:]); n > 0 && next[0] != '\n' && next[0] != '\r' {
+		if next := dec.UnreadBuffer(); len(next) > 0 && next[0] != '\n' && next[0] != '\r' {
 			// Let the SDK produce its original framing error.
-			raw = append(raw, next[0])
+			raw = append(raw.Clone(), next[0])
 		} else if msg, ok := decodeScalar(raw); ok {
 			if !c.deliver(msg, nil) {
 				return
@@ -109,12 +109,12 @@ func (c *stdioConn) read() {
 			continue
 		}
 		// The cold path preserves the SDK's batch bookkeeping and error types.
-		var batch []json.RawMessage
+		var batch []jsontext.Value
 		count := 1
 		if json.Unmarshal(raw, &batch) == nil {
 			count = max(1, len(batch))
 		}
-		if _, err := c.feed.Write(append(raw, '\n')); err != nil {
+		if _, err := c.feed.Write(append(raw.Clone(), '\n')); err != nil {
 			c.deliver(nil, err)
 			return
 		}
@@ -146,4 +146,37 @@ func (r *messageReader) Read(p []byte) (int, error) {
 	n, err := r.Reader.Read(p)
 	r.read += int64(n)
 	return n, err
+}
+
+// The wire fields and conversion match jsonrpc.DecodeMessage at SDK v1.7.0.
+// Any rejected shape falls back to the SDK instead
+// of maintaining a second set of protocol errors here. Parse owns raw fields;
+// no zero-copy flags are used, so transport buffers may be safely reused.
+func decodeScalar(raw []byte) (jsonrpc.Message, bool) {
+	var wire struct {
+		Version string         `json:"jsonrpc"`
+		ID      any            `json:"id"`
+		Method  string         `json:"method"`
+		Params  jsontext.Value `json:"params"`
+		Result  jsontext.Value `json:"result"`
+		Error   *jsonrpc.Error `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil || wire.Version != "2.0" {
+		return nil, false
+	}
+	id, err := jsonrpc.MakeID(wire.ID)
+	if err != nil {
+		return nil, false
+	}
+	if wire.Method != "" {
+		return &jsonrpc.Request{ID: id, Method: wire.Method, Params: wire.Params}, true
+	}
+	if !id.IsValid() {
+		return nil, false
+	}
+	response := &jsonrpc.Response{ID: id, Result: wire.Result}
+	if wire.Error != nil {
+		response.Error = wire.Error
+	}
+	return response, true
 }

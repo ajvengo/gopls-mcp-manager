@@ -4,7 +4,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
@@ -51,7 +51,7 @@ func TestEndToEndRealGopls(t *testing.T) {
 		t.Run(frontend, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 			defer cancel()
-			var call func(json.RawMessage) *jsonrpc.Response
+			var call func(jsontext.Value) *jsonrpc.Response
 			wantUnqualifiedWorktree := root
 			if frontend == "HTTP" {
 				b := newHTTPBackend(ctx, m, root)
@@ -61,13 +61,13 @@ func TestEndToEndRealGopls(t *testing.T) {
 				require.NoError(t, err)
 				server := httptest.NewServer(newHTTPHandler(b, instructions))
 				defer server.Close()
-				call = func(params json.RawMessage) *jsonrpc.Response {
+				call = func(params jsontext.Value) *jsonrpc.Response {
 					return postMCP(t, server.URL, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":`+string(params)+`}`)
 				}
 			} else {
 				wantUnqualifiedWorktree = linked
 				client := stdioFixture(t, m, root)
-				call = func(params json.RawMessage) *jsonrpc.Response {
+				call = func(params jsontext.Value) *jsonrpc.Response {
 					id := mustID(t, "call")
 					return stdioRoundTrip(t, ctx, client, &jsonrpc.Request{ID: id, Method: "tools/call", Params: params})
 				}
@@ -77,7 +77,7 @@ func TestEndToEndRealGopls(t *testing.T) {
 				{"linked file", `{"name":"go_file_context","arguments":{"file":` + strconv.Quote(filepath.Join(linked, "fixture.go")) + `}}`, "LinkedMarker"},
 				{"unqualified workspace after linked call", `{"name":"go_workspace","arguments":{}}`, wantUnqualifiedWorktree},
 			} {
-				response := call(json.RawMessage(tc.params))
+				response := call(jsontext.Value(tc.params))
 				ok := response.Error == nil && !strings.Contains(string(response.Result), `"isError":true`) && strings.Contains(string(response.Result), tc.want)
 				require.Truef(t, ok, "%s: real gopls response to %s = %+v; want %s", tc.name, tc.params, response, tc.want)
 			}

@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -173,6 +174,25 @@ func TestHTTPProtocolAndErrors(t *testing.T) {
 	require.Error(t, resp.Error, "upstream error was lost")
 }
 
+func TestHTTPRejectsAmbiguousJSON(t *testing.T) {
+	t.Parallel()
+	b := newHTTPBackend(t.Context(), nil, testHome)
+	defer b.cancel()
+	handler := newHTTPHandler(b, "")
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"file":"/a","file":"/b"}}}`,
+		"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\xff\"}",
+	} {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, mcpRequest(t, t.Context(), "/mcp", body))
+			require.Equal(t, http.StatusBadRequest, response.Code)
+		})
+	}
+}
+
 func TestHTTPCurrentSDKClient(t *testing.T) {
 	t.Parallel()
 	_, endpoint, _, _, _ := httpFixture(t)
@@ -230,7 +250,7 @@ func TestHTTPBackendShutdownReleasesCalls(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		var result mcp.CallToolResult
-		done <- b.call(t.Context(), "tools/call", json.RawMessage(`{"name":"where","arguments":{"block":true}}`), &result)
+		done <- b.call(t.Context(), "tools/call", jsontext.Value(`{"name":"where","arguments":{"block":true}}`), &result)
 	}()
 	mustRecv(t, started, "upstream call did not start")
 	b.close()

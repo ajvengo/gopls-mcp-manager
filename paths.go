@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,7 +52,7 @@ func (r *router) expireMemosLocked() {
 	r.memo.generation++
 }
 
-func parsePathArguments(params json.RawMessage) pathArguments {
+func parsePathArguments(params jsontext.Value) pathArguments {
 	var call struct {
 		Arguments pathArguments `json:"arguments"`
 	}
@@ -73,7 +74,7 @@ func parsePathArguments(params json.RawMessage) pathArguments {
 // what comes back is a well-formed result for the files it did cover. Both are
 // reported so that route can refuse it instead. The extra work is a memo lookup
 // per path on the hit that already covers the routing path (see worktreeOf).
-func (r *router) toolCallWorktrees(ctx context.Context, params json.RawMessage) []string {
+func (r *router) toolCallWorktrees(ctx context.Context, params jsontext.Value) []string {
 	args := parsePathArguments(params)
 	// The scalar arguments are ranged over as an array rather than concatenated
 	// with Files into one slice: this runs on the goroutine that routes every
@@ -261,8 +262,8 @@ func worktreeOfDir(ctx context.Context, dir string) (string, error) {
 	}
 	// Refused at the one place a worktree is minted, so no port is allocated and
 	// no gopls spawned for a path the map cannot hold: a Unix path is arbitrary
-	// bytes, but the map file is JSON, and json.Marshal replaces invalid UTF-8
-	// with U+FFFD rather than failing (§10). writeMap refuses it too — this is
+	// bytes, but the map file is JSON and v2 rejects invalid UTF-8 (§10).
+	// writeMap refuses it too — this is
 	// what keeps it from ever getting that far.
 	if !utf8.ValidString(worktree) {
 		return "", fmt.Errorf("worktree path is not valid UTF-8: %q", worktree)
@@ -278,10 +279,10 @@ func worktreeOfDir(ctx context.Context, dir string) (string, error) {
 // left alone rather than resolved here — routing already treats it as no
 // evidence, and rewriting is not worth stalling the reader for.
 //
-// Only the arguments named are touched: rewriteNested rebuilds the message from
-// the client's own key spellings, so arguments this manager does not model, and
+// Only the exact argument names are touched: rewriteNested preserves opaque
+// keys, so arguments this manager does not model, and
 // every field beside arguments, survive verbatim.
-func (r *router) canonicalToolCall(params json.RawMessage) (json.RawMessage, bool) {
+func (r *router) canonicalToolCall(params jsontext.Value) (jsontext.Value, bool) {
 	if !r.memo.aliased.Load() {
 		return params, false
 	}

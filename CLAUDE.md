@@ -23,21 +23,21 @@ Benchmarks and pprof recipes are in README.md "Development".
 One `router` (`bridge.go`) per frontend session. It owns routing state, the in-flight
 request map and per-worktree `lane`s. Both frontends build on it:
 
-- **stdio bridge** (`session.go`): `readFromClient` → `readIngress` admits calls into
+- **stdio bridge** (`bridge.go`): `readFromClient` → `readIngress` admits calls into
   the 64-message routing queue and handles `notifications/cancelled` immediately →
   `routing.go` resolves the target worktree → the call goes to that worktree's `lane`
-  (`lane.go`) → the upstream SSE connection → `readFromUpstream` (`upstream.go`)
+  (`lane.go`) → the upstream SSE connection → `readFromUpstream` (`bridge.go`)
   answers `roots/list` itself and forwards responses → `writeToClient`. Pathless calls
   follow `sticky`.
 - **HTTP** (`http.go`): `httpBackend` wraps a router with `stateless = true`. Pathless
   calls always go to home, there is no sticky state, and client IDs are rewritten to
   internal sequence IDs so different clients cannot collide.
 
-Worktree resolution (`paths.go`, `resolver.go`) shells out to `git rev-parse`. One
+Worktree resolution (`paths.go`, `routing.go`) shells out to `git rev-parse`. One
 resolver worker does the filesystem work behind a path memo and a directory memo;
 memo hits and pathless calls skip the worker.
 
-Request accounting (`requests.go`, `operations.go`) tracks client-visible calls
+Request accounting (`requests.go`) tracks client-visible calls
 (`awaitingUpstream`) apart from upstream operation credits. A credit is released
 only when gopls actually answers, not on local cancel or timeout.
 
@@ -47,7 +47,7 @@ flock-guarded and shared by every manager on the machine, and gopls children out
 the manager. Dropping a record without killing its process strands a 1–2 GB index,
 so liveness verdicts are conservative: only "connection refused" is conclusive, and
 a `ps` identity check runs before any signal. SPEC.md §8 has the rules. The one
-deliberate eviction is the open-file budget (`budget.go`, SPEC L6): on macOS each
+deliberate eviction is the open-file budget (`maintenance.go`, SPEC L6): on macOS each
 gopls holds a kqueue fd per worktree entry, so maintenance terminates the servers
 with the lowest aged use counts while the total lsof row count is over the limit,
 sparing any worktree with an upstream call under 30 s old (`pending.go`, which also

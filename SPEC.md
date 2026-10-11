@@ -243,11 +243,10 @@ that omits it.** Existing capabilities and roots settings are preserved. This
 makes S1/S2 independent of optional client behaviour; malformed parameters
 remain gopls' error to report.
 
-The client's own spelling of a key is the one rewritten, because `encoding/json`
-matches field names case-insensitively: a client that sent `Capabilities` has a
-field gopls already reads, and adding `capabilities` beside it would leave two
-keys mapping to one — with the capability this whole rule exists to add landing
-in whichever of them gopls did not take.
+Names are case-sensitive under JSON v2: only `capabilities` and `roots` are
+interpreted. Differently cased names remain opaque fields and cannot suppress
+the canonical capability this bridge adds. Duplicate names and invalid UTF-8
+are refused at the transport boundary.
 → `TestWithRootsCapability`, `TestRootlessInitializeIsForwardedWithWorkingRoots`,
   `FuzzWithRootsCapability`
 
@@ -732,8 +731,9 @@ lives in an unexported field of `CallToolResult`, which — like the other
 multi-round-trip results — carries none of the marker the SDK's own defaulting
 matches on, so nothing sets it and `omitempty` drops it; a client on protocol
 revision 2026-07-28 rejects a tool call without it. Unmarshalling is the only
-door into that field, so the value is spliced into the payload ahead of its
-keys, where a duplicate loses to an upstream that answered for itself. Both
+door into that field, so a missing value is spliced into the payload ahead of its
+keys. An existing `resultType` is preserved, including escaped key spellings;
+no duplicate key is inserted. Both
 defaults are the value an absent field means, `"public"` and `"complete"`. A
 case added to that middleware has to answer the same question for its result
 type.
@@ -747,3 +747,24 @@ bounded framing in the manager.
 Covered by `TestHTTPStatelessRoutingAndSSEReuse`, `TestHTTPProtocolAndErrors`,
 `TestHTTPCurrentSDKClient`, `TestHTTPDisconnectCancelsLegacySSECall`, and
 `TestHTTPBackendShutdownReleasesCalls`.
+
+## JSON processing
+
+All project-owned serialization uses `encoding/json/v2`; streaming framing uses
+`encoding/json/jsontext`, and opaque payloads use `jsontext.Value`. There are no
+v1 compatibility options. Names are case-sensitive: routing reads only `arguments`,
+`file`, `dir`, and `files`; cancellation reads only `requestId`. Unknown fields
+remain allowed. Duplicate names and invalid UTF-8 are rejected. HTTP validates
+bodies before SDK negotiation (invalid JSON receives 400); stdio rejects the
+message, and malformed upstream SSE JSON closes the connection. Byte limits and
+capacity reservations still apply before parsing.
+→ `TestPathArgumentsUseStrictJSON`, `TestStdioRejectsAmbiguousJSON`,
+`TestHTTPRejectsAmbiguousJSON`, `TestSSEReadContracts`
+
+Protocol adapters rewrite only exact names and preserve opaque fields. They
+return malformed input unchanged for the owning parser to reject. Result defaults
+never introduce duplicate names. Registry JSON uses the existing capitalized
+field names; differently cased manual entries no longer match those fields.
+Zero-valued optional record fields use `omitzero`. Nil maps and slices use v2's
+empty-object/empty-array defaults. SDK encoding remains an upstream dependency;
+the HTTP adapter explicitly retains an empty tool arguments object.

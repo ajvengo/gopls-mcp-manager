@@ -8,7 +8,7 @@ package main
 // go test -fuzz FuzzReadMap -fuzztime 30s
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"math"
 	"path/filepath"
 	"slices"

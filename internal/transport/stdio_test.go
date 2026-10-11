@@ -3,7 +3,8 @@ package transport
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"io"
 	"net"
 	"strings"
@@ -60,7 +61,6 @@ func TestStdioMatchesSDK(t *testing.T) {
 		`{"JSONRPC":"2.0","id":1,"method":"tools/list"}`,
 		`{"jsonrpc":"2.0","id":{},"method":"tools/list"}`,
 		`{"jsonrpc":"1.0","method":"tools/list"}`,
-		`{"jsonrpc":"2.0","method":"first","method":"second"}`,
 		`{"jsonrpc":"2.0","id":null,"result":1}`,
 		`{"jsonrpc":"2.0","id":1,"params":null,"method":"x"}`,
 		`null`, `[]`, `{}`, `{"jsonrpc":`,
@@ -89,6 +89,23 @@ func TestStdioMatchesSDK(t *testing.T) {
 	}
 }
 
+func TestStdioRejectsAmbiguousJSON(t *testing.T) {
+	t.Parallel()
+	for _, wire := range []string{
+		`{"jsonrpc":"2.0","method":"first","method":"second"}`,
+		`{"jsonrpc":"2.0","method":"x","params":{"file":"/a","file":"/b"}}`,
+		"{\"jsonrpc\":\"2.0\",\"method\":\"\xff\"}",
+	} {
+		t.Run(wire, func(t *testing.T) {
+			t.Parallel()
+			conn := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
+			defer func() { _ = conn.Close() }()
+			_, err := conn.Read(t.Context())
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestStdioPreservesBatchResponses(t *testing.T) {
 	t.Parallel()
 	var output bytes.Buffer
@@ -103,11 +120,11 @@ func TestStdioPreservesBatchResponses(t *testing.T) {
 	}
 	for _, id := range []string{"b", "a"} {
 		requestID, _ := jsonrpc.MakeID(id)
-		err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: json.RawMessage(`{}`)})
+		err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: jsontext.Value(`{}`)})
 		require.NoError(t, err)
 		require.Falsef(t, id == "b" && output.Len() != 0, "partial batch response escaped")
 	}
-	var responses []json.RawMessage
+	var responses []jsontext.Value
 	err := json.Unmarshal(output.Bytes(), &responses)
 	require.Truef(t, err == nil && len(responses) == 2, "batch response: %s, %v", output.Bytes(), err)
 }
@@ -167,7 +184,7 @@ func BenchmarkStdioTransport(b *testing.B) {
 			}
 			b.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
 			id, _ := jsonrpc.MakeID(float64(1))
-			req := &jsonrpc.Request{ID: id, Method: "tools/call", Params: json.RawMessage(`{"name":"go_file_context","arguments":{"file":"/repo/main.go"}}`)}
+			req := &jsonrpc.Request{ID: id, Method: "tools/call", Params: jsontext.Value(`{"name":"go_file_context","arguments":{"file":"/repo/main.go"}}`)}
 			go func() {
 				for b.Context().Err() == nil {
 					if writer.Write(b.Context(), req) != nil {

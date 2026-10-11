@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+
 	"fmt"
 	"io"
 	"net/http"
@@ -132,7 +133,7 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		b := newHTTPBackend(t.Context(), nil, testHome)
 		entered, release := make(chan struct{}), make(chan struct{})
-		b.r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, json.RawMessage) []string {
+		b.r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
 			close(entered)
 			<-release
 			return []string{testHome}
@@ -146,13 +147,13 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 		defer cancel()
 		coldDone := make(chan error, 1)
 		go func() {
-			var result json.RawMessage
+			var result jsontext.Value
 			coldDone <- b.call(ctx, "tools/call", fileCallParams("/cold/file.go"), &result)
 		}()
 		mustRecv(t, entered, "cold lookup did not start")
 		start := time.Now()
-		var result json.RawMessage
-		require.NoError(t, b.call(t.Context(), "tools/call", json.RawMessage(`{"arguments":{}}`), &result))
+		var result jsontext.Value
+		require.NoError(t, b.call(t.Context(), "tools/call", jsontext.Value(`{"arguments":{}}`), &result))
 		elapsed := time.Since(start)
 		require.Zero(t, elapsed, "warm HTTP call waited for the cold lookup budget")
 		cancel()

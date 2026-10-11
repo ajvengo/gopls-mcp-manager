@@ -18,7 +18,7 @@ type Limits struct {
 	SharedServers                     int
 	LogBytes                          int
 	// OpenFiles caps the lsof rows of every recorded gopls together; the
-	// command's budget.go says why that count grows with the worktree.
+	// command's maintenance.go says why that count grows with the worktree.
 	OpenFiles int
 	// Metrics is GOPLS_MANAGER_METRICS, kept here so the one env var that is
 	// not a limit is still read in the one place that reads the environment.
