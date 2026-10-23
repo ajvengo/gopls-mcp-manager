@@ -270,7 +270,10 @@ record whose partial directories no longer hold the same names, or hold a
 module file modified after its start (`StartedAtMilli`, M4b), by the L6 path:
 busy worktrees are spared and termination goes through L2. A snapshot of
 another server is ignored (without identities: one taken before the record's
-`StartedAt`), and a stale verdict drops it, so one change restarts one server.
+`StartedAt`). The snapshot is dropped only once the sweep has committed the
+server's termination or removal, so one change restarts one server, and a server
+spared (busy, an uncertain identity check, a record changed under the probe)
+stays stale for the next sweep.
 The next call starts a fresh one with a fresh plan.
 → `TestWatchStaleNoticesWhatNoRootCovers`,
 `TestMaintenanceRestartsAServerThatMissedAnUncoveredChange`,

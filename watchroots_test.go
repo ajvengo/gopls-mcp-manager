@@ -260,6 +260,30 @@ func TestMaintenanceRestartsAServerThatMissedAnUncoveredChange(t *testing.T) {
 	wantRunning(t, process, "a server with a fresh call was restarted")
 
 	m.endPending(call)
+	// An identity check that cannot answer keeps the server, so it must keep
+	// the change too.
+	uncertain, cancel := context.WithCancel(t.Context())
+	m.alive = func(context.Context, record) probeVerdict { cancel(); return probeLive }
+	_, _ = m.sweepMaintenance(uncertain)
+	wantRunning(t, process, "a server whose identity check was uncertain was restarted")
+	require.Contains(t, m.watch.plans, worktree, "an uncertain verdict used the change up")
+
+	// Another manager flushing uses between the probe and the commit makes
+	// withRecords keep the record it no longer recognises: the server stays,
+	// and so must the change.
+	m.alive = func(context.Context, record) probeVerdict {
+		flushed := stale
+		flushed.Uses, flushed.UsedAt = 1, time.Now().Unix()
+		mustWriteMap(t, m.mapPath, []record{flushed})
+		return probeLive
+	}
+	_, err = m.sweepMaintenance(t.Context())
+	require.NoError(t, err)
+	wantRunning(t, process, "a server whose record changed under the probe was restarted")
+	require.Contains(t, m.watch.plans, worktree, "a verdict withRecords did not commit used the change up")
+	mustWriteMap(t, m.mapPath, []record{stale})
+
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	_, err = m.sweepMaintenance(t.Context())
 	require.NoError(t, err)
 	select {
