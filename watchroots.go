@@ -89,6 +89,12 @@ func moduleFile(name string) bool {
 	return false
 }
 
+// rulePath is the path a filter rule names, slash-cleaned and relative to the
+// worktree: "" for a rule covering the whole worktree.
+func rulePath(rule string) string {
+	return strings.TrimPrefix(path.Clean("/"+rule[1:]), "/")
+}
+
 // pathIncludeFunc is gopls' cache.PathIncludeFunc: rules are evaluated in order
 // and the last match wins, a rule matches its path and everything below it, and
 // a "**" segment matches zero or more segments. Paths are slash-separated and
@@ -97,7 +103,7 @@ func pathIncludeFunc(rules []string) func(string) bool {
 	matchers := make([]*regexp.Regexp, len(rules))
 	included := make([]bool, len(rules))
 	for i, rule := range rules {
-		prefix := strings.TrimPrefix(path.Clean("/"+rule[1:]), "/")
+		prefix := rulePath(rule)
 		pattern := ".*"
 		if prefix != "" {
 			var b strings.Builder
@@ -144,7 +150,7 @@ func newDirFilter(rules []string) dirFilter {
 		if rule[0] != '+' {
 			continue
 		}
-		prefix := strings.TrimPrefix(path.Clean("/"+rule[1:]), "/")
+		prefix := rulePath(rule)
 		if prefix == "" || slices.Contains(strings.Split(prefix, "/"), "**") {
 			plus = append(plus, "**")
 			break
@@ -309,8 +315,9 @@ func relevantNames(entries []os.DirEntry, rel string, filter dirFilter, files bo
 	for _, e := range entries {
 		name := e.Name()
 		switch {
-		case e.IsDir():
-			if !skippedByWatcher(name) && (files && filter.include(path.Join(rel, name)) || !files && filter.worthListing(path.Join(rel, name))) {
+		case e.IsDir() && !skippedByWatcher(name):
+			child := path.Join(rel, name)
+			if files && filter.include(child) || !files && filter.worthListing(child) {
 				names = append(names, name+"/")
 			}
 		case files && e.Type().IsRegular() && watchedFile(name):

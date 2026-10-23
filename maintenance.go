@@ -47,13 +47,12 @@ func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 		}
 		if victim || stale {
 			if busy, err := m.busyWorktrees(time.Now()); err == nil && !busy[r.Worktree] {
-				verdict := identityVerdict(ctx, r)
-				if stale && verdict != probeUncertain {
+				if stale {
 					condemnedMu.Lock()
 					condemned[r] = snapshot
 					condemnedMu.Unlock()
 				}
-				return verdict
+				return identityVerdict(ctx, r)
 			}
 		}
 		info, err := os.Stat(r.Worktree)

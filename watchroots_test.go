@@ -186,11 +186,7 @@ func TestWatchStaleJudgesExcludedSubdirectoriesByPlusRules(t *testing.T) {
 
 func TestWatchStaleNoticesWhatNoRootCovers(t *testing.T) {
 	t.Parallel()
-	worktree := t.TempDir()
-	mustTree(t, worktree, map[string]string{"go.mod": "module m\n", "main.go": "package main\n", "docs/": "", "pkg/": ""})
-	m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}, limits: config.Limits{DirectoryFilters: []string{"-docs"}}}
-	past := time.Now().Add(-2 * time.Minute)
-	require.NoError(t, os.Chtimes(filepath.Join(worktree, "go.mod"), past, past))
+	m, worktree := partialWorktree(t)
 	r := record{Worktree: worktree, StartedAt: time.Now().Add(-time.Minute).Unix()}
 	remember := func() { m.rememberWatch(worktree, serverID{}, planWatch(worktree, m.limits.DirectoryFilters)) }
 
