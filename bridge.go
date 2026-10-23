@@ -38,6 +38,9 @@ type router struct {
 	// read under this same context for the rest of its life, so the caller
 	// cancels it on expiry rather than passing a deadline down. See dialBounded.
 	dial func(context.Context, string) (mcp.Connection, error)
+	// plan computes a worktree's roots for answerRoots. A seam, like dial: the
+	// real one walks the tree, which a test cannot hold open any other way.
+	plan func(worktree string, global []string) watchPlan
 
 	mu sync.Mutex
 	// Client requests still in flight, so that a dying gopls fails its callers
@@ -90,6 +93,7 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 	}
 	r.limits = r.limits.WithDefaults()
 	r.dial = r.dialGopls
+	r.plan = planWatch
 	r.sseBudget = transport.NewBudget(r.limits.SSEBytes)
 	return r
 }
@@ -287,6 +291,14 @@ func errorResponse(id jsonrpc.ID, code int64, format string, args ...any) *jsonr
 }
 
 func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
+	// roots/list is answered off this loop: planning walks the worktree, and
+	// nothing else from this upstream is forwarded while the loop is in it. One
+	// worker per reader keeps the walks serial and the goroutines bounded; the
+	// queue is small because gopls asks rarely, and a full one only slows the
+	// reader to the old behaviour.
+	asks := make(chan jsonrpc.ID, 4)
+	defer close(asks)
+	go r.answerRootsAsks(conn, worktree, asks)
 	for {
 		msg, err := conn.Read(r.ctx)
 		if err != nil {
@@ -294,6 +306,14 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 			// connection fails the next write, which redials and retries once.
 			r.failInFlight(conn, worktree, err)
 			return
+		}
+		if req, ok := msg.(*jsonrpc.Request); ok && req.ID.IsValid() && req.Method == "roots/list" {
+			select {
+			case asks <- req.ID:
+			case <-r.ctx.Done():
+				return
+			}
+			continue
 		}
 		if answered, err := r.answeredUpstream(r.ctx, conn, worktree, msg); err != nil {
 			_ = conn.Close()
@@ -314,6 +334,30 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 	}
 }
 
+// answerRootsAsks replies to the roots/list ids the reader hands over, each
+// under its own delivery ceiling (S4a). A failed reply closes the connection,
+// which fails the reader's Read, and fails the connection's calls here as well:
+// failInFlight claims each id under r.mu, so whichever of the two runs first
+// answers it and the other finds nothing. Later asks on a failed connection are
+// drained unanswered, so the reader never blocks on a dead worker. It ends when
+// the reader closes asks.
+func (r *router) answerRootsAsks(conn mcp.Connection, worktree string, asks <-chan jsonrpc.ID) {
+	failed := false
+	for id := range asks {
+		if failed {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(r.ctx, sendBudget)
+		err := r.answerRoots(ctx, conn, worktree, id)
+		cancel()
+		if err != nil {
+			failed = true
+			_ = conn.Close()
+			r.failInFlight(conn, worktree, err)
+		}
+	}
+}
+
 // answeredUpstream handles a server-initiated request here rather than passing
 // it to the client, and reports whether it did.
 //
@@ -323,7 +367,9 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 // is the kinder reply.
 //
 // ctx is the caller's budget for talking to conn: the handshake answers roots
-// inside its deadline (S2); steady-state replies get the delivery ceiling.
+// inside its deadline (S2); steady-state replies get the delivery ceiling. Only
+// the handshake reaches roots/list here: the steady-state reader hands it to
+// answerRootsAsks, so its walk of the worktree blocks no response.
 func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, worktree string, msg jsonrpc.Message) (bool, error) {
 	req, ok := msg.(*jsonrpc.Request)
 	if !ok || !req.ID.IsValid() {
@@ -350,8 +396,8 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 // nothing and answer "no package metadata" for a file that is right there on
 // disk — indistinguishable from a genuinely broken tree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) error {
-	plan := planWatch(worktree, r.limits.DirectoryFilters)
-	r.m.rememberWatch(worktree, plan)
+	plan := r.plan(worktree, r.limits.DirectoryFilters)
+	r.m.rememberWatch(worktree, serverOf(conn), plan)
 	// Strings in a fixed shape: marshaling them cannot fail, and there would be
 	// nobody to tell anyway — the id belongs to the upstream, so an error reply
 	// sent to the client would answer a question it never asked.

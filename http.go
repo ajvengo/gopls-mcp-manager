@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -115,7 +116,8 @@ func (b *httpBackend) start() {
 			select {
 			case <-b.r.ctx.Done():
 				return
-			case <-b.r.errs:
+			case err := <-b.r.errs:
+				fmt.Fprintln(os.Stderr, "gopls-mcp-manager: http session:", err)
 				b.cancel()
 				return
 			case msg := <-b.r.out:

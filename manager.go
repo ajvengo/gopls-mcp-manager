@@ -129,10 +129,17 @@ func portUnavailable(port int) bool {
 // lock is dropped is what makes that safe: it reserves the port, and startGrace
 // keeps a concurrent sweep from reaping a server that has not bound yet.
 func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
+	r, err := m.ensureRecord(ctx, worktree)
+	return r.Port, err
+}
+
+// ensureRecord is ensure answering with the record of the gopls it vouches for,
+// for a caller that must know which server it is about to talk to.
+func (m *manager) ensureRecord(ctx context.Context, worktree string) (record, error) {
 	defer m.timed("ensure", time.Now())
 	claimed, started, err := m.claimPort(ctx, worktree)
 	if err != nil {
-		return 0, err
+		return record{}, err
 	}
 	// P6. A record inside its start grace was vouched for by L7 without being
 	// probed at all, so its port can still refuse: the gopls it names was forked
@@ -143,7 +150,7 @@ func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
 	// below depend on how long the sweep's probes took, and a slow one would
 	// silently skip both the wait and the SIGTERM that follows it.
 	if started == nil && !withinStartGrace(claimed) {
-		return claimed.Port, nil
+		return claimed, nil
 	}
 	readyStart := time.Now()
 	readyErr := m.ready(ctx, claimed.Port)
@@ -156,18 +163,18 @@ func (m *manager) ensure(ctx context.Context, worktree string) (int, error) {
 		if started == nil {
 			// Somebody else's start, and its failure belongs to them: that
 			// process signals and forgets. This only reports it.
-			return 0, err
+			return record{}, err
 		}
 		// Cleanup survives request cancellation and completes before the CLI
 		// can exit. If exit cannot be confirmed, keep the record discoverable.
 		if stopErr := started.stop(); stopErr != nil {
-			return 0, errors.Join(err, stopErr)
+			return record{}, errors.Join(err, stopErr)
 		}
 		cleanup, cancel := context.WithTimeout(context.Background(), exitGrace)
 		defer cancel()
-		return 0, errors.Join(err, m.forget(cleanup, claimed))
+		return record{}, errors.Join(err, m.forget(cleanup, claimed))
 	}
-	return claimed.Port, nil
+	return claimed, nil
 }
 
 func (m *manager) timed(stage string, start time.Time) {
@@ -207,11 +214,14 @@ func (m *manager) claimPort(ctx context.Context, worktree string) (record, *chil
 		if err != nil {
 			return nil, err
 		}
+		now := time.Now()
 		claimed = record{
 			Worktree:  worktree,
 			Port:      port,
 			PID:       started.Pid,
-			StartedAt: time.Now().Unix(),
+			StartedAt: now.Unix(),
+			// The same instant, so the two always agree.
+			StartedAtMilli: now.UnixMilli(),
 		}
 		return append(records, claimed), nil
 	})

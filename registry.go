@@ -24,13 +24,55 @@ type record struct {
 	// the record unreapable until startGrace is up; see recordAlive. Zero in a
 	// map written before the field existed, which reads as "no grace" — the
 	// behaviour those records already had.
-	StartedAt   int64
-	Terminating bool `json:",omitzero"`
+	StartedAt int64
+	// StartedAtMilli is the same instant in unix milliseconds, for comparing
+	// the start with a file's mtime (see startedPrecisely). Zero in a map
+	// written by a manager that predates it; that reader then falls back to
+	// StartedAt.
+	StartedAtMilli int64 `json:",omitzero"`
+	Terminating    bool  `json:",omitzero"`
 	// Uses is the server's tools/call count, halved every useHalfLife, as of
 	// UsedAt in unix seconds; see frequency. Shared through the map so every
 	// manager evicts by the same ranking.
 	Uses   float64 `json:",omitzero"`
 	UsedAt int64   `json:",omitzero"`
+}
+
+// startedPrecisely is when r's gopls was spawned, to the millisecond, and false
+// for a record that cannot say. StartedAtMilli is trusted only when it agrees
+// with StartedAt: the map is meant to be editable by hand, and a milli that
+// contradicts the seconds beside it is a typo, not a better clock. A map
+// rewritten by an older manager carries no milli at all, so the seconds stand
+// in. A zero StartedAt is no start at all.
+func (r record) startedPrecisely() (time.Time, bool) {
+	if r.StartedAt == 0 {
+		return time.Time{}, false
+	}
+	if r.StartedAtMilli != 0 && r.StartedAtMilli/1000 == r.StartedAt {
+		return time.UnixMilli(r.StartedAtMilli), true
+	}
+	return time.Unix(r.StartedAt, 0), true
+}
+
+// serverID names one gopls process: its pid and the unix second it started. A
+// pid alone is reused; the start tells a restart on the same pid from the same
+// server. Whole seconds, not StartedAtMilli: an older manager rewriting the map
+// drops the milli, and an identity that changed under it would orphan the
+// server's snapshot. The zero value is "unknown", which is what a connection
+// that did not come from ensure — a test's stub — carries.
+type serverID struct {
+	pid     int
+	started int64
+}
+
+func (id serverID) known() bool { return id.pid != 0 }
+
+// server is the identity of the gopls r describes, unknown when r has no start.
+func (r record) server() serverID {
+	if r.StartedAt == 0 {
+		return serverID{}
+	}
+	return serverID{pid: r.PID, started: r.StartedAt}
 }
 
 // keepRecords is the body that changes nothing: withRecords sweeps whatever the

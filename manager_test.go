@@ -622,6 +622,7 @@ func TestClaimPortReturnsBeforeItsGoplsIsReady(t *testing.T) {
 	records := mustReadMap(t, m.mapPath)
 	require.Truef(t, slices.Equal(records, []record{claimed}) && claimed.PID == started.Pid,
 		"records = %#v, want just the claim %#v for pid %d", records, claimed, started.Pid)
+	assert.EqualValuesf(t, claimed.StartedAt, claimed.StartedAtMilli/1000, "claim %#v: milliseconds and seconds name different instants", claimed)
 	assert.Truef(t, withinStartGrace(records[0]), "record stamped %d is outside its own start grace, want one a sweep would spare", records[0].StartedAt)
 }
 

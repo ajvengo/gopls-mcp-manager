@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -71,11 +72,11 @@ func TestModuleIgnoreFiltersReadGoModAndGoWork(t *testing.T) {
 	mustTree(t, worktree, map[string]string{
 		"go.work":        "go 1.27\n\nuse (\n\t.\n\t./sub\n\t../outside\n)\n",
 		"go.mod":         "module example.com/root\n\ngo 1.27\n\nignore (\n\t./docs/\n\tnode_modules\n)\n",
-		"sub/go.mod":     "module example.com/sub\n\ngo 1.27\n\nignore ./gen\n",
+		"sub/go.mod":     "module example.com/sub\n\ngo 1.27\n\nignore (\n\t./gen\n\tmocks\n)\n",
 		"broken/go.mod":  "not a go.mod",
 		"../outside/x.g": "",
 	})
-	assert.Equal(t, []string{"-docs", "-**/node_modules", "-sub/gen"}, moduleIgnoreFilters(worktree))
+	assert.Equal(t, []string{"-docs", "-**/node_modules", "-sub/gen", "-sub/mocks", "-sub/**/mocks"}, moduleIgnoreFilters(worktree))
 	assert.Nil(t, moduleIgnoreFilters(t.TempDir()), "no go.mod, no filters")
 }
 
@@ -135,50 +136,94 @@ func TestPlanWatchReincludesBelowAnExcludedTree(t *testing.T) {
 	assert.Equal(t, partialEntries{names: []string{"more/"}}, plan.partial[filepath.Join(worktree, "docs", "deep")])
 }
 
-func TestWatchStaleNoticesWhatNoRootCovers(t *testing.T) {
+// TestPlanWatchDescendsOnlyWhereAPlusRuleCanReach pins that an excluded tree is
+// walked, and its subdirectories recorded, only when a + rule could include
+// something in it: a big node_modules costs nothing next to a +docs/go rule.
+func TestPlanWatchDescendsOnlyWhereAPlusRuleCanReach(t *testing.T) {
 	t.Parallel()
 	worktree := t.TempDir()
-	mustTree(t, worktree, map[string]string{"go.mod": "module m\n", "main.go": "package main\n", "docs/": "", "pkg/": ""})
-	m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}, limits: config.Limits{DirectoryFilters: []string{"-docs"}}}
+	mustTree(t, worktree, map[string]string{
+		"web/node_modules/a/b/c/": "", "web/node_modules/d/": "", "docs/go/x.go": "package x\n", "docs/other/deep/": "", "pkg/": "",
+	})
+	keys := func(rules ...string) []string {
+		var rels []string
+		for dir := range planWatch(worktree, rules).partial {
+			rel, err := filepath.Rel(worktree, dir)
+			require.NoError(t, err)
+			rels = append(rels, filepath.ToSlash(rel))
+		}
+		slices.Sort(rels)
+		return rels
+	}
+	assert.Equal(t, []string{".", "docs", "web"}, keys("-**/node_modules", "-docs", "+docs/go"),
+		"nothing under node_modules, nor docs/other, is walked")
+	assert.Equal(t, []string{".", "docs", "docs/go", "docs/other", "docs/other/deep", "web", "web/node_modules", "web/node_modules/a", "web/node_modules/a/b", "web/node_modules/a/b/c", "web/node_modules/d"},
+		keys("-**/node_modules", "-docs", "+**/x"), "a ** segment may match anywhere: the full walk")
+	assert.Equal(t, []string{".", "docs"}, keys("-", "+docs/go/"),
+		"a bare - with later + rules walks only toward them")
+}
+
+// TestWatchStaleJudgesExcludedSubdirectoriesByPlusRules pins that a new
+// directory under an excluded tree condemns a server only when a + rule can
+// reach it.
+func TestWatchStaleJudgesExcludedSubdirectoriesByPlusRules(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	mustTree(t, worktree, map[string]string{"go.mod": "module m\n", "docs/notes.md": "", "pkg/": ""})
+	m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}, limits: config.Limits{DirectoryFilters: []string{"-docs", "+docs/go"}}}
 	past := time.Now().Add(-2 * time.Minute)
 	require.NoError(t, os.Chtimes(filepath.Join(worktree, "go.mod"), past, past))
 	r := record{Worktree: worktree, StartedAt: time.Now().Add(-time.Minute).Unix()}
-	remember := func() { m.rememberWatch(worktree, planWatch(worktree, m.limits.DirectoryFilters)) }
+	plan := planWatch(worktree, m.limits.DirectoryFilters)
+	assert.Equal(t, []string{"pkg"}, relRoots(t, worktree, plan))
+	m.rememberWatch(worktree, serverID{}, plan)
+
+	require.NoError(t, os.Mkdir(filepath.Join(worktree, "docs", "x"), 0o700))
+	require.False(t, watchStale(m, r), "docs/x is unreachable for +docs/go")
+	require.NoError(t, os.Mkdir(filepath.Join(worktree, "docs", "go"), 0o700))
+	require.True(t, watchStale(m, r), "docs/go is re-included")
+}
+
+func TestWatchStaleNoticesWhatNoRootCovers(t *testing.T) {
+	t.Parallel()
+	m, worktree := partialWorktree(t)
+	r := record{Worktree: worktree, StartedAt: time.Now().Add(-time.Minute).Unix()}
+	remember := func() { m.rememberWatch(worktree, serverID{}, planWatch(worktree, m.limits.DirectoryFilters)) }
 
 	remember()
-	require.False(t, m.watchStale(r), "nothing changed")
+	require.False(t, watchStale(m, r), "nothing changed")
 	mustWriteFile(t, filepath.Join(worktree, "README.md"), "")
 	mustWriteFile(t, filepath.Join(worktree, "main.go"), "package main // edited\n")
 	require.NoError(t, os.Mkdir(filepath.Join(worktree, "docs", "more"), 0o700))
-	require.False(t, m.watchStale(r), "a non-Go file, an edit gopls checks itself and an excluded directory are not news")
+	require.False(t, watchStale(m, r), "a non-Go file, an edit gopls checks itself and an excluded directory are not news")
 
 	mustWriteFile(t, filepath.Join(worktree, "new.go"), "package main\n")
-	require.True(t, m.watchStale(r), "a Go file no root covers was added")
-	require.False(t, m.watchStale(r), "the stale verdict drops the snapshot: one change condemns one server")
+	require.True(t, watchStale(m, r), "a Go file no root covers was added")
+	require.False(t, watchStale(m, r), "the stale verdict drops the snapshot: one change condemns one server")
 
 	remember()
 	require.NoError(t, os.Mkdir(filepath.Join(worktree, "cmd"), 0o700))
-	require.True(t, m.watchStale(r), "a new top-level directory")
+	require.True(t, watchStale(m, r), "a new top-level directory")
 
 	remember()
 	future := time.Now().Add(time.Minute)
 	require.NoError(t, os.Chtimes(filepath.Join(worktree, "go.mod"), future, future))
-	require.True(t, m.watchStale(r), "go.mod changed after the server started")
+	require.True(t, watchStale(m, r), "go.mod changed after the server started")
 
 	remember()
-	require.False(t, m.watchStale(record{Worktree: worktree, StartedAt: time.Now().Add(time.Hour).Unix()}),
+	require.False(t, watchStale(m, record{Worktree: worktree, StartedAt: time.Now().Add(time.Hour).Unix()}),
 		"a snapshot older than the server describes a predecessor")
-	require.False(t, m.watchStale(record{Worktree: worktree}), "legacy records skip the mtime check")
-	require.False(t, (&manager{}).watchStale(r), "a manager without plans condemns nothing")
+	require.False(t, watchStale(m, record{Worktree: worktree}), "legacy records skip the mtime check")
+	require.False(t, watchStale(&manager{}, r), "a manager without plans condemns nothing")
 }
 
 func TestRememberWatchForgetsAPlanWithNothingUncovered(t *testing.T) {
 	t.Parallel()
 	m := &manager{watch: &watchPlans{plans: map[string]watchSnapshot{"/w": {}}}}
-	m.rememberWatch("/w", watchPlan{roots: []string{"/w"}})
+	m.rememberWatch("/w", serverID{}, watchPlan{roots: []string{"/w"}})
 	assert.Empty(t, m.watch.plans)
 	var none *manager
-	none.rememberWatch("/w", watchPlan{}) // nil-safe
+	none.rememberWatch("/w", serverID{}, watchPlan{}) // nil-safe
 }
 
 func TestMaintenanceRestartsAServerThatMissedAnUncoveredChange(t *testing.T) {
@@ -196,19 +241,51 @@ func TestMaintenanceRestartsAServerThatMissedAnUncoveredChange(t *testing.T) {
 	stale := record{Worktree: worktree, PID: process.Process.Pid, Port: firstPort, StartedAt: time.Now().Add(-time.Minute).Unix()}
 	mustWriteMap(t, m.mapPath, []record{stale})
 	m.alive = func(context.Context, record) probeVerdict { return probeLive }
-	m.rememberWatch(worktree, planWatch(worktree, m.limits.DirectoryFilters))
+	m.rememberWatch(worktree, serverID{}, planWatch(worktree, m.limits.DirectoryFilters))
 
 	_, err := m.sweepMaintenance(t.Context())
 	require.NoError(t, err)
 	wantRunning(t, process, "an unchanged worktree was restarted")
 
 	require.NoError(t, os.Mkdir(filepath.Join(worktree, "cmd"), 0o700))
+	m.pending = newPendingCalls()
+	call := operationKey{id: mustID(t, "busy")}
+	m.beginPending(call, worktree)
+	_, err = m.sweepMaintenance(t.Context())
+	require.NoError(t, err)
+	wantRunning(t, process, "a server with a fresh call was restarted")
+
+	m.endPending(call)
+	// An identity check that cannot answer keeps the server, so it must keep
+	// the change too.
+	uncertain, cancel := context.WithCancel(t.Context())
+	m.alive = func(context.Context, record) probeVerdict { cancel(); return probeLive }
+	_, _ = m.sweepMaintenance(uncertain)
+	wantRunning(t, process, "a server whose identity check was uncertain was restarted")
+	require.Contains(t, m.watch.plans, worktree, "an uncertain verdict used the change up")
+
+	// Another manager flushing uses between the probe and the commit makes
+	// withRecords keep the record it no longer recognises: the server stays,
+	// and so must the change.
+	m.alive = func(context.Context, record) probeVerdict {
+		flushed := stale
+		flushed.Uses, flushed.UsedAt = 1, time.Now().Unix()
+		mustWriteMap(t, m.mapPath, []record{flushed})
+		return probeLive
+	}
+	_, err = m.sweepMaintenance(t.Context())
+	require.NoError(t, err)
+	wantRunning(t, process, "a server whose record changed under the probe was restarted")
+	require.Contains(t, m.watch.plans, worktree, "a verdict withRecords did not commit used the change up")
+	mustWriteMap(t, m.mapPath, []record{stale})
+
+	m.alive = func(context.Context, record) probeVerdict { return probeLive }
 	_, err = m.sweepMaintenance(t.Context())
 	require.NoError(t, err)
 	select {
 	case <-exited:
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the server that missed a new directory was not terminated")
+		require.FailNow(t, "the server that missed a new directory was not terminated once its worktree went idle")
 	}
 	stale.Terminating = true
 	wantRecords(t, m.mapPath, "the restart did not persist termination", stale)
@@ -236,4 +313,175 @@ func TestUpstreamRootsCoverTheWorktreeMinusFilters(t *testing.T) {
 		}
 		assert.Equal(t, []string{"file://" + filepath.Join(worktree, "cmd"), "file://" + filepath.Join(worktree, "pkg")}, uris)
 	})
+}
+
+// watchStale is watchChanged plus what the sweep does with a condemned server:
+// the verdict drops the snapshot, so one change condemns one server.
+func watchStale(m *manager, r record) bool {
+	snapshot, stale := m.watchChanged(r)
+	if stale {
+		m.forgetWatch(r.Worktree, snapshot)
+	}
+	return stale
+}
+
+// partialWorktree is a worktree whose docs directory is excluded, so that the
+// worktree itself is a partial directory.
+func partialWorktree(t *testing.T) (*manager, string) {
+	t.Helper()
+	worktree := t.TempDir()
+	mustTree(t, worktree, map[string]string{"go.mod": "module m\n", "main.go": "package main\n", "docs/": "", "pkg/": ""})
+	past := time.Now().Add(-2 * time.Minute)
+	require.NoError(t, os.Chtimes(filepath.Join(worktree, "go.mod"), past, past))
+	m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}, limits: config.Limits{DirectoryFilters: []string{"-docs"}}}
+	return m, worktree
+}
+
+func serverRecord(worktree string, pid int, started time.Time) record {
+	return record{Worktree: worktree, PID: pid, StartedAt: started.Unix(), StartedAtMilli: started.UnixMilli()}
+}
+
+// A later roots answer comes from another session reaching the same gopls, whose
+// watcher still holds only what the first answer told it. The tree that answer
+// describes already holds whatever was added since, so it must not replace the
+// snapshot the server's watcher is judged by.
+func TestRememberWatchKeepsTheFirstSnapshotOfAServer(t *testing.T) {
+	t.Parallel()
+	m, worktree := partialWorktree(t)
+	started := time.Now().Add(-time.Minute)
+	first := serverRecord(worktree, 100, started)
+	remember := func(r record) { m.rememberWatch(worktree, r.server(), planWatch(worktree, m.limits.DirectoryFilters)) }
+
+	remember(first)
+	mustWriteFile(t, filepath.Join(worktree, "new.go"), "package main\n")
+	remember(first) // the second session's answer already sees new.go
+	rewritten := first
+	rewritten.StartedAtMilli = 0 // an older manager rewrote the map
+	require.True(t, watchStale(m, rewritten), "the change between the two answers is still the server's to be condemned for, whoever rewrote its record")
+
+	// A restart reports for itself: its snapshot replaces, and the predecessor's
+	// verdict cannot be read off it.
+	remember(first)
+	second := serverRecord(worktree, 101, started.Add(time.Second))
+	remember(second)
+	mustWriteFile(t, filepath.Join(worktree, "newer.go"), "package main\n")
+	require.False(t, watchStale(m, first), "a snapshot from another server describes no watcher of this one")
+	require.True(t, watchStale(m, second), "the restarted server's own snapshot")
+}
+
+func TestWatchChangedIgnoresASnapshotFromAnotherServer(t *testing.T) {
+	t.Parallel()
+	m, worktree := partialWorktree(t)
+	started := time.Now().Add(-time.Minute)
+	mine := serverRecord(worktree, 100, started)
+	m.rememberWatch(worktree, serverRecord(worktree, 100, started.Add(time.Second)).server(), planWatch(worktree, m.limits.DirectoryFilters))
+	mustWriteFile(t, filepath.Join(worktree, "new.go"), "package main\n")
+	require.False(t, watchStale(m, mine), "same pid, another start: a different server")
+
+	// Unknown on either side falls back to comparing the clock.
+	m.rememberWatch(worktree, serverID{}, planWatch(worktree, m.limits.DirectoryFilters))
+	mustWriteFile(t, filepath.Join(worktree, "newer.go"), "package main\n")
+	require.True(t, watchStale(m, record{Worktree: worktree, PID: 100, StartedAt: started.Unix()}), "an unidentified snapshot taken since the start")
+}
+
+// A server told to watch the whole worktree never unwatches it, so a later
+// answer with partial directories cannot make it miss anything: it must store
+// nothing that could condemn it.
+func TestRememberWatchPinsAServerThatHadNothingUncovered(t *testing.T) {
+	t.Parallel()
+	m, worktree := partialWorktree(t)
+	started := time.Now().Add(-time.Minute)
+	r := serverRecord(worktree, 100, started)
+
+	m.rememberWatch(worktree, r.server(), watchPlan{roots: []string{worktree}})
+	assert.Contains(t, m.watch.plans, worktree, "the fact that nothing is uncovered is what later answers keep")
+	m.rememberWatch(worktree, r.server(), planWatch(worktree, m.limits.DirectoryFilters))
+	mustWriteFile(t, filepath.Join(worktree, "new.go"), "package main\n")
+	require.False(t, watchStale(m, r))
+	assert.Empty(t, m.watch.plans[worktree].partial)
+
+	// An unidentified server still stores nothing for a plan with no partials.
+	m.rememberWatch(worktree, serverID{}, watchPlan{roots: []string{worktree}})
+	assert.NotContains(t, m.watch.plans, worktree)
+}
+
+func TestServerOfReadsTheIdentityThroughBoundedConn(t *testing.T) {
+	t.Parallel()
+	id := serverID{pid: 7, started: 1_700_000_000}
+	conn := &boundedConn{Connection: &identifiedConn{Connection: loopbackConn(), id: id}, release: func() {}}
+	assert.Equal(t, id, serverOf(conn))
+	assert.False(t, serverOf(loopbackConn()).known(), "a stub dial carries no identity")
+	assert.False(t, (&boundedConn{Connection: loopbackConn(), release: func() {}}).server().known())
+}
+
+func TestStartedPrecisely(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		r    record
+		want time.Time
+		ok   bool
+	}{
+		{name: "no start", r: record{}},
+		{name: "milliseconds", r: record{StartedAt: 1000, StartedAtMilli: 1_000_900}, want: time.UnixMilli(1_000_900), ok: true},
+		{name: "seconds only", r: record{StartedAt: 1000}, want: time.Unix(1000, 0), ok: true},
+		{name: "inconsistent milliseconds", r: record{StartedAt: 1000, StartedAtMilli: 5_000_900}, want: time.Unix(1000, 0), ok: true},
+		{name: "milliseconds without seconds", r: record{StartedAtMilli: 1_000_900}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := tc.r.startedPrecisely()
+			assert.Equal(t, tc.ok, ok)
+			assert.True(t, tc.want.Equal(got), "got %v, want %v", got, tc.want)
+		})
+	}
+}
+
+// go.mod tidied at 12:00:00.6 and a server started at 12:00:00.9 is not a
+// server that missed the edit, although whole seconds would say so.
+func TestModuleFileMtimeIsComparedWithThePreciseStart(t *testing.T) {
+	t.Parallel()
+	whole := time.Now().Add(-time.Minute).Truncate(time.Second)
+	started := whole.Add(900 * time.Millisecond)
+	for _, tc := range []struct {
+		name  string
+		mtime time.Time
+		r     record
+		want  bool
+	}{
+		{name: "300ms before", mtime: started.Add(-300 * time.Millisecond), r: serverRecord("", 1, started), want: false},
+		{name: "300ms after", mtime: started.Add(300 * time.Millisecond), r: serverRecord("", 1, started), want: true},
+		{name: "no milliseconds falls back to seconds", mtime: started.Add(-300 * time.Millisecond), r: record{PID: 1, StartedAt: started.Unix()}, want: true},
+		{name: "inconsistent milliseconds falls back to seconds", mtime: started.Add(-300 * time.Millisecond), r: record{PID: 1, StartedAt: started.Unix(), StartedAtMilli: started.UnixMilli() + 5000}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m, worktree := partialWorktree(t)
+			require.NoError(t, os.Chtimes(filepath.Join(worktree, "go.mod"), tc.mtime, tc.mtime))
+			m.rememberWatch(worktree, serverID{}, planWatch(worktree, m.limits.DirectoryFilters))
+			tc.r.Worktree = worktree
+			_, stale := m.watchChanged(tc.r)
+			assert.Equal(t, tc.want, stale)
+		})
+	}
+}
+
+func TestMapKeepsTheMillisecondStart(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t)
+	want := record{Worktree: "/repo/a", Port: 62001, PID: 11, StartedAt: 1000, StartedAtMilli: 1_000_900}
+	mustWriteMap(t, m.mapPath, []record{want})
+	got, intact, err := readMap(m.mapPath)
+	require.NoError(t, err)
+	require.True(t, intact)
+	assert.Equal(t, []record{want}, got)
+
+	// A line an older manager wrote has no such member and still parses.
+	appendToMap(t, m.mapPath, `{"Worktree":"/repo/old","Port":62002,"PID":12,"StartedAt":2000}`+"\n")
+	got, intact, err = readMap(m.mapPath)
+	require.NoError(t, err)
+	require.True(t, intact)
+	require.Len(t, got, 2)
+	assert.Zero(t, got[1].StartedAtMilli)
+	assert.EqualValues(t, 2000, got[1].StartedAt)
 }

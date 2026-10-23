@@ -18,13 +18,19 @@ import (
 
 // sweepMaintenance reaps servers whose worktree is gone, evicts those over the
 // open-file budget, and restarts those that missed a change no watched root
-// covers (watchStale). All reach a signal only through identityVerdict and
+// covers (watchChanged). All reach a signal only through identityVerdict and
 // withRecords' persisted termination, like any other condemned record.
 func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 	victims, err := m.evictionVictims(ctx)
 	if err != nil {
 		return nil, err
 	}
+	// Stale servers a probe condemned, with the snapshot each was judged by.
+	// Probes run concurrently, hence the lock.
+	var (
+		condemnedMu sync.Mutex
+		condemned   = make(map[record]watchSnapshot)
+	)
 	maintenance := *m
 	maintenance.alive = func(ctx context.Context, r record) probeVerdict {
 		verdict := m.alive(ctx, r)
@@ -33,8 +39,19 @@ func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 		}
 		// Asked again just before the verdict: a call may have reached this
 		// server since the victims were picked.
-		if slices.Contains(victims, r) || (!r.Terminating && m.watchStale(r)) {
+		victim := slices.Contains(victims, r)
+		var snapshot watchSnapshot
+		stale := false
+		if !victim && !r.Terminating {
+			snapshot, stale = m.watchChanged(r)
+		}
+		if victim || stale {
 			if busy, err := m.busyWorktrees(time.Now()); err == nil && !busy[r.Worktree] {
+				if stale {
+					condemnedMu.Lock()
+					condemned[r] = snapshot
+					condemnedMu.Unlock()
+				}
 				return identityVerdict(ctx, r)
 			}
 		}
@@ -47,7 +64,28 @@ func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 		}
 		return identityVerdict(ctx, r)
 	}
-	return maintenance.withRecords(ctx, keepRecords)
+	records, err := maintenance.withRecords(ctx, keepRecords)
+	m.forgetCondemned(condemned, records, err)
+	return records, err
+}
+
+// forgetCondemned drops the snapshots of the stale servers the sweep actually
+// removed. Only a server that is leaving uses its change up: one spared for a
+// busy worktree, kept because its identity check could not answer, or kept
+// because withRecords found its record changed under the probe (another
+// manager flushing its uses) is still stale at the next sweep. A failed sweep
+// proves nothing, so it forgets nothing.
+func (m *manager) forgetCondemned(condemned map[record]watchSnapshot, records []record, err error) {
+	if err != nil {
+		return
+	}
+	for r, snapshot := range condemned {
+		if !slices.ContainsFunc(records, func(kept record) bool {
+			return kept.Worktree == r.Worktree && kept.PID == r.PID && kept.StartedAt == r.StartedAt && !kept.Terminating
+		}) {
+			m.forgetWatch(r.Worktree, snapshot)
+		}
+	}
 }
 
 // A signal is not an available slot. Confirm exits before startup admission,

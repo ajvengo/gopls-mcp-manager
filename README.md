@@ -243,6 +243,11 @@ a cold index. A gopls never unwatches a root, so after changing the filters,
 servers started before pick them up only when they restart (`list`, then kill,
 or let eviction do it).
 
+A bare `-` excludes everything and later `+` rules re-include, so the allowlist
+idiom `-,+cmd,+internal` works. The manager looks into an excluded directory
+only where a `+` rule can reach, so a `+` rule with a `**` segment is the one
+that costs a full walk of the tree.
+
 
 Every maintenance sweep (startup, then every 30 s in each bridge/HTTP manager)
 counts the lsof rows of every recorded gopls. While the total exceeds
@@ -270,7 +275,7 @@ flight. SPEC.md contains the behavioral contract.
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…}` |
+| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…,"StartedAtMilli":…}` |
 | `~/.local/share/gopls-ports.map.lock` | flock held around every read-modify-write |
 | `~/.local/share/gopls-mcp-logs/<hash>.log` | stdout+stderr of the gopls for that worktree |
 

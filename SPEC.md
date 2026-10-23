@@ -258,15 +258,30 @@ sees edits to Go files there, since every file-scoped MCP tool compares its
 package's mtimes first, but not an added or removed file or directory, nor a
 go.mod/go.sum/go.work change. Each manager keeps, per worktree, the Go-relevant
 entry names (included subdirectories, `.go`/`.mod`/`.sum`/`.work`/`.s` files)
-of every partial directory as of its last S1 answer. A maintenance sweep
-condemns a live, non-terminating record whose partial directories no longer hold
-the same names, or hold a module file modified after `StartedAt`, by the L6 path:
-busy worktrees are spared and termination goes through L2. A snapshot older than
-the record's `StartedAt` is ignored, and a stale verdict drops it, so one change
-restarts one server. The next call starts a fresh one with a fresh plan.
+of every partial directory as of the first S1 answer its gopls received. gopls only
+adds watches and reports no file that already exists, so a later answer to the
+same gopls (another session) does not describe its watcher: a snapshot belongs
+to one server, identified by the pid and `StartedAt` of the record `ensure`
+claimed for the dial, and only an answer from a different server replaces it.
+A server whose first answer left nothing uncovered keeps an empty snapshot, so
+later answers cannot condemn it. A connection of unknown identity replaces the
+snapshot on every answer. A maintenance sweep condemns a live, non-terminating
+record whose partial directories no longer hold the same names, or hold a
+module file modified after its start (`StartedAtMilli`, M4b), by the L6 path:
+busy worktrees are spared and termination goes through L2. A snapshot of
+another server is ignored (without identities: one taken before the record's
+`StartedAt`). The snapshot is dropped only once the sweep has committed the
+server's termination or removal, so one change restarts one server, and a server
+spared (busy, an uncertain identity check, a record changed under the probe)
+stays stale for the next sweep.
+The next call starts a fresh one with a fresh plan.
 → `TestWatchStaleNoticesWhatNoRootCovers`,
 `TestMaintenanceRestartsAServerThatMissedAnUncoveredChange`,
-`TestRememberWatchForgetsAPlanWithNothingUncovered`
+`TestRememberWatchForgetsAPlanWithNothingUncovered`,
+`TestRememberWatchKeepsTheFirstSnapshotOfAServer`,
+`TestWatchChangedIgnoresASnapshotFromAnotherServer`,
+`TestRememberWatchPinsAServerThatHadNothingUncovered`,
+`TestModuleFileMtimeIsComparedWithThePreciseStart`
 
 S2. S1 holds **inside the handshake window too**. gopls asks for its roots as
 soon as it has seen the capability in `initialize`, which is before the steady
@@ -296,11 +311,14 @@ its outstanding calls. The next call can reconnect using ordinary lane recovery.
 `TestServerReplyKeepsShorterHandshakeDeadline`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
-lane also writes to. The cancellation control worker is another writer. `mcp.Connection` documents `Write` as safe to call
+lane also writes to, and the steady-state reader answers `roots/list` from a
+worker goroutine of its own, so that S1's walk of the worktree stalls no
+response behind it. The cancellation control worker is another writer. `mcp.Connection` documents `Write` as safe to call
 concurrently and `Close` as safe alongside a blocked `Read`, and both
 implementations in use honour it: `sseClientConn.Write` shares nothing but an
 `*http.Client` and a mutex-guarded closed flag, and `ioConn.Write` serialises on
 its own `writeMu`.
+→ `TestSlowRootsPlanDoesNotBlockResponses`
 
 There is never a second *reader*, which nothing promises: a connection is read
 by its handshake until that finishes, and only then does `cache` start the
@@ -380,7 +398,7 @@ owned failed-child cleanup (P2a).
 Path `~/.local/share/gopls-ports.map`, mode `0600`, one JSON object per line:
 
 ```json
-{"Worktree":"/Users/x/src/repo","Port":62001,"PID":4242,"StartedAt":1754218800}
+{"Worktree":"/Users/x/src/repo","Port":62001,"PID":4242,"StartedAt":1754218800,"StartedAtMilli":1754218800417}
 ```
 
 M1. Written atomically: temp file in the same directory, `fsync`, `rename`.
@@ -427,6 +445,16 @@ into a range, because it is not an argument to anything: it only widens or
 narrows the grace of L7. Absent — a map written before the field existed — it
 reads as zero, which is 1970, which is no grace at all: exactly the behaviour
 those records already had.
+
+M4b. `StartedAtMilli` is the same instant in unix milliseconds, written beside
+`StartedAt` from one clock reading and omitted when zero. Only S1b reads it, to
+compare module-file mtimes with the start; server identity, the start grace and
+the eviction window stay in whole seconds, so an older manager dropping the
+field changes none of them. It is used only when
+`StartedAtMilli / 1000 == StartedAt`: a map written by an older manager has none,
+and a hand-edited one may contradict the seconds, and both fall back to
+`StartedAt`. A line without it still parses.
+→ `TestStartedPrecisely`, `TestMapKeepsTheMillisecondStart`
 
 M5. Round-tripping preserves any path, including one containing tabs, quotes or
 newlines — JSON escaping keeps a record on one line.

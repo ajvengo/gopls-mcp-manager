@@ -29,7 +29,7 @@ import (
 // go.work change. A manager therefore keeps the Go-relevant entry names of each
 // partial directory, and maintenance condemns a gopls whose partial
 // directories gained or lost one, or whose module files changed after it
-// started; the next call starts a fresh one. See watchStale.
+// started; the next call starts a fresh one. See watchChanged.
 
 // watchPlan is what answerRoots tells a gopls to watch.
 type watchPlan struct {
@@ -50,6 +50,9 @@ type partialEntries struct {
 type watchSnapshot struct {
 	partial map[string]partialEntries
 	taken   time.Time
+	// server is the gopls the roots went to, unknown when the connection did
+	// not say; see rememberWatch.
+	server serverID
 }
 
 // watchPlans holds this manager's snapshots by worktree.
@@ -86,6 +89,12 @@ func moduleFile(name string) bool {
 	return false
 }
 
+// rulePath is the path a filter rule names, slash-cleaned and relative to the
+// worktree: "" for a rule covering the whole worktree.
+func rulePath(rule string) string {
+	return strings.TrimPrefix(path.Clean("/"+rule[1:]), "/")
+}
+
 // pathIncludeFunc is gopls' cache.PathIncludeFunc: rules are evaluated in order
 // and the last match wins, a rule matches its path and everything below it, and
 // a "**" segment matches zero or more segments. Paths are slash-separated and
@@ -94,7 +103,7 @@ func pathIncludeFunc(rules []string) func(string) bool {
 	matchers := make([]*regexp.Regexp, len(rules))
 	included := make([]bool, len(rules))
 	for i, rule := range rules {
-		prefix := strings.TrimPrefix(path.Clean("/"+rule[1:]), "/")
+		prefix := rulePath(rule)
 		pattern := ".*"
 		if prefix != "" {
 			var b strings.Builder
@@ -122,6 +131,47 @@ func pathIncludeFunc(rules []string) func(string) bool {
 		}
 		return include
 	}
+}
+
+// dirFilter judges directories by one rule list: include is pathIncludeFunc's
+// verdict, and mayInclude whether an excluded directory is worth looking into,
+// that is, whether some + rule could include it or something below it. A rule
+// with a "**" segment may match anywhere, so it always says yes; any other rule
+// names one path, which an excluded directory can lead to only when it is that
+// path or an ancestor of it. Without + rules nothing excluded is worth a look.
+type dirFilter struct {
+	include    func(string) bool
+	mayInclude func(string) bool
+}
+
+func newDirFilter(rules []string) dirFilter {
+	var plus []string
+	for _, rule := range rules {
+		if rule[0] != '+' {
+			continue
+		}
+		prefix := rulePath(rule)
+		if prefix == "" || slices.Contains(strings.Split(prefix, "/"), "**") {
+			plus = append(plus, "**")
+			break
+		}
+		plus = append(plus, prefix)
+	}
+	return dirFilter{
+		include: pathIncludeFunc(rules),
+		mayInclude: func(rel string) bool {
+			rel = strings.Trim(rel, "/")
+			return slices.ContainsFunc(plus, func(prefix string) bool {
+				return prefix == "**" || prefix == rel || strings.HasPrefix(prefix, rel+"/")
+			})
+		},
+	}
+}
+
+// worthListing reports whether the appearance of subdirectory rel of an
+// excluded directory matters: it is included, or may lead to something that is.
+func (f dirFilter) worthListing(rel string) bool {
+	return f.include(rel) || f.mayInclude(rel)
 }
 
 // moduleIgnoreFilters turns the ignore directives of the worktree's go.mod, and
@@ -159,6 +209,11 @@ func moduleIgnoreFilters(worktree string) []string {
 				continue
 			}
 			if !relative {
+				if dir != "." {
+					// "dir/**/pattern" needs a segment for ** to stand for, so
+					// it alone would miss a pattern directory directly in dir.
+					filters = append(filters, "-"+path.Join(dir, pattern))
+				}
 				pattern = "**/" + pattern
 			}
 			filters = append(filters, "-"+path.Join(dir, pattern))
@@ -174,9 +229,8 @@ func planWatch(worktree string, global []string) watchPlan {
 		return watchPlan{roots: []string{worktree}}
 	}
 	w := planner{
-		include:    pathIncludeFunc(rules),
-		hasInclude: slices.ContainsFunc(rules, func(rule string) bool { return rule[0] == '+' }),
-		plan:       watchPlan{partial: make(map[string]partialEntries)},
+		filter: newDirFilter(rules),
+		plan:   watchPlan{partial: make(map[string]partialEntries)},
 	}
 	if w.walk(worktree, "") {
 		return watchPlan{roots: []string{worktree}}
@@ -186,9 +240,8 @@ func planWatch(worktree string, global []string) watchPlan {
 }
 
 type planner struct {
-	include    func(string) bool
-	hasInclude bool
-	plan       watchPlan
+	filter dirFilter
+	plan   watchPlan
 }
 
 // walk reports whether the tree at dir has no excluded directory, adding the
@@ -207,9 +260,9 @@ func (w *planner) walk(dir, rel string) bool {
 		}
 		child, childRel := filepath.Join(dir, e.Name()), path.Join(rel, e.Name())
 		switch {
-		case !w.include(childRel):
+		case !w.filter.include(childRel):
 			partial = true
-			if w.hasInclude {
+			if w.filter.mayInclude(childRel) {
 				w.walkExcluded(child, childRel)
 			}
 		case w.walk(child, childRel):
@@ -222,14 +275,15 @@ func (w *planner) walk(dir, rel string) bool {
 		return true
 	}
 	w.plan.roots = append(w.plan.roots, clean...)
-	w.plan.partial[dir] = partialEntries{names: relevantNames(entries, rel, w.include, true), files: true}
+	w.plan.partial[dir] = partialEntries{names: relevantNames(entries, rel, w.filter, true), files: true}
 	return false
 }
 
 // walkExcluded looks inside an excluded directory for descendants a later +
-// rule includes again. Only its subdirectories are recorded, all of them, since
-// a new one may hold such a descendant: its own files are excluded, so a change
-// among them must not condemn a gopls.
+// rule includes again; the caller has checked that one may exist. Only its
+// subdirectories are recorded, those that may hold such a descendant, since a
+// new one may: its own files are excluded, so a change among them, or a new
+// subdirectory no + rule can reach, must not condemn a gopls.
 func (w *planner) walkExcluded(dir, rel string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -240,27 +294,30 @@ func (w *planner) walkExcluded(dir, rel string) {
 			continue
 		}
 		child, childRel := filepath.Join(dir, e.Name()), path.Join(rel, e.Name())
-		if !w.include(childRel) {
-			w.walkExcluded(child, childRel)
+		if !w.filter.include(childRel) {
+			if w.filter.mayInclude(childRel) {
+				w.walkExcluded(child, childRel)
+			}
 		} else if w.walk(child, childRel) {
 			w.plan.roots = append(w.plan.roots, child)
 		}
 	}
-	w.plan.partial[dir] = partialEntries{names: relevantNames(entries, rel, w.include, false)}
+	w.plan.partial[dir] = partialEntries{names: relevantNames(entries, rel, w.filter, false)}
 }
 
 // relevantNames lists the entries of a partial directory whose appearance or
 // disappearance gopls would have needed to hear about, subdirectories with a
 // trailing slash. With files set (a directory that is itself included) that is
-// its included subdirectories and watched files; without (an excluded one), all
-// of its subdirectories.
-func relevantNames(entries []os.DirEntry, rel string, include func(string) bool, files bool) []string {
+// its included subdirectories and watched files; without (an excluded one), the
+// subdirectories a + rule may reach (dirFilter.worthListing).
+func relevantNames(entries []os.DirEntry, rel string, filter dirFilter, files bool) []string {
 	names := []string{}
 	for _, e := range entries {
 		name := e.Name()
 		switch {
-		case e.IsDir():
-			if !skippedByWatcher(name) && (!files || include(path.Join(rel, name))) {
+		case e.IsDir() && !skippedByWatcher(name):
+			child := path.Join(rel, name)
+			if files && filter.include(child) || !files && filter.worthListing(child) {
 				names = append(names, name+"/")
 			}
 		case files && e.Type().IsRegular() && watchedFile(name):
@@ -271,70 +328,99 @@ func relevantNames(entries []os.DirEntry, rel string, include func(string) bool,
 	return names
 }
 
-// rememberWatch records the plan just reported for worktree. Nil-safe: routers
-// built in tests may have no manager.
-func (m *manager) rememberWatch(worktree string, plan watchPlan) {
+// rememberWatch records the plan just reported to the gopls named by server for
+// worktree. Nil-safe: routers built in tests may have no manager.
+//
+// A snapshot belongs to one server. gopls only ever adds watches for the roots
+// its sessions report and synthesises no event for a file that already exists,
+// so its watcher is fixed by the first answer it got: a later answer, from
+// another session reaching the same gopls, describes a tree that already holds
+// whatever was added in between, and replacing the snapshot with it would hide
+// that change for good. So an answer from the server the snapshot belongs to
+// leaves it alone, whether it holds partial directories or none (a server told
+// to watch the whole worktree never unwatches it, so a later answer cannot make
+// it miss anything). An answer from another server, a restart, replaces it. A
+// server of unknown identity replaces on every answer.
+func (m *manager) rememberWatch(worktree string, server serverID, plan watchPlan) {
 	if m == nil || m.watch == nil {
 		return
 	}
 	m.watch.mu.Lock()
 	defer m.watch.mu.Unlock()
-	if len(plan.partial) == 0 {
+	if current, ok := m.watch.plans[worktree]; ok && server.known() && current.server == server {
+		return
+	}
+	if len(plan.partial) == 0 && !server.known() {
 		delete(m.watch.plans, worktree)
 		return
 	}
-	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now()}
+	// A known server with nothing uncovered still gets a snapshot, with no
+	// partial directories: it is what makes its later answers keep that fact.
+	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now(), server: server}
 }
 
-// watchStale reports whether r's gopls has missed a change no root of its plan
+// watchChanged reports whether r's gopls has missed a change no root of its plan
 // covers: a partial directory whose relevant entries differ from the snapshot,
-// or a module file in one modified after the server started. Only a snapshot
-// taken since r started describes r's watcher; an older one belongs to a server
-// this manager reported roots to before. A stale verdict drops the snapshot, so
+// or a module file in one modified after the server started. Only a snapshot of
+// r's own server describes r's watcher. With both identities known that is
+// compared; otherwise a snapshot taken before r started belongs to a server this
+// manager reported roots to earlier. It returns the snapshot to hand to
+// forgetWatch once r is condemned rather than dropping it, because a caller may
+// still spare the server (a busy worktree) and so must not use the change up:
 // one change condemns one server.
-func (m *manager) watchStale(r record) bool {
+func (m *manager) watchChanged(r record) (watchSnapshot, bool) {
 	if m.watch == nil {
-		return false
+		return watchSnapshot{}, false
 	}
 	m.watch.mu.Lock()
 	snapshot, ok := m.watch.plans[r.Worktree]
 	m.watch.mu.Unlock()
-	if !ok || snapshot.taken.Unix() < r.StartedAt {
-		return false
+	if !ok {
+		return watchSnapshot{}, false
 	}
-	include := m.watchInclude(r.Worktree)
+	if id := r.server(); id.known() && snapshot.server.known() {
+		if id != snapshot.server {
+			return watchSnapshot{}, false
+		}
+	} else if snapshot.taken.Unix() < r.StartedAt {
+		return watchSnapshot{}, false
+	}
+	filter := m.watchFilter(r.Worktree)
 	for dir, want := range snapshot.partial {
-		if !partialChanged(r, dir, want, include) {
-			continue
+		if partialChanged(r, dir, want, filter) {
+			return snapshot, true
 		}
-		m.watch.mu.Lock()
-		if current, ok := m.watch.plans[r.Worktree]; ok && current.taken.Equal(snapshot.taken) {
-			delete(m.watch.plans, r.Worktree)
-		}
-		m.watch.mu.Unlock()
-		return true
 	}
-	return false
+	return watchSnapshot{}, false
+}
+
+// forgetWatch drops snapshot, unless a newer one has replaced it meanwhile.
+func (m *manager) forgetWatch(worktree string, snapshot watchSnapshot) {
+	m.watch.mu.Lock()
+	defer m.watch.mu.Unlock()
+	if current, ok := m.watch.plans[worktree]; ok && current.taken.Equal(snapshot.taken) {
+		delete(m.watch.plans, worktree)
+	}
 }
 
 // partialChanged reports whether partial directory dir of r's worktree no
 // longer holds the relevant entries it did, or holds a module file modified
 // after r started. A record from before StartedAt existed skips the mtime half.
 // A directory that cannot be read is the worktree-reaping sweep's business.
-func partialChanged(r record, dir string, want partialEntries, include func(string) bool) bool {
+func partialChanged(r record, dir string, want partialEntries, filter dirFilter) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
 	rel, _ := filepath.Rel(r.Worktree, dir)
 	rel = strings.TrimPrefix(filepath.ToSlash(rel), ".")
-	if !slices.Equal(want.names, relevantNames(entries, rel, include, want.files)) {
+	if !slices.Equal(want.names, relevantNames(entries, rel, filter, want.files)) {
 		return true
 	}
-	if !want.files || r.StartedAt == 0 {
+	started, ok := r.startedPrecisely()
+	if !want.files || !ok {
 		return false
 	}
-	started := time.Unix(r.StartedAt, 0)
 	for _, e := range entries {
 		if !moduleFile(e.Name()) {
 			continue
@@ -346,8 +432,8 @@ func partialChanged(r record, dir string, want partialEntries, include func(stri
 	return false
 }
 
-// watchInclude rebuilds the include function for worktree, so that a new
+// watchFilter rebuilds the directory filter for worktree, so that a new
 // subdirectory is judged by the rules in force now.
-func (m *manager) watchInclude(worktree string) func(string) bool {
-	return pathIncludeFunc(append(moduleIgnoreFilters(worktree), m.limits.DirectoryFilters...))
+func (m *manager) watchFilter(worktree string) dirFilter {
+	return newDirFilter(append(moduleIgnoreFilters(worktree), m.limits.DirectoryFilters...))
 }
