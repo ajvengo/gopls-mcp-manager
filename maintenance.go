@@ -33,8 +33,19 @@ func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 		}
 		// Asked again just before the verdict: a call may have reached this
 		// server since the victims were picked.
-		if slices.Contains(victims, r) || (!r.Terminating && m.watchStale(r)) {
+		victim := slices.Contains(victims, r)
+		var snapshot watchSnapshot
+		stale := false
+		if !victim && !r.Terminating {
+			snapshot, stale = m.watchChanged(r)
+		}
+		if victim || stale {
 			if busy, err := m.busyWorktrees(time.Now()); err == nil && !busy[r.Worktree] {
+				// Only a condemned server uses its change up: one spared for
+				// a busy worktree is still stale at the next sweep.
+				if stale {
+					m.forgetWatch(r.Worktree, snapshot)
+				}
 				return identityVerdict(ctx, r)
 			}
 		}

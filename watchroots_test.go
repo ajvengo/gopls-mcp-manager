@@ -71,11 +71,11 @@ func TestModuleIgnoreFiltersReadGoModAndGoWork(t *testing.T) {
 	mustTree(t, worktree, map[string]string{
 		"go.work":        "go 1.27\n\nuse (\n\t.\n\t./sub\n\t../outside\n)\n",
 		"go.mod":         "module example.com/root\n\ngo 1.27\n\nignore (\n\t./docs/\n\tnode_modules\n)\n",
-		"sub/go.mod":     "module example.com/sub\n\ngo 1.27\n\nignore ./gen\n",
+		"sub/go.mod":     "module example.com/sub\n\ngo 1.27\n\nignore (\n\t./gen\n\tmocks\n)\n",
 		"broken/go.mod":  "not a go.mod",
 		"../outside/x.g": "",
 	})
-	assert.Equal(t, []string{"-docs", "-**/node_modules", "-sub/gen"}, moduleIgnoreFilters(worktree))
+	assert.Equal(t, []string{"-docs", "-**/node_modules", "-sub/gen", "-sub/mocks", "-sub/**/mocks"}, moduleIgnoreFilters(worktree))
 	assert.Nil(t, moduleIgnoreFilters(t.TempDir()), "no go.mod, no filters")
 }
 
@@ -203,12 +203,20 @@ func TestMaintenanceRestartsAServerThatMissedAnUncoveredChange(t *testing.T) {
 	wantRunning(t, process, "an unchanged worktree was restarted")
 
 	require.NoError(t, os.Mkdir(filepath.Join(worktree, "cmd"), 0o700))
+	m.pending = newPendingCalls()
+	call := operationKey{id: mustID(t, "busy")}
+	m.beginPending(call, worktree)
+	_, err = m.sweepMaintenance(t.Context())
+	require.NoError(t, err)
+	wantRunning(t, process, "a server with a fresh call was restarted")
+
+	m.endPending(call)
 	_, err = m.sweepMaintenance(t.Context())
 	require.NoError(t, err)
 	select {
 	case <-exited:
 	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the server that missed a new directory was not terminated")
+		require.FailNow(t, "the server that missed a new directory was not terminated once its worktree went idle")
 	}
 	stale.Terminating = true
 	wantRecords(t, m.mapPath, "the restart did not persist termination", stale)

@@ -159,6 +159,11 @@ func moduleIgnoreFilters(worktree string) []string {
 				continue
 			}
 			if !relative {
+				if dir != "." {
+					// "dir/**/pattern" needs a segment for ** to stand for, so
+					// it alone would miss a pattern directory directly in dir.
+					filters = append(filters, "-"+path.Join(dir, pattern))
+				}
 				pattern = "**/" + pattern
 			}
 			filters = append(filters, "-"+path.Join(dir, pattern))
@@ -293,28 +298,42 @@ func (m *manager) rememberWatch(worktree string, plan watchPlan) {
 // this manager reported roots to before. A stale verdict drops the snapshot, so
 // one change condemns one server.
 func (m *manager) watchStale(r record) bool {
+	snapshot, stale := m.watchChanged(r)
+	if stale {
+		m.forgetWatch(r.Worktree, snapshot)
+	}
+	return stale
+}
+
+// watchChanged is watchStale without dropping the snapshot, for a caller that
+// may still spare the server (a busy worktree) and so must not use the change
+// up: it returns the snapshot to hand to forgetWatch once r is condemned.
+func (m *manager) watchChanged(r record) (watchSnapshot, bool) {
 	if m.watch == nil {
-		return false
+		return watchSnapshot{}, false
 	}
 	m.watch.mu.Lock()
 	snapshot, ok := m.watch.plans[r.Worktree]
 	m.watch.mu.Unlock()
 	if !ok || snapshot.taken.Unix() < r.StartedAt {
-		return false
+		return watchSnapshot{}, false
 	}
 	include := m.watchInclude(r.Worktree)
 	for dir, want := range snapshot.partial {
-		if !partialChanged(r, dir, want, include) {
-			continue
+		if partialChanged(r, dir, want, include) {
+			return snapshot, true
 		}
-		m.watch.mu.Lock()
-		if current, ok := m.watch.plans[r.Worktree]; ok && current.taken.Equal(snapshot.taken) {
-			delete(m.watch.plans, r.Worktree)
-		}
-		m.watch.mu.Unlock()
-		return true
 	}
-	return false
+	return watchSnapshot{}, false
+}
+
+// forgetWatch drops snapshot, unless a newer one has replaced it meanwhile.
+func (m *manager) forgetWatch(worktree string, snapshot watchSnapshot) {
+	m.watch.mu.Lock()
+	defer m.watch.mu.Unlock()
+	if current, ok := m.watch.plans[worktree]; ok && current.taken.Equal(snapshot.taken) {
+		delete(m.watch.plans, worktree)
+	}
 }
 
 // partialChanged reports whether partial directory dir of r's worktree no
