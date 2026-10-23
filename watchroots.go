@@ -29,7 +29,7 @@ import (
 // go.work change. A manager therefore keeps the Go-relevant entry names of each
 // partial directory, and maintenance condemns a gopls whose partial
 // directories gained or lost one, or whose module files changed after it
-// started; the next call starts a fresh one. See watchStale.
+// started; the next call starts a fresh one. See watchChanged.
 
 // watchPlan is what answerRoots tells a gopls to watch.
 type watchPlan struct {
@@ -50,6 +50,9 @@ type partialEntries struct {
 type watchSnapshot struct {
 	partial map[string]partialEntries
 	taken   time.Time
+	// server is the gopls the roots went to, unknown when the connection did
+	// not say; see rememberWatch.
+	server serverID
 }
 
 // watchPlans holds this manager's snapshots by worktree.
@@ -318,38 +321,46 @@ func relevantNames(entries []os.DirEntry, rel string, filter dirFilter, files bo
 	return names
 }
 
-// rememberWatch records the plan just reported for worktree. Nil-safe: routers
-// built in tests may have no manager.
-func (m *manager) rememberWatch(worktree string, plan watchPlan) {
+// rememberWatch records the plan just reported to the gopls named by server for
+// worktree. Nil-safe: routers built in tests may have no manager.
+//
+// A snapshot belongs to one server. gopls only ever adds watches for the roots
+// its sessions report and synthesises no event for a file that already exists,
+// so its watcher is fixed by the first answer it got: a later answer, from
+// another session reaching the same gopls, describes a tree that already holds
+// whatever was added in between, and replacing the snapshot with it would hide
+// that change for good. So an answer from the server the snapshot belongs to
+// leaves it alone, whether it holds partial directories or none (a server told
+// to watch the whole worktree never unwatches it, so a later answer cannot make
+// it miss anything). An answer from another server, a restart, replaces it. A
+// server of unknown identity replaces on every answer.
+func (m *manager) rememberWatch(worktree string, server serverID, plan watchPlan) {
 	if m == nil || m.watch == nil {
 		return
 	}
 	m.watch.mu.Lock()
 	defer m.watch.mu.Unlock()
-	if len(plan.partial) == 0 {
+	if current, ok := m.watch.plans[worktree]; ok && server.known() && current.server == server {
+		return
+	}
+	if len(plan.partial) == 0 && !server.known() {
 		delete(m.watch.plans, worktree)
 		return
 	}
-	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now()}
+	// A known server with nothing uncovered still gets a snapshot, with no
+	// partial directories: it is what makes its later answers keep that fact.
+	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now(), server: server}
 }
 
-// watchStale reports whether r's gopls has missed a change no root of its plan
+// watchChanged reports whether r's gopls has missed a change no root of its plan
 // covers: a partial directory whose relevant entries differ from the snapshot,
-// or a module file in one modified after the server started. Only a snapshot
-// taken since r started describes r's watcher; an older one belongs to a server
-// this manager reported roots to before. A stale verdict drops the snapshot, so
+// or a module file in one modified after the server started. Only a snapshot of
+// r's own server describes r's watcher. With both identities known that is
+// compared; otherwise a snapshot taken before r started belongs to a server this
+// manager reported roots to earlier. It returns the snapshot to hand to
+// forgetWatch once r is condemned rather than dropping it, because a caller may
+// still spare the server (a busy worktree) and so must not use the change up:
 // one change condemns one server.
-func (m *manager) watchStale(r record) bool {
-	snapshot, stale := m.watchChanged(r)
-	if stale {
-		m.forgetWatch(r.Worktree, snapshot)
-	}
-	return stale
-}
-
-// watchChanged is watchStale without dropping the snapshot, for a caller that
-// may still spare the server (a busy worktree) and so must not use the change
-// up: it returns the snapshot to hand to forgetWatch once r is condemned.
 func (m *manager) watchChanged(r record) (watchSnapshot, bool) {
 	if m.watch == nil {
 		return watchSnapshot{}, false
@@ -357,7 +368,14 @@ func (m *manager) watchChanged(r record) (watchSnapshot, bool) {
 	m.watch.mu.Lock()
 	snapshot, ok := m.watch.plans[r.Worktree]
 	m.watch.mu.Unlock()
-	if !ok || snapshot.taken.Unix() < r.StartedAt {
+	if !ok {
+		return watchSnapshot{}, false
+	}
+	if id := r.server(); id.known() && snapshot.server.known() {
+		if id != snapshot.server {
+			return watchSnapshot{}, false
+		}
+	} else if snapshot.taken.Unix() < r.StartedAt {
 		return watchSnapshot{}, false
 	}
 	filter := m.watchFilter(r.Worktree)
@@ -392,10 +410,10 @@ func partialChanged(r record, dir string, want partialEntries, filter dirFilter)
 	if !slices.Equal(want.names, relevantNames(entries, rel, filter, want.files)) {
 		return true
 	}
-	if !want.files || r.StartedAt == 0 {
+	started, ok := r.startedPrecisely()
+	if !want.files || !ok {
 		return false
 	}
-	started := time.Unix(r.StartedAt, 0)
 	for _, e := range entries {
 		if !moduleFile(e.Name()) {
 			continue

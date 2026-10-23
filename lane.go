@@ -353,16 +353,38 @@ func (c *boundedConn) Close() error {
 }
 
 func (r *router) dialGopls(ctx context.Context, worktree string) (mcp.Connection, error) {
-	port, err := r.m.ensure(ctx, worktree)
+	server, err := r.m.ensureRecord(ctx, worktree)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := transport.ConnectSSE(ctx, mcpURL(port), r.limits.MessageBytes, r.sseBudget)
+	conn, err := transport.ConnectSSE(ctx, mcpURL(server.Port), r.limits.MessageBytes, r.sseBudget)
 	if err != nil {
 		return nil, fmt.Errorf("connect to shared gopls MCP: %w", err)
 	}
-	return conn, nil
+	return &identifiedConn{Connection: conn, id: server.server()}, nil
 }
+
+// identifiedConn is a connection that knows which gopls it talks to: the one
+// ensure vouched for just before the dial. answerRoots reads it to keep the
+// first watch snapshot of a server (see rememberWatch). A connection without
+// one, such as a test's stub, is of unknown identity.
+type identifiedConn struct {
+	mcp.Connection
+	id serverID
+}
+
+// serverOf is the identity of the gopls conn talks to, unknown for a connection
+// that carries none. boundedConn passes its inner connection's through.
+func serverOf(conn mcp.Connection) serverID {
+	if c, ok := conn.(interface{ server() serverID }); ok {
+		return c.server()
+	}
+	return serverID{}
+}
+
+func (c *identifiedConn) server() serverID { return c.id }
+
+func (c *boundedConn) server() serverID { return serverOf(c.Connection) }
 
 // handshake replays the client's initialize under a private id and swallows the
 // reply, so the client sees exactly one initialize result — the home server's.

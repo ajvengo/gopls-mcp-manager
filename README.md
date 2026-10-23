@@ -275,7 +275,7 @@ flight. SPEC.md contains the behavioral contract.
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…}` |
+| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…,"StartedAtMilli":…}` |
 | `~/.local/share/gopls-ports.map.lock` | flock held around every read-modify-write |
 | `~/.local/share/gopls-mcp-logs/<hash>.log` | stdout+stderr of the gopls for that worktree |
 

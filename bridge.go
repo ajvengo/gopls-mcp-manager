@@ -397,7 +397,7 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 // disk — indistinguishable from a genuinely broken tree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) error {
 	plan := r.plan(worktree, r.limits.DirectoryFilters)
-	r.m.rememberWatch(worktree, plan)
+	r.m.rememberWatch(worktree, serverOf(conn), plan)
 	// Strings in a fixed shape: marshaling them cannot fail, and there would be
 	// nobody to tell anyway — the id belongs to the upstream, so an error reply
 	// sent to the client would answer a question it never asked.

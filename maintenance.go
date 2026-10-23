@@ -18,7 +18,7 @@ import (
 
 // sweepMaintenance reaps servers whose worktree is gone, evicts those over the
 // open-file budget, and restarts those that missed a change no watched root
-// covers (watchStale). All reach a signal only through identityVerdict and
+// covers (watchChanged). All reach a signal only through identityVerdict and
 // withRecords' persisted termination, like any other condemned record.
 func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 	victims, err := m.evictionVictims(ctx)
