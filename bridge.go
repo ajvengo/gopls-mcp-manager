@@ -338,8 +338,9 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 		"gopls-mcp-manager does not relay %q to the client", req.Method))
 }
 
-// answerRoots tells an upstream that its one workspace root is the worktree it
-// serves, instead of forwarding the question to the client.
+// answerRoots tells an upstream the roots of the worktree it serves — the
+// worktree itself, or the directories covering it minus what its filters
+// exclude (see watchroots.go) — instead of forwarding the question to the client.
 //
 // This is what makes a gopls notice a file created after it started: its watcher
 // only watches the roots the client reports, and it only asks for them once it
@@ -349,13 +350,18 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 // nothing and answer "no package metadata" for a file that is right there on
 // disk — indistinguishable from a genuinely broken tree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) error {
-	// Two strings in a fixed shape: marshaling them cannot fail, and there would
-	// be nobody to tell anyway — the id belongs to the upstream, so an error
-	// reply sent to the client would answer a question it never asked.
+	plan := planWatch(worktree, r.limits.DirectoryFilters)
+	r.m.rememberWatch(worktree, plan)
+	// Strings in a fixed shape: marshaling them cannot fail, and there would be
+	// nobody to tell anyway — the id belongs to the upstream, so an error reply
+	// sent to the client would answer a question it never asked.
 	//nolint:staticcheck // Legacy gopls SSE sessions still need roots for file watching.
-	result, _ := json.Marshal(mcp.ListRootsResult{Roots: []*mcp.Root{{
-		URI:  (&url.URL{Scheme: "file", Path: worktree}).String(),
-		Name: filepath.Base(worktree),
-	}}})
+	roots := make([]*mcp.Root, len(plan.roots))
+	for i, dir := range plan.roots {
+		//nolint:staticcheck // Legacy gopls SSE sessions still need roots for file watching.
+		roots[i] = &mcp.Root{URI: (&url.URL{Scheme: "file", Path: dir}).String(), Name: filepath.Base(dir)}
+	}
+	//nolint:staticcheck // Legacy gopls SSE sessions still need roots for file watching.
+	result, _ := json.Marshal(mcp.ListRootsResult{Roots: roots})
 	return conn.Write(ctx, &jsonrpc.Response{ID: id, Result: result})
 }

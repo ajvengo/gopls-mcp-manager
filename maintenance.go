@@ -16,8 +16,9 @@ import (
 	"time"
 )
 
-// sweepMaintenance reaps servers whose worktree is gone and evicts those over
-// the open-file budget. Both reach a signal only through identityVerdict and
+// sweepMaintenance reaps servers whose worktree is gone, evicts those over the
+// open-file budget, and restarts those that missed a change no watched root
+// covers (watchStale). All reach a signal only through identityVerdict and
 // withRecords' persisted termination, like any other condemned record.
 func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 	victims, err := m.evictionVictims(ctx)
@@ -32,7 +33,7 @@ func (m *manager) sweepMaintenance(ctx context.Context) ([]record, error) {
 		}
 		// Asked again just before the verdict: a call may have reached this
 		// server since the victims were picked.
-		if slices.Contains(victims, r) {
+		if slices.Contains(victims, r) || (!r.Terminating && m.watchStale(r)) {
 			if busy, err := m.busyWorktrees(time.Now()); err == nil && !busy[r.Worktree] {
 				return identityVerdict(ctx, r)
 			}
@@ -77,14 +78,14 @@ func (m *manager) prepareAdmission(ctx context.Context, worktree string) error {
 	}
 }
 
-// Why a budget rather than a fix: gopls mcp hard-codes its fsnotify watcher
-// over the roots answerRoots reports, and on darwin fsnotify is kqueue, which
-// holds one descriptor open for every file and directory under the watched tree
-// — markdown, python and yaml included, since gopls filters events, not
-// watches. A gopls therefore costs about as many descriptors as its worktree
-// has entries, and nothing on this side of the MCP connection can change that
-// short of withholding roots, which would leave gopls blind to new files.
-// What can be bounded is how many such trees are watched at once: maintenance
+// Why a budget as well as filtered roots: gopls mcp hard-codes its fsnotify
+// watcher over the roots answerRoots reports, and on darwin fsnotify is kqueue,
+// which holds one descriptor open for every file and directory under the
+// watched tree — markdown, python and yaml included, since gopls filters
+// events, not watches. Directory filters (watchroots.go) take excluded trees
+// out of the roots, but a gopls still costs about as many descriptors as the
+// rest of its worktree has entries. What can be bounded is how many such trees
+// are watched at once: maintenance
 // evicts the least frequently used servers while their lsof rows together
 // exceed GOPLS_MANAGER_MAX_OPEN_FILES, and the next call to an evicted worktree
 // starts it again.

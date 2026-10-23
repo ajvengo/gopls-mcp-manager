@@ -229,9 +229,44 @@ optional execution timeout and outstanding limits (R8–R9).
 
 ## 4. Server-initiated requests
 
-S1. **`roots/list` is answered by the bridge**, never forwarded, with exactly one
-root: the worktree that upstream serves, as a `file://` URI with its base name.
+S1. **`roots/list` is answered by the bridge**, never forwarded, with the roots
+of the worktree that upstream serves, each a `file://` URI with its base name:
+the worktree itself when no filter excludes anything under it (S1a).
 → `TestUpstreamRootsAnsweredWithItsOwnWorktree`
+
+S1a. **Directory filters narrow the roots.** The rules are the `ignore`
+directives of the worktree's `go.mod` and of every module its `go.work` uses
+(`./dir` relative to that module, a bare `dir` at any depth, as in cmd/go),
+followed by GOPLS_MANAGER_DIRECTORY_FILTERS, with gopls `directoryFilters`
+semantics: last match wins, a rule covers its subtree, `**` is zero or more
+segments. When a rule excludes a directory, the roots are the smallest set of
+directories covering the worktree minus the excluded trees; a `+` rule
+re-includes a subtree below an excluded one. Directories gopls' watcher skips
+(names starting with `.` or `_`, and `testdata`) are neither roots nor
+exclusions, so `.git` is never watched whatever a rule says.
+→ `TestUpstreamRootsCoverTheWorktreeMinusFilters`,
+`TestPlanWatchCoversTheWorktreeMinusExcludedTrees`,
+`TestPlanWatchWithoutExclusionsIsTheWorktree`,
+`TestPlanWatchReincludesBelowAnExcludedTree`, `TestGitDirectoryIsNeverWatched`,
+`TestPathIncludeFuncMatchesGopls`, `TestModuleIgnoreFiltersReadGoModAndGoWork`,
+`TestParseDirectoryFilters`
+
+S1b. **A server that missed an uncovered change is restarted.** No root covers
+the entries directly inside a "partial" directory, one with an excluded
+descendant (the worktree itself whenever anything is excluded). gopls still
+sees edits to Go files there, since every file-scoped MCP tool compares its
+package's mtimes first, but not an added or removed file or directory, nor a
+go.mod/go.sum/go.work change. Each manager keeps, per worktree, the Go-relevant
+entry names (included subdirectories, `.go`/`.mod`/`.sum`/`.work`/`.s` files)
+of every partial directory as of its last S1 answer. A maintenance sweep
+condemns a live, non-terminating record whose partial directories no longer hold
+the same names, or hold a module file modified after `StartedAt`, by the L6 path:
+busy worktrees are spared and termination goes through L2. A snapshot older than
+the record's `StartedAt` is ignored, and a stale verdict drops it, so one change
+restarts one server. The next call starts a fresh one with a fresh plan.
+→ `TestWatchStaleNoticesWhatNoRootCovers`,
+`TestMaintenanceRestartsAServerThatMissedAnUncoveredChange`,
+`TestRememberWatchForgetsAPlanWithNothingUncovered`
 
 S2. S1 holds **inside the handshake window too**. gopls asks for its roots as
 soon as it has seen the capability in `initialize`, which is before the steady
@@ -275,6 +310,11 @@ Rationale for S1/S2: gopls' MCP mode runs a full in-process LSP session with an
 fsnotify watcher, but it watches only the roots the client reports. Forwarded,
 every upstream would be told about the single tree the session opened in, and
 every other worktree would answer "no package metadata" for files on disk.
+Rationale for S1a/S1b: on darwin that watcher holds a descriptor per entry of
+every watched directory, Go or not, and headless `gopls mcp` accepts no
+settings, so the roots are the only lever on what it watches. gopls never stops
+watching a root once told it, so a server keeps the roots it started with until
+it exits.
 
 ## 5. Failure semantics
 
@@ -593,7 +633,8 @@ have no hard disk ceiling, and no archives are retained.
   outstanding limits bound retained requests, not execution duration.
   Cancellation or timeout cannot prove that a gopls mutation stopped.
 - Cooperating recorded spawns are capped, but shared-process RAM is not.
-  The only process eviction is the open-file budget (L6). It spares servers
+  The process evictions are the open-file budget (L6) and the restart of a
+  server that missed an uncovered change (S1b). Both spare servers
   with pending calls under 30 s old. A call landing between its final check
   and SIGTERM, or pending longer, fails as on a dying gopls. Lanes are
   never evicted. Cross-client attachment and operation ownership would let
@@ -634,6 +675,7 @@ Environment variables are parsed when constructing the manager:
 | GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | Total lsof rows of recorded gopls before maintenance evicts (L6) |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional post-delivery timeout |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON observations on stderr |
+| GOPLS_MANAGER_DIRECTORY_FILTERS | unset | Comma-separated gopls `directoryFilters` rules (`-docs,-**/node_modules,+docs/go`) applied after go.mod `ignore` directives (S1a) |
 
 Counts must be positive integers. Execution timeout must be a nonnegative Go
 duration. Manager metrics report lock wait/hold and probe, readiness and ensure

@@ -4,7 +4,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,6 +25,10 @@ type Limits struct {
 	// Metrics is GOPLS_MANAGER_METRICS, kept here so the one env var that is
 	// not a limit is still read in the one place that reads the environment.
 	Metrics bool
+	// DirectoryFilters is GOPLS_MANAGER_DIRECTORY_FILTERS: gopls
+	// directoryFilters rules, applied after each worktree's go.mod ignore
+	// directives to the roots a gopls is told to watch. Nil means none.
+	DirectoryFilters []string
 }
 
 // WithDefaults fills every unset field from Default, so that nothing downstream
@@ -109,5 +115,34 @@ func FromEnv() (Limits, error) {
 		return limits, fmt.Errorf("GOPLS_MANAGER_SSE_BUFFER_BUDGET must hold at least one maximum-size message")
 	}
 	limits.Metrics = os.Getenv("GOPLS_MANAGER_METRICS") == "1"
+	filters, err := ParseDirectoryFilters(os.Getenv("GOPLS_MANAGER_DIRECTORY_FILTERS"))
+	if err != nil {
+		return limits, fmt.Errorf("GOPLS_MANAGER_DIRECTORY_FILTERS: %w", err)
+	}
+	limits.DirectoryFilters = filters
 	return limits, nil
+}
+
+// ParseDirectoryFilters splits a comma-separated list of gopls directoryFilters
+// rules and validates each the way gopls does: a leading + or -, and no glob
+// operator but a whole "**" segment. Rules come back slash-cleaned, so
+// "-docs/" and "-docs" are the same rule. Blank entries are skipped.
+func ParseDirectoryFilters(raw string) ([]string, error) {
+	var filters []string
+	for _, field := range strings.Split(raw, ",") {
+		filter := strings.TrimSpace(field)
+		if filter == "" {
+			continue
+		}
+		if filter[0] != '+' && filter[0] != '-' {
+			return nil, fmt.Errorf("invalid filter %q: must start with + or -", filter)
+		}
+		for _, seg := range strings.Split(filter[1:], "/") {
+			if seg != "**" && strings.ContainsAny(seg, "*?") {
+				return nil, fmt.Errorf("invalid filter %q: only whole ** segments are supported", filter)
+			}
+		}
+		filters = append(filters, filter[:1]+strings.TrimPrefix(path.Clean("/"+filter[1:]), "/"))
+	}
+	return filters, nil
 }
