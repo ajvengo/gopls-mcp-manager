@@ -296,11 +296,14 @@ its outstanding calls. The next call can reconnect using ordinary lane recovery.
 `TestServerReplyKeepsShorterHandshakeDeadline`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
-lane also writes to. The cancellation control worker is another writer. `mcp.Connection` documents `Write` as safe to call
+lane also writes to, and the steady-state reader answers `roots/list` from a
+worker goroutine of its own, so that S1's walk of the worktree stalls no
+response behind it. The cancellation control worker is another writer. `mcp.Connection` documents `Write` as safe to call
 concurrently and `Close` as safe alongside a blocked `Read`, and both
 implementations in use honour it: `sseClientConn.Write` shares nothing but an
 `*http.Client` and a mutex-guarded closed flag, and `ioConn.Write` serialises on
 its own `writeMu`.
+→ `TestSlowRootsPlanDoesNotBlockResponses`
 
 There is never a second *reader*, which nothing promises: a connection is read
 by its handshake until that finishes, and only then does `cache` start the

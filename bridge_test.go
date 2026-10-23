@@ -1460,3 +1460,33 @@ func runGit(t testing.TB, args ...string) {
 	output, err := exec.Command("git", args...).CombinedOutput()
 	require.NoErrorf(t, err, "git %v: %v\n%s", args, err, output)
 }
+
+func TestSlowRootsPlanDoesNotBlockResponses(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		ctx := t.Context()
+		upstream, gopls := upstreamPair(t)
+		r := newTestRouter(t, testHome)
+		entered, release := make(chan struct{}), make(chan struct{})
+		r.plan = func(worktree string, _ []string) watchPlan {
+			close(entered)
+			<-release
+			return watchPlan{roots: []string{worktree}}
+		}
+		call := mustID(t, "call")
+		r.track(call, upstream, testWorktree)
+		go r.readFromUpstream(upstream, testWorktree)
+
+		rootsID := mustID(t, "roots")
+		require.NoError(t, gopls.Write(ctx, &jsonrpc.Request{ID: rootsID, Method: "roots/list"}))
+		mustRecv(t, entered, "roots plan")
+		require.NoError(t, gopls.Write(ctx, &jsonrpc.Response{ID: call, Result: jsontext.Value(`{}`)}))
+		resp, ok := mustRecv(t, r.out, "response behind a pending roots plan").(*jsonrpc.Response)
+		require.True(t, ok)
+		assert.Equal(t, call, resp.ID)
+
+		close(release)
+		msg, err := gopls.Read(ctx)
+		require.NoError(t, err)
+		_ = wantResponse(t, msg, rootsID)
+	})
+}
