@@ -37,6 +37,7 @@ type manager struct {
 	openFiles func(context.Context, []record) (map[int]int, error)
 	uses      *useCounts    // nil counts nothing
 	pending   *pendingCalls // nil tracks and publishes nothing
+	watch     *watchPlans   // nil remembers no plan, so maintenance condemns nothing as stale
 }
 
 // gopls is resolved by startGopls, not here: list's whole job is to find and
@@ -56,6 +57,7 @@ func newManager() (*manager, error) {
 		openFiles: countOpenFiles,
 		uses:      &useCounts{counts: make(map[string]int)},
 		pending:   newPendingCalls(),
+		watch:     &watchPlans{plans: make(map[string]watchSnapshot)},
 	}
 	m.start = m.startGopls
 	m.limits, err = config.FromEnv()

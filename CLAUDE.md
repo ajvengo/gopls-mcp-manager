@@ -51,7 +51,10 @@ deliberate eviction is the open-file budget (`maintenance.go`, SPEC L6): on macO
 gopls holds a kqueue fd per worktree entry, so maintenance terminates the servers
 with the lowest aged use counts while the total lsof row count is over the limit,
 sparing any worktree with an upstream call under 30 s old (`pending.go`, which also
-publishes them per manager pid for cross-process visibility).
+publishes them per manager pid for cross-process visibility). To keep that fd count
+down, `answerRoots` reports filtered roots (`watchroots.go`, SPEC S1a: go.mod `ignore`
+plus GOPLS_MANAGER_DIRECTORY_FILTERS), and the same sweep restarts a server whose
+uncovered "partial" directories changed (S1b).
 
 ## Testing conventions
 

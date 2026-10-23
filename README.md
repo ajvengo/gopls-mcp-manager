@@ -177,6 +177,7 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 | GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | lsof rows of all recorded gopls together; maintenance evicts the least frequently used servers above it |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
+| GOPLS_MANAGER_DIRECTORY_FILTERS | unset | Comma-separated gopls `directoryFilters` rules, e.g. `-docs,-**/node_modules,+docs/go`; applied after each worktree's go.mod `ignore` directives to the roots gopls watches |
 
 Counts must be positive. Execution timeout accepts Go durations such as 2m.
 A stdio value that exceeds the message limit ends the transport with an error;
@@ -222,8 +223,26 @@ not RSS. Existing records remain reusable even above a lowered ceiling.
 On macOS a gopls holds one descriptor per file and directory in its worktree:
 `gopls mcp` hard-codes an fsnotify watcher over the roots it is given, and
 fsnotify's kqueue backend opens every entry of every watched directory — `.md`,
-`.py` and `.yaml` included. A manager cannot change that without hiding new
-files from gopls, so it bounds how many trees are watched at once instead.
+`.py` and `.yaml` included. Headless `gopls mcp` takes no `directoryFilters`
+setting, so the manager filters the roots it reports instead (below), and bounds
+how many trees are watched at once.
+
+### Directory filters
+
+gopls is told to watch the worktree minus what its filters exclude: the `ignore`
+directives of the worktree's `go.mod` (and of the modules its `go.work` uses),
+then GOPLS_MANAGER_DIRECTORY_FILTERS, with gopls `directoryFilters` semantics.
+`.git`, and every other directory gopls' watcher skips (`.*`, `_*`, `testdata`),
+is never watched. With nothing excluded the root is the worktree, as before.
+Otherwise the roots are the directories covering the rest, so the entries
+directly inside a directory with an excluded descendant (the worktree root among
+them) are not watched. gopls still sees edits to Go files there, but a manager
+restarts the server when such a directory gains or loses a Go-relevant file or
+subdirectory, or its `go.mod`/`go.sum`/`go.work` changes, and the next call pays
+a cold index. A gopls never unwatches a root, so after changing the filters,
+servers started before pick them up only when they restart (`list`, then kill,
+or let eviction do it).
+
 
 Every maintenance sweep (startup, then every 30 s in each bridge/HTTP manager)
 counts the lsof rows of every recorded gopls. While the total exceeds

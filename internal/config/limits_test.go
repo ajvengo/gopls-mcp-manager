@@ -53,12 +53,14 @@ func TestFromEnvOverrides(t *testing.T) {
 	want.PerLane, want.Lanes, want.CacheEntries = 12, 2, 3
 	want.CacheTTL, want.Execution, want.Metrics = time.Minute, 2*time.Minute, true
 	got, err := FromEnv()
-	require.Truef(t, err == nil && got == want, "overrides = %+v, %v; want %+v", got, err, want)
+	require.NoError(t, err)
+	require.Equal(t, want, got, "overrides")
 	t.Setenv("GOPLS_MANAGER_EXECUTION_TIMEOUT", "0s")
 	t.Setenv("GOPLS_MANAGER_METRICS", "true")
 	want.Execution, want.Metrics = 0, false
 	got, err = FromEnv()
-	require.Truef(t, err == nil && got == want, "disabled timeout and metrics = %+v, %v; want %+v", got, err, want)
+	require.NoError(t, err)
+	require.Equal(t, want, got, "disabled timeout and metrics")
 }
 
 func TestWithDefaults(t *testing.T) {
@@ -83,4 +85,31 @@ func TestWithDefaults(t *testing.T) {
 			require.Equalf(t, tc.want, got, "WithDefaults(%+v) = %+v, want %+v", tc.in, got, tc.want)
 		})
 	}
+}
+
+func TestParseDirectoryFilters(t *testing.T) {
+	t.Parallel()
+	filters, err := ParseDirectoryFilters(" -docs/ , ,+docs/go,-**/node_modules,-./scripts,-")
+	require.NoError(t, err)
+	require.Equal(t, []string{"-docs", "+docs/go", "-**/node_modules", "-scripts", "-"}, filters)
+
+	none, err := ParseDirectoryFilters("")
+	require.NoError(t, err)
+	require.Nil(t, none)
+
+	for _, invalid := range []string{"docs", "-doc*", "-a/b?", "-**x"} {
+		_, err := ParseDirectoryFilters(invalid)
+		require.Errorf(t, err, "invalid filter %q accepted", invalid)
+	}
+}
+
+func TestFromEnvDirectoryFilters(t *testing.T) {
+	t.Setenv("GOPLS_MANAGER_DIRECTORY_FILTERS", "-docs,+docs/go")
+	limits, err := FromEnv()
+	require.NoError(t, err)
+	require.Equal(t, []string{"-docs", "+docs/go"}, limits.DirectoryFilters)
+
+	t.Setenv("GOPLS_MANAGER_DIRECTORY_FILTERS", "docs")
+	_, err = FromEnv()
+	require.ErrorContains(t, err, "GOPLS_MANAGER_DIRECTORY_FILTERS")
 }
