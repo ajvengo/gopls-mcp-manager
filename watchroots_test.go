@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -133,6 +134,54 @@ func TestPlanWatchReincludesBelowAnExcludedTree(t *testing.T) {
 	assert.Equal(t, partialEntries{names: []string{"deep/", "go/"}}, plan.partial[filepath.Join(worktree, "docs")],
 		"an excluded directory records its subdirectories only")
 	assert.Equal(t, partialEntries{names: []string{"more/"}}, plan.partial[filepath.Join(worktree, "docs", "deep")])
+}
+
+// TestPlanWatchDescendsOnlyWhereAPlusRuleCanReach pins that an excluded tree is
+// walked, and its subdirectories recorded, only when a + rule could include
+// something in it: a big node_modules costs nothing next to a +docs/go rule.
+func TestPlanWatchDescendsOnlyWhereAPlusRuleCanReach(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	mustTree(t, worktree, map[string]string{
+		"web/node_modules/a/b/c/": "", "web/node_modules/d/": "", "docs/go/x.go": "package x\n", "docs/other/deep/": "", "pkg/": "",
+	})
+	keys := func(rules ...string) []string {
+		var rels []string
+		for dir := range planWatch(worktree, rules).partial {
+			rel, err := filepath.Rel(worktree, dir)
+			require.NoError(t, err)
+			rels = append(rels, filepath.ToSlash(rel))
+		}
+		slices.Sort(rels)
+		return rels
+	}
+	assert.Equal(t, []string{".", "docs", "web"}, keys("-**/node_modules", "-docs", "+docs/go"),
+		"nothing under node_modules, nor docs/other, is walked")
+	assert.Equal(t, []string{".", "docs", "docs/go", "docs/other", "docs/other/deep", "web", "web/node_modules", "web/node_modules/a", "web/node_modules/a/b", "web/node_modules/a/b/c", "web/node_modules/d"},
+		keys("-**/node_modules", "-docs", "+**/x"), "a ** segment may match anywhere: the full walk")
+	assert.Equal(t, []string{".", "docs"}, keys("-", "+docs/go/"),
+		"a bare - with later + rules walks only toward them")
+}
+
+// TestWatchStaleJudgesExcludedSubdirectoriesByPlusRules pins that a new
+// directory under an excluded tree condemns a server only when a + rule can
+// reach it.
+func TestWatchStaleJudgesExcludedSubdirectoriesByPlusRules(t *testing.T) {
+	t.Parallel()
+	worktree := t.TempDir()
+	mustTree(t, worktree, map[string]string{"go.mod": "module m\n", "docs/notes.md": "", "pkg/": ""})
+	m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}, limits: config.Limits{DirectoryFilters: []string{"-docs", "+docs/go"}}}
+	past := time.Now().Add(-2 * time.Minute)
+	require.NoError(t, os.Chtimes(filepath.Join(worktree, "go.mod"), past, past))
+	r := record{Worktree: worktree, StartedAt: time.Now().Add(-time.Minute).Unix()}
+	plan := planWatch(worktree, m.limits.DirectoryFilters)
+	assert.Equal(t, []string{"pkg"}, relRoots(t, worktree, plan))
+	m.rememberWatch(worktree, plan)
+
+	require.NoError(t, os.Mkdir(filepath.Join(worktree, "docs", "x"), 0o700))
+	require.False(t, m.watchStale(r), "docs/x is unreachable for +docs/go")
+	require.NoError(t, os.Mkdir(filepath.Join(worktree, "docs", "go"), 0o700))
+	require.True(t, m.watchStale(r), "docs/go is re-included")
 }
 
 func TestWatchStaleNoticesWhatNoRootCovers(t *testing.T) {
