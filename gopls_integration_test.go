@@ -139,15 +139,18 @@ func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 	records := mustReadMap(t, m.mapPath)
 	require.Len(t, records, 1, "simultaneous clients must share one child")
 	old := records[0]
-	call := func(b *httpBackend, file, marker string) {
+	call := func(b *httpBackend, file, marker string) error {
 		t.Helper()
 		var result jsontext.Value
-		require.NoError(t, b.call(ctx, "tools/call", map[string]any{"name": "go_file_context", "arguments": map[string]any{"file": file}}, &result))
+		if err := b.call(ctx, "tools/call", map[string]any{"name": "go_file_context", "arguments": map[string]any{"file": file}}, &result); err != nil {
+			return err
+		}
 		require.NotContains(t, string(result), `"isError":true`)
 		require.Contains(t, string(result), marker)
+		return nil
 	}
-	call(first, filepath.Join(root, "fixture.go"), "RootMarker")
-	call(second, filepath.Join(linked, "fixture.go"), "LinkedMarker")
+	require.NoError(t, call(first, filepath.Join(root, "fixture.go"), "RootMarker"))
+	require.NoError(t, call(second, filepath.Join(linked, "fixture.go"), "LinkedMarker"))
 	require.Len(t, mustReadMap(t, m.mapPath), 2, "linked worktree must get its own shared child")
 	require.Eventually(t, func() bool {
 		m.watch.mu.Lock()
@@ -174,7 +177,19 @@ func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 		}
 		return true
 	}, 5*time.Second, 20*time.Millisecond)
-	call(first, filepath.Join(root, "added.go"), "RootMarker")
+	if err := call(first, filepath.Join(root, "added.go"), "RootMarker"); err != nil {
+		// The old stream's reader may win the first call's write race (SPEC F2).
+		// Accept only that terminal error before any replacement was started;
+		// the next independent call must reconnect and see the new file.
+		var remote *jsonrpc.Error
+		require.ErrorAs(t, err, &remote)
+		require.EqualValues(t, jsonrpc.CodeInternalError, remote.Code)
+		require.Contains(t, remote.Message, "gopls for "+root+" went away mid-call:")
+		for _, r := range mustReadMap(t, m.mapPath) {
+			require.NotEqual(t, root, r.Worktree, "a replacement failed instead of the old stream")
+		}
+		require.NoError(t, call(first, filepath.Join(root, "added.go"), "RootMarker"))
+	}
 	for _, r := range mustReadMap(t, m.mapPath) {
 		if r.Worktree == root {
 			require.NotEqual(t, old.PID, r.PID)
