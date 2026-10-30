@@ -136,6 +136,9 @@ func FuzzCleanRecords(f *testing.F) {
 // every process the user owns, and a port outside our range can only refuse a
 // probe and so condemn a live server.
 func FuzzReadMap(f *testing.F) {
+	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"Terminating":true}`))
+	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"PID":0}`))
+	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"StartedAtMilli":9223372036854775807}`))
 	f.Add([]byte(""))
 	f.Add([]byte("\n\n\n"))
 	f.Add([]byte(`{"worktree":"/repo","port":62001,"pid":42}`))
@@ -379,6 +382,9 @@ func FuzzCancelTarget(f *testing.F) {
 // A request is routed on its method and params together, and target's answer is
 // the lane that will run it. It must always name one.
 func FuzzTargetNamesALane(f *testing.F) {
+	f.Add("tools/call", []byte(`{"arguments":{"files":["relative.go",null]}}`))
+	f.Add("tools/call", []byte(`{"arguments":{"file":"/repo/a.go","file":"/repo/b.go"}}`))
+	f.Add("tools/call", []byte(`{"arguments":{"files":{"nested":["/repo/a.go"]}}}`))
 	f.Add("tools/call", []byte(`{"arguments":{"file":"/repo/a.go"}}`))
 	f.Add("tools/call", []byte(`{"arguments":{"query":"Foo"}}`))
 	f.Add("tools/list", []byte(`{}`))

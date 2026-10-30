@@ -170,3 +170,63 @@ func TestCancelledQueueEntryCannotClaimReusedID(t *testing.T) {
 		wantClientQuiet(t, r, "stale queue entry failed new request")
 	})
 }
+
+func TestDelayedCancellationCannotCancelReusedID(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		r := newTestRouter(t, testHome)
+		conn := newFakeConn()
+		var cancellations int
+		conn.onWrite = func(_ context.Context, msg jsonrpc.Message) error {
+			if req, ok := msg.(*jsonrpc.Request); ok && req.Method == "notifications/cancelled" {
+				cancellations++
+			}
+			return nil
+		}
+		l := connectedLane(r, testHome, conn)
+		id := sendCall(t, l, "reused")
+		r.cancelCall(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"reused"}`)})
+		_ = wantClientError(t, r, id, "cancelled request did not complete")
+		_, claimed := r.finish(id, conn, nil)
+		require.False(t, claimed, "late response completed the cancelled request twice")
+		_ = sendCall(t, l, "reused")
+		go l.runControls()
+		synctest.Wait()
+		require.Zero(t, cancellations, "old advisory cancellation reached the reused upstream id")
+		require.Equal(t, 1, r.requestUsage().Outstanding)
+	})
+}
+
+func TestCancellationWriteFencesIDReuse(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		r := newTestRouter(t, testHome)
+		conn := newFakeConn()
+		entered, release := make(chan struct{}), make(chan struct{})
+		var writes int
+		conn.onWrite = func(_ context.Context, msg jsonrpc.Message) error {
+			if req := msg.(*jsonrpc.Request); req.Method == "notifications/cancelled" {
+				close(entered)
+				<-release
+			} else {
+				writes++
+			}
+			return nil
+		}
+		l := connectedLane(r, testHome, conn)
+		id := sendCall(t, l, "same")
+		r.cancelCall(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"same"}`)})
+		_ = wantClientError(t, r, id, "cancelled call did not finish")
+		go l.runControls()
+		<-entered
+		r.finish(id, conn, nil)
+		r.track(id, nil, testHome)
+		done := make(chan struct{})
+		go func() { defer close(done); l.send(t.Context(), &jsonrpc.Request{ID: id, Method: "tools/call"}, nil) }()
+		synctest.Wait()
+		assert.Equal(t, 1, writes, "new id use overtook the old cancellation write")
+		close(release)
+		<-done
+		require.Equal(t, 2, writes)
+	})
+}

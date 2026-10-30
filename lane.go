@@ -46,6 +46,10 @@ type lane struct {
 	reqs     chan delivery
 	controls chan cancellation
 	done     chan struct{}
+	// Serialize operation placement with advisory check/write, so an old
+	// cancellation cannot race a new use of the same connection/id. Waiting
+	// for this gate spends the caller's existing delivery budget.
+	writes chan struct{}
 
 	// ctx owns this lane's control worker and shutdown. Delivery contexts start
 	// at ingress so queueing and resolution share the request lifetime before
@@ -67,6 +71,7 @@ func newLane(r *router, worktree string) *lane {
 		reqs:     make(chan delivery, laneQueue),
 		controls: make(chan cancellation, laneQueue),
 		done:     make(chan struct{}),
+		writes:   make(chan struct{}, 1),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -117,6 +122,7 @@ type cancellation struct {
 	conn     mcp.Connection
 	deadline time.Time
 	placed   <-chan struct{}
+	state    *callState
 }
 
 func (l *lane) runControls() {
@@ -125,19 +131,51 @@ func (l *lane) runControls() {
 		case <-l.ctx.Done():
 			return
 		case control := <-l.controls:
-			ctx, cancel := context.WithDeadline(l.ctx, control.deadline)
-			if control.placed != nil {
-				select {
-				case <-control.placed:
-				case <-ctx.Done():
-				}
-			}
-			if ctx.Err() == nil {
-				_ = control.conn.Write(ctx, control.req)
-			}
-			cancel()
+			l.sendCancellation(control)
 		}
 	}
+}
+
+func (l *lane) lockWrites(ctx context.Context) error {
+	select {
+	case l.writes <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-l.writes
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *lane) sendCancellation(control cancellation) {
+	ctx, cancel := context.WithDeadline(l.ctx, control.deadline)
+	defer cancel()
+	if control.placed != nil {
+		select {
+		case <-control.placed:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if err := l.lockWrites(ctx); err != nil {
+		return
+	}
+	defer func() { <-l.writes }()
+	id, valid := cancelledID(control.req.Params)
+	if !valid {
+		return
+	}
+	l.r.mu.Lock()
+	op, exists := l.r.operations[operationKey{control.conn, id}]
+	l.r.mu.Unlock()
+	if exists && op.state != control.state {
+		return // this id now belongs to a later upstream operation
+	}
+	// With no operation left, sending is harmless: the gate prevents a new
+	// operation from placing this id until this write has completed.
+	_ = control.conn.Write(ctx, control.req)
 }
 
 func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *callState) {
@@ -191,12 +229,18 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 		// was already deleted would outlive the call and produce a second,
 		// contradictory reply to the same id later on.
 		placed := make(chan struct{})
+		if err := l.lockWrites(ctx); err != nil {
+			l.giveUp(conn, id, state, err)
+			return
+		}
 		if err := l.r.beginOperation(id, state, conn, l.worktree, cancel, placed); err != nil {
+			<-l.writes
 			l.giveUp(conn, id, state, err)
 			return
 		}
 		err = conn.Write(ctx, req)
 		close(placed)
+		<-l.writes
 		if errors.Is(err, transport.ErrMessageTooLarge) {
 			// The bounded transport rejected before POST; unlike a write failure,
 			// this proves no upstream operation was started by this attempt.
@@ -334,7 +378,7 @@ func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 		return nil, err
 	}
 	// Handed to the connection, which releases it on Close — see boundedConn.
-	return &boundedConn{Connection: conn, release: cancel}, nil
+	return &boundedConn{Connection: conn, release: cancel, ctx: ctx}, nil
 }
 
 // boundedConn ties dialBounded's context to the life of its connection, so
@@ -345,10 +389,13 @@ func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 type boundedConn struct {
 	mcp.Connection
 	release context.CancelFunc
+	ctx     context.Context
 }
 
+func (c *boundedConn) lifetime() context.Context { return c.ctx }
+
 func (c *boundedConn) Close() error {
-	defer c.release()
+	c.release()
 	return c.Connection.Close()
 }
 

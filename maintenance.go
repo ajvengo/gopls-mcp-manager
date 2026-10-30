@@ -159,12 +159,12 @@ func (m *manager) used(worktree string) {
 	m.uses.mu.Unlock()
 }
 
-// flushUses is a withMap body adding the pending counts to their records.
-// Terminating records are left alone: signalTerminating matches the exact
-// record it persisted.
-func (m *manager) flushUses(records []record) ([]record, error) {
+// flushUses transfers a batch of delivered usage to the registry. Failed
+// commits merge it back with deliveries made concurrently, so storage errors
+// cannot silently reset eviction frequency. Terminating records stay intact.
+func (m *manager) flushUses(ctx context.Context) ([]record, error) {
 	if m.uses == nil {
-		return records, nil
+		return m.withMap(ctx, keepRecords)
 	}
 	m.uses.mu.Lock()
 	counts := m.uses.counts
@@ -172,14 +172,24 @@ func (m *manager) flushUses(records []record) ([]record, error) {
 		m.uses.counts = make(map[string]int)
 	}
 	m.uses.mu.Unlock()
-	now := time.Now()
-	for i, r := range records {
-		if n := counts[r.Worktree]; n > 0 && !r.Terminating {
-			records[i].Uses = r.frequency(now) + float64(n)
-			records[i].UsedAt = now.Unix()
+	records, err := m.withMap(ctx, func(records []record) ([]record, error) {
+		now := time.Now()
+		for i, r := range records {
+			if n := counts[r.Worktree]; n > 0 && !r.Terminating {
+				records[i].Uses = r.frequency(now) + float64(n)
+				records[i].UsedAt = now.Unix()
+			}
 		}
+		return records, nil
+	})
+	if err != nil && len(counts) != 0 {
+		m.uses.mu.Lock()
+		for worktree, n := range counts {
+			m.uses.counts[worktree] += n
+		}
+		m.uses.mu.Unlock()
 	}
-	return records, nil
+	return records, err
 }
 
 // frequency is Uses aged to now. A future UsedAt is not aged at all, rather
@@ -193,7 +203,7 @@ func (r record) frequency(now time.Time) float64 {
 // evict. Only the flush can fail the sweep: a missing or failing lsof skips
 // the budget and leaves deleted-worktree reaping to go ahead.
 func (m *manager) evictionVictims(ctx context.Context) ([]record, error) {
-	records, err := m.withMap(ctx, m.flushUses)
+	records, err := m.flushUses(ctx)
 	if err != nil || m.openFiles == nil || len(records) == 0 {
 		return nil, err
 	}
@@ -226,16 +236,28 @@ func (m *manager) evictionVictims(ctx context.Context) ([]record, error) {
 // GOPLS_MANAGER_MAX_SERVERS.
 func overBudget(records []record, files map[int]int, busy map[string]bool, budget int, now time.Time) ([]record, int) {
 	total := 0
-	counted := make(map[int]bool, len(records))
-	var candidates []record
+	byPID := make(map[int]record, len(records))
+	spared := make(map[int]bool, len(records))
 	for _, r := range records {
-		if !counted[r.PID] {
-			counted[r.PID] = true
+		previous, exists := byPID[r.PID]
+		if !exists {
 			total += files[r.PID]
 		}
+		// Duplicate records describe one process. Keep its hottest ranking and
+		// spare the whole process if any alias is busy, new or terminating.
+		if !exists || r.frequency(now) > previous.frequency(now) {
+			byPID[r.PID] = r
+		}
 		age := now.Sub(time.Unix(r.StartedAt, 0))
-		if !r.Terminating && !busy[r.Worktree] && files[r.PID] > 0 && (age < 0 || age >= evictionWindow) {
-			candidates = append(candidates, r)
+		if r.Terminating || busy[r.Worktree] || files[r.PID] <= 0 || age >= 0 && age < evictionWindow {
+			spared[r.PID] = true
+		}
+	}
+	var candidates []record
+	for _, r := range records {
+		if candidate, ok := byPID[r.PID]; ok && !spared[r.PID] {
+			candidates = append(candidates, candidate)
+			delete(byPID, r.PID)
 		}
 	}
 	slices.SortStableFunc(candidates, func(a, b record) int {

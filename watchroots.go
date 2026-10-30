@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -8,7 +9,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 
 	"golang.org/x/mod/modfile"
 )
@@ -33,6 +38,7 @@ import (
 
 // watchPlan is what answerRoots tells a gopls to watch.
 type watchPlan struct {
+	started time.Time                 // admission order, so a late plan cannot replace a newer generation
 	roots   []string                  // absolute directories gopls watches recursively
 	partial map[string]partialEntries // keyed by absolute directory
 }
@@ -48,6 +54,7 @@ type partialEntries struct {
 
 // watchSnapshot is the plan a manager last reported for a worktree, and when.
 type watchSnapshot struct {
+	planned time.Time
 	partial map[string]partialEntries
 	taken   time.Time
 	// server is the gopls the roots went to, unknown when the connection did
@@ -100,9 +107,12 @@ func rulePath(rule string) string {
 // a "**" segment matches zero or more segments. Paths are slash-separated and
 // relative to the worktree.
 func pathIncludeFunc(rules []string) func(string) bool {
-	matchers := make([]*regexp.Regexp, len(rules))
-	included := make([]bool, len(rules))
-	for i, rule := range rules {
+	matchers := make([]*regexp.Regexp, 0, len(rules))
+	included := make([]bool, 0, len(rules))
+	for _, rule := range rules {
+		if !usableFilterRule(rule) {
+			continue
+		}
 		prefix := rulePath(rule)
 		pattern := ".*"
 		if prefix != "" {
@@ -118,8 +128,12 @@ func pathIncludeFunc(rules []string) func(string) bool {
 			}
 			pattern = strings.TrimPrefix(b.String(), "^/.*")
 		}
-		matchers[i] = regexp.MustCompile(pattern)
-		included[i] = rule[0] == '+'
+		matcher, err := regexp.Compile(pattern)
+		if err != nil {
+			continue
+		}
+		matchers = append(matchers, matcher)
+		included = append(included, rule[0] == '+')
 	}
 	return func(rel string) bool {
 		rel = "/" + strings.Trim(rel, "/") + "/"
@@ -131,6 +145,10 @@ func pathIncludeFunc(rules []string) func(string) bool {
 		}
 		return include
 	}
+}
+
+func usableFilterRule(rule string) bool {
+	return len(rule) > 0 && len(rule) <= config.MaxDirectoryFilterBytes && utf8.ValidString(rule) && (rule[0] == '+' || rule[0] == '-')
 }
 
 // dirFilter judges directories by one rule list: include is pathIncludeFunc's
@@ -147,7 +165,7 @@ type dirFilter struct {
 func newDirFilter(rules []string) dirFilter {
 	var plus []string
 	for _, rule := range rules {
-		if rule[0] != '+' {
+		if !usableFilterRule(rule) || rule[0] != '+' {
 			continue
 		}
 		prefix := rulePath(rule)
@@ -181,9 +199,12 @@ func (f dirFilter) worthListing(rel string) bool {
 // does not parse contributes nothing: gopls reports that, not this.
 func moduleIgnoreFilters(worktree string) []string {
 	moduleDirs := []string{"."}
-	if data, err := os.ReadFile(filepath.Join(worktree, "go.work")); err == nil {
+	if data, err := readModuleFile(filepath.Join(worktree, "go.work")); err == nil {
 		if work, err := modfile.ParseWork("go.work", data, nil); err == nil {
 			for _, use := range work.Use {
+				if !utf8.ValidString(use.Path) {
+					continue
+				}
 				dir := path.Clean(filepath.ToSlash(use.Path))
 				if !path.IsAbs(dir) && dir != ".." && !strings.HasPrefix(dir, "../") && !slices.Contains(moduleDirs, dir) {
 					moduleDirs = append(moduleDirs, dir)
@@ -194,7 +215,7 @@ func moduleIgnoreFilters(worktree string) []string {
 	var filters []string
 	for _, dir := range moduleDirs {
 		gomod := filepath.Join(worktree, filepath.FromSlash(dir), "go.mod")
-		data, err := os.ReadFile(gomod)
+		data, err := readModuleFile(gomod)
 		if err != nil {
 			continue
 		}
@@ -203,6 +224,9 @@ func moduleIgnoreFilters(worktree string) []string {
 			continue
 		}
 		for _, ignore := range file.Ignore {
+			if !utf8.ValidString(ignore.Path) {
+				continue
+			}
 			pattern, relative := strings.CutPrefix(filepath.ToSlash(ignore.Path), "./")
 			pattern = strings.Trim(path.Clean("/"+pattern), "/")
 			if pattern == "" {
@@ -220,6 +244,30 @@ func moduleIgnoreFilters(worktree string) []string {
 		}
 	}
 	return filters
+}
+
+// Metadata is repository-controlled. Nonblocking open avoids parking on a FIFO;
+// descriptor checks reject devices, and the reader also bounds concurrent growth.
+const maxModuleFileBytes = 4 << 20
+
+func readModuleFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxModuleFileBytes {
+		return nil, os.ErrInvalid
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxModuleFileBytes+1))
+	if len(data) > maxModuleFileBytes {
+		return nil, os.ErrInvalid
+	}
+	return data, err
 }
 
 // planWatch computes the roots a gopls for worktree is told to watch.
@@ -347,8 +395,10 @@ func (m *manager) rememberWatch(worktree string, server serverID, plan watchPlan
 	}
 	m.watch.mu.Lock()
 	defer m.watch.mu.Unlock()
-	if current, ok := m.watch.plans[worktree]; ok && server.known() && current.server == server {
-		return
+	if current, ok := m.watch.plans[worktree]; ok {
+		if server.known() && current.server == server || !plan.started.IsZero() && current.planned.After(plan.started) {
+			return
+		}
 	}
 	if len(plan.partial) == 0 && !server.known() {
 		delete(m.watch.plans, worktree)
@@ -356,7 +406,7 @@ func (m *manager) rememberWatch(worktree string, server serverID, plan watchPlan
 	}
 	// A known server with nothing uncovered still gets a snapshot, with no
 	// partial directories: it is what makes its later answers keep that fact.
-	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now(), server: server}
+	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now(), planned: plan.started, server: server}
 }
 
 // watchChanged reports whether r's gopls has missed a change no root of its plan

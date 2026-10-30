@@ -97,7 +97,7 @@ func TestParseDirectoryFilters(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, none)
 
-	for _, invalid := range []string{"docs", "-doc*", "-a/b?", "-**x"} {
+	for _, invalid := range []string{"docs", "-doc*", "-a/b?", "-**x", "+\x80"} {
 		_, err := ParseDirectoryFilters(invalid)
 		require.Errorf(t, err, "invalid filter %q accepted", invalid)
 	}

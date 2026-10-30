@@ -80,10 +80,14 @@ for the original write to finish before forwarding. A full control queue can
 drop the advisory notification but cannot undo local completion. Unknown,
 already completed or malformed cancellation ids are dropped. A notification
 itself has no response; the terminal response belongs to the request it names.
+Advisory writes and operation placement share a cancellable lane gate. Under
+that gate an advisory is dropped if its connection/id now belongs to another
+request generation; a later reuse cannot overtake an advisory already writing.
 → `TestQueuedCancellationPreventsDelivery`,
 `TestCancellationBypassesFullDeliveryQueue`,
 `TestCancellationCannotOvertakeItsCall`,
 `TestCancellationFollowsACallOntoItsRetryConnection`
+→ `TestDelayedCancellationCannotCancelReusedID`, `TestCancellationWriteFencesIDReuse`
 
 R8. Outstanding requests are bounded independently of queue depth: 128 per
 worktree lane and 1024 per session by default. A server accepting writes without
@@ -244,12 +248,19 @@ directories covering the worktree minus the excluded trees; a `+` rule
 re-includes a subtree below an excluded one. Directories gopls' watcher skips
 (names starting with `.` or `_`, and `testdata`) are neither roots nor
 exclusions, so `.git` is never watched whatever a rule says.
+Module metadata contributes filters only when it resolves to a regular file
+of at most 4 MiB; devices, FIFOs and oversized files contribute none. Regular
+file symlinks remain supported. Environment filter rules must be valid UTF-8.
+Individual rules are capped at 4096 bytes before regexp compilation; invalid
+decoded module paths and unusable module rules are ignored. Environment rules
+exceeding the cap are rejected at startup.
 → `TestUpstreamRootsCoverTheWorktreeMinusFilters`,
 `TestPlanWatchCoversTheWorktreeMinusExcludedTrees`,
 `TestPlanWatchWithoutExclusionsIsTheWorktree`,
 `TestPlanWatchReincludesBelowAnExcludedTree`, `TestGitDirectoryIsNeverWatched`,
 `TestPathIncludeFuncMatchesGopls`, `TestModuleIgnoreFiltersReadGoModAndGoWork`,
 `TestParseDirectoryFilters`
+→ `TestModuleMetadataReadsAreBounded`, `FuzzDirectoryFilterPrecedence`
 
 S1b. **A server that missed an uncovered change is restarted.** No root covers
 the entries directly inside a "partial" directory, one with an excluded
@@ -307,8 +318,17 @@ S4. **Every other server-initiated request is answered with
 S4a. Server-request replies have a 30 s ceiling, shortened by any existing
 handshake deadline. A failed reply closes the connection and explicitly fails
 its outstanding calls. The next call can reconnect using ordinary lane recovery.
+Planning shares this deadline through one router-owned filesystem worker.
+An uncancellable syscall may occupy that worker after expiry, but reconnects
+do not create replacement workers. Expired plans cannot publish snapshots,
+and an older plan cannot replace a newer generation's snapshot. Connection
+closure cancels its queued roots work even when its reader is backpressured.
 → `TestServerReplyFailureCompletesOutstanding`,
 `TestServerReplyKeepsShorterHandshakeDeadline`
+→ `TestRootsPlanningHonoursBudget`, `TestRootsWorkersStayBoundedAcrossTimeouts`,
+`TestExpiredRootsPlanCannotRememberSnapshot`,
+`TestLateRootsPlanCannotReplaceNewerGeneration`,
+`TestClosedConnectionCannotStartObsoleteRootsPlan`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
 lane also writes to, and the steady-state reader answers `roots/list` from a
@@ -488,9 +508,14 @@ that should stop and one confirmed gone.
 
 → `TestRecordAlive`, `FuzzWithinStartGrace`
 
-L1. Explicit full maintenance (`list`) probes every snapshot record with at most
+L1. Explicit liveness reconciliation (`list`) probes every snapshot record with at most
 eight concurrent probes. Cancellation stops admission before reconciliation.
+Endpoint probes bypass environment proxies and refuse redirects, like SSE
+traffic. A redirect is inconclusive, never permission to signal. Process
+matching checks the complete `gopls mcp -listen <address>` argument tail rather
+than substrings; interpreter prefixes remain supported.
 → `TestSweepBoundsConcurrencyAndCancelsBeforeMutation`
+→ `TestProbeDoesNotFollowRedirects`, `TestProcessIdentityRejectsSubstringMatches`
 
 Duplicate worktree records are included. Acquisition (`ensure` and bridge dials)
 probes only records matching the requested worktree. All other records remain
@@ -504,10 +529,15 @@ mark a replacement.
 → `TestSweepReconcilesOnlyTheProbedIdentity`
 
 L2. Before signalling, persist Terminating=true. This commit survives a later
-caller mutation failure. A separate per-record action flock serializes signal
+caller mutation failure. A separate per-port action flock serializes signal
 attempts. Recheck the atomic registry snapshot and process identity before
 SIGTERM, without holding the global registry lock.
+The stable `<map>.cleanup-<port>.lock` names retain their inodes, with at most
+4001 new cleanup lock files per registry. Older PID/port-keyed lock files remain
+untouched. Upgrade all managers before relying on the new lock namespace;
+historical lock files may be removed only while every sharing manager is stopped.
 → `TestSweepSignalsOnlyAfterPersistingTermination`
+→ `TestCleanupLockFilesBoundedAcrossGenerations`
 
 L3. Sending SIGTERM is not proof of exit. Retain the record on signal error,
 ignored SIGTERM or delayed exit; ensure refuses its endpoint and does not spawn
@@ -533,7 +563,10 @@ is outside the flock, while the persisted record reserves its port.
 L6. Every maintenance sweep first adds this manager's delivered tools/call
 counts to the matching non-terminating records (`Uses` aged to now with a 1 h
 half-life, `UsedAt` now). It then counts lsof rows for every recorded pid,
-each pid once. While the total exceeds GOPLS_MANAGER_MAX_OPEN_FILES, it picks
+each pid once. A failed usage commit restores its batch alongside concurrently
+delivered counts. Duplicate PID records contribute one eviction candidate,
+ranked by their hottest record; any busy, new or terminating alias spares the
+whole process. While the total exceeds GOPLS_MANAGER_MAX_OPEN_FILES, it picks
 records in ascending aged-use order, then oldest UsedAt. Terminating records
 and records started less than 5 min ago are never picked but still count.
 Nor is a worktree with an upstream operation (beginOperation to
@@ -547,6 +580,7 @@ pending operations again and only then judged by identity, so it reaches
 SIGTERM only through L2. A missing or failing lsof skips the budget
 for that sweep but not the rest of it.
 → `TestOverBudgetEvictsLeastFrequentlyUsed`, `TestFlushUsesAgesAndAddsCounts`,
+`TestFailedUsageCommitPreservesConcurrentCounts`,
 `TestMaintenanceEvictsLeastFrequentlyUsedOverBudget`,
 `TestMaintenanceSweepsWhenOpenFilesCannotBeCounted`, `TestDeliveredToolCallsCountUses`,
 `TestMaintenanceSparesServersWithFreshPendingCalls`,
@@ -649,6 +683,11 @@ have no hard disk ceiling, and no archives are retained.
 
 ## 10. Known limits
 
+- Roots planning, like path resolution, uses one filesystem worker per router.
+  Shutdown does not wait for an uncancellable filesystem call; its worker exits
+  when the in-progress operation returns. Session churn tests exercise
+  interruptible work.
+
 - Routing waits are bounded even if the OS stalls a filesystem syscall, but the
   single resolver worker can remain occupied until that syscall returns.
   Session shutdown does not wait for that worker. Other filesystem operations,
@@ -669,12 +708,19 @@ have no hard disk ceiling, and no archives are retained.
   eviction spare busy servers; see LEASES.md.
 - Message and frame limits bound wire data, not total heap or decoded-object
   overhead. Queued decoded results and GC high-water allocations remain outside
-  the HTTP and SSE byte budgets. Log retention requires explicit maintenance.
+  the HTTP and SSE byte budgets. Roots plans and uncovered-directory snapshots
+  scale with tree size and have no independent entry/byte ceiling. Log retention
+  requires explicit maintenance and has no aggregate disk ceiling.
 - A terminating process that ignores SIGTERM remains recorded and blocks ensure
   for its worktree. This preserves operator visibility. Owned failed children
   have bounded escalation; a sweeper has no owned process handle.
-- PID identity checks still race signals on POSIX. Per-record action locks
+- PID identity checks still race signals on POSIX. Per-port action locks
   serialize cooperating managers but cannot make OS PID reuse atomic.
+- Loopback endpoints are unauthenticated and assume trusted local clients and
+  listeners. Bind-and-close port selection does not authenticate the eventual
+  listener to the recorded child. Command-line matching is a conservative
+  cleanup check, not protection against a local actor spoofing process arguments.
+  Private per-user state directories and their existing ancestors are trusted.
 - Old manager binaries ignore Terminating. Upgrade all managers sharing the map
   before relying on termination retention; mixed-version safety is not promised.
 - Duplicate records for a worktree are preserved, and ensure uses the first.
@@ -728,6 +774,10 @@ file count, largest size and count above the trim threshold.
 
 Stdio uses a direct, case-sensitive parser for complete scalar messages; the
 pinned SDK still handles writes, batch correlation and fallback validation.
+The stdio adapter excludes notifications from the SDK's unresolved batch-response
+set while preserving original message order. Notification-only batches produce
+no response and retain no response ownership; mixed batches aggregate only
+ID-bearing requests.
 Raw fields are owned copies. SSE uses bounded framing with the SDK JSON-RPC codec.
 Stdio decoding enforces a per-value byte budget including preceding whitespace,
 accounting for read-ahead already buffered by the decoder. Oversized or incomplete
@@ -735,6 +785,8 @@ values fail before unbounded buffering.
 → `TestStdioMessageLimitAndReadAhead`
 → `TestStdioMatchesSDK`, `TestStdioPreservesBatchResponses`,
 `TestStdioCloseUnblocksRead`, `FuzzDecodeScalarMatchesSDK`
+Batch cases cover requests only, mixed notifications, and notifications only.
+→ `FuzzStdioNotificationBatches`
 
 Complete upstream SSE events, including framing fields and comments, have the
 same per-message ceiling. Framing reserves allocated capacity from the shared
@@ -747,8 +799,12 @@ frame blocked at the handoff. Oversize events or invalid JSON-RPC close the
 connection and fail its pending requests; oversize POSTs fail before HTTP Write.
 The byte budget excludes decoded messages, network buffers and garbage awaiting
 collection. It is not a process heap limit.
+Upstream SSE connects only to numeric HTTP loopback addresses. Endpoint events
+must retain the initial scheme and host/port, without credentials or fragments.
+The dedicated client bypasses environment proxies and refuses GET/POST redirects.
 → `TestSSEFrameBoundsAndOwnership`, `TestSSEReadAheadAndSlowConsumerClose`,
 `TestSSEOversizeBeforePost`
+→ `TestSSERejectsEndpointEscape`, `TestSSERejectsRedirects`, `FuzzSSEFrameBudget`
 
 Implementation remains one Go module. `internal/config` owns shared limits,
 defaults and environment validation. `internal/transport` owns bounded stdio/SSE

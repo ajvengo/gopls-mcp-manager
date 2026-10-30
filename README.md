@@ -112,7 +112,8 @@ Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
 - **A cancellation completes the call locally** and releases its outstanding
   slot. Queued or dialling delivery is cancelled. Delivered calls also use a
   separate bounded control queue to notify the exact owning connection; a late
-  answer is suppressed. Local completion does not prove upstream work stopped.
+  answer is suppressed. Advisory writes are fenced against later reuse of the
+  same request ID. Local completion does not prove upstream work stopped.
 - Everything else that is not a `tools/call` goes to home.
 
 Resolution shells out to `git rev-parse --show-toplevel`, so successful answers
@@ -139,11 +140,12 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
   come back as errors rather than hanging, since MCP clients have no timeout.
 - **Each worktree gets its own lane**, so starting a cold worktree — a lock wait,
   a `gopls` spawn, a handshake — costs that worktree's calls and nobody else's.
-- **Each admitted message has a 30 s delivery budget**, including queue time,
+- **After routing, each message has a 30 s delivery budget**, including lane queue time,
   lock acquisition, readiness, handshake and retry. An expired queued call
   cannot start a server. Filesystem syscalls cannot be interrupted by a Go
   context, and failed-child cleanup has a separate short budget. The budget
   is separate from the optional post-delivery execution timeout described below.
+  The total ingress, routing and delivery lifetime is at most 40 s.
 - **A full worktree queue rejects requests** with an overload error instead of
   blocking other worktrees. Each delivery and cancellation queue holds 64
   messages. Notifications are advisory and are dropped when their queue is full.
@@ -273,6 +275,11 @@ flight. SPEC.md contains the behavioral contract.
 
 ## State on disk
 
+Cleanup action locks use stable per-port names (`gopls-ports.map.cleanup-<port>.lock`),
+so new locks are bounded by the 4001-port allocation range. Their inodes stay
+in place for flock safety. Older PID/port-keyed locks are retained; upgrade all
+sharing managers and stop them before manually removing historical lock files.
+
 | Path | Contents |
 | --- | --- |
 | `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…,"StartedAtMilli":…}` |
@@ -313,7 +320,9 @@ process is signalled when it is. Acquisition checks only records for the request
 worktree; unrelated records continue reserving their ports. Startup performs a
 full sweep before admission, and running bridge/HTTP managers repeat it every
 30 seconds so deleted temporary worktrees do not strand indexes. Run `list` for
-an immediate full maintenance sweep. Existing worktrees with healthy servers
+immediate liveness reconciliation; open-file eviction, deleted-worktree cleanup,
+and stale-watch restarts run at startup and on the maintenance timer.
+Existing worktrees with healthy servers
 remain shared; this is not idle eviction. Probes run outside
 the global registry lock. Reconciliation applies verdicts only to unchanged
 record identities:
@@ -420,6 +429,29 @@ costs; inspect stacks before attributing them to the manager.
 The integration benchmark includes actual gopls execution latency; its child
 process CPU and allocations require separate profiling and are outside the
 manager's pprof profile.
+
+`TestAuditSessionChurn` checks ten batches of 100 synthetic backend lifetimes,
+including roots planning, cancellation and unresolved-operation cleanup. To save
+quiescent heap/goroutine profiles outside the repository:
+
+```sh
+GOPLS_MANAGER_AUDIT_PROFILES=/tmp/gopls-audit-profiles go test -race -v -run '^TestAuditSessionChurn$' .
+go test -run '^$' -fuzz '^FuzzDirectoryFilterPrecedence$' -fuzztime=60s .
+go test -run '^$' -fuzz '^FuzzSSEFrameBudget$' -fuzztime=60s ./internal/transport
+```
+
+Roots planning uses one worker per router, and callers share their reply deadline
+with planning. An uncancellable filesystem call can retain that single worker
+until it returns. Module metadata larger than 4 MiB or resolving to a nonregular
+file contributes no ignore filters; symlinks to regular files remain supported.
+Filter rules are limited to 4096 bytes. Invalid UTF-8 environment rules fail
+startup; invalid decoded module ignore paths are skipped safely.
+Upstream SSE uses direct HTTP loopback connections, same-origin endpoint events,
+and no redirects. Readiness probes likewise bypass proxies and refuse redirects.
+These limits do not bound decoded heap or shared gopls RSS. Roots plans and
+watch snapshots scale with tree size; logs have explicit trimming and no aggregate
+retention ceiling. Loopback listeners and existing private state directories are
+trusted: the service does not authenticate a TCP listener to its recorded child.
 
 The bridge tests run under `testing/synctest`, whose clock only moves once every
 goroutine in the bubble has blocked, which makes timeouts free and exact: a test

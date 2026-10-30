@@ -110,21 +110,72 @@ func (c *stdioConn) read() {
 		}
 		// The cold path preserves the SDK's batch bookkeeping and error types.
 		var batch []jsontext.Value
-		count := 1
-		if json.Unmarshal(raw, &batch) == nil {
-			count = max(1, len(batch))
-		}
-		if _, err := c.feed.Write(append(raw.Clone(), '\n')); err != nil {
-			c.deliver(nil, err)
-			return
-		}
-		for range count {
-			msg, err := c.sdk.Read(context.Background())
-			if !c.deliver(msg, err) {
+		if json.Unmarshal(raw, &batch) == nil && len(batch) > 0 {
+			if !c.readBatch(batch) {
 				return
 			}
+			continue
+		}
+		msg, err := c.readSDK(raw.Clone())
+		if !c.deliver(msg, err) {
+			return
 		}
 	}
+}
+
+func (c *stdioConn) readSDK(raw []byte) (jsonrpc.Message, error) {
+	if _, err := c.feed.Write(append(raw, '\n')); err != nil {
+		return nil, err
+	}
+	return c.sdk.Read(context.Background())
+}
+
+// The SDK includes notifications in a batch's unresolved response set. They
+// can never resolve, so keep them out of that bookkeeping while delivering
+// every message in its original order. ID-bearing messages still use the SDK's
+// batch correlation, duplicate-ID checks and response aggregation.
+func (c *stdioConn) readBatch(batch []jsontext.Value) bool {
+	messages := make([]jsonrpc.Message, len(batch))
+	tracked := make([]jsontext.Value, 0, len(batch))
+	for i, raw := range batch {
+		msg, err := jsonrpc.DecodeMessage(raw)
+		if err != nil {
+			c.deliver(nil, err)
+			return false
+		}
+		messages[i] = msg
+		if req, ok := msg.(*jsonrpc.Request); !ok || req.ID.IsValid() {
+			tracked = append(tracked, raw)
+		}
+	}
+	var next jsonrpc.Message
+	if len(tracked) > 0 {
+		raw, err := json.Marshal(tracked)
+		if err == nil {
+			next, err = c.readSDK(raw)
+		}
+		if err != nil {
+			c.deliver(nil, err)
+			return false
+		}
+	}
+	for _, msg := range messages {
+		if req, ok := msg.(*jsonrpc.Request); !ok || req.ID.IsValid() {
+			if next == nil {
+				var err error
+				next, err = c.sdk.Read(context.Background())
+				if err != nil {
+					c.deliver(nil, err)
+					return false
+				}
+			}
+			msg, next = next, nil
+		}
+		if !c.deliver(msg, nil) {
+			return false
+		}
+	}
+	return true
 }
 
 // Account for decoder read-ahead when resetting the per-value budget. A large

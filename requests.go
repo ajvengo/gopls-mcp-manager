@@ -208,10 +208,7 @@ func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 			case r.out <- errorResponse(id, -32000, "execution deadline exceeded; upstream work may still be running"):
 			case <-r.ctx.Done():
 			default:
-				select {
-				case r.errs <- fmt.Errorf("client output queue is full during execution timeout"):
-				default:
-				}
+				r.reportError(fmt.Errorf("client output queue is full during execution timeout"))
 			}
 		}
 	})
@@ -226,8 +223,9 @@ func (r *router) clearRequests() {
 			owner.cancel()
 		}
 	}
-	clear(r.operations)
-	clear(r.operationsPerWorktree)
+	for key := range r.operations {
+		r.endOperationLocked(key)
+	}
 }
 
 // owed is a request in flight: the worktree it was routed to, and the upstream
@@ -361,7 +359,7 @@ func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
 	r.lanesMu.Unlock()
 	if l != nil {
 		select {
-		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, deadline: time.Now().Add(sendBudget)}:
+		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, state: owner.state, deadline: time.Now().Add(sendBudget)}:
 		default:
 		}
 	}
@@ -418,6 +416,7 @@ type operationKey struct {
 type operation struct {
 	worktree  string
 	abandoned bool
+	state     *callState
 }
 
 // Reserve and place atomically, before Write: cancellation cannot make a
@@ -440,7 +439,7 @@ func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connec
 		r.rejectedLocked("upstream_operations")
 		return fmt.Errorf("upstream operation limit reached; cancelled or disconnected work may still be running")
 	}
-	r.operations[key] = operation{worktree: worktree}
+	r.operations[key] = operation{worktree: worktree, state: state}
 	r.operationsPerWorktree[worktree]++
 	r.m.beginPending(key, worktree)
 	owner.conn, owner.cancel, owner.placed = conn, cancel, placed

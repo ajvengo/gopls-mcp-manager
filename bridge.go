@@ -40,7 +40,9 @@ type router struct {
 	dial func(context.Context, string) (mcp.Connection, error)
 	// plan computes a worktree's roots for answerRoots. A seam, like dial: the
 	// real one walks the tree, which a test cannot hold open any other way.
-	plan func(worktree string, global []string) watchPlan
+	plan     func(worktree string, global []string) watchPlan
+	planOnce sync.Once
+	plans    chan rootsPlanning
 
 	mu sync.Mutex
 	// Client requests still in flight, so that a dying gopls fails its callers
@@ -84,6 +86,7 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 		usage:                 requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
 		out:                   make(chan jsonrpc.Message, 64),
 		errs:                  make(chan error, 4),
+		plans:                 make(chan rootsPlanning),
 	}
 	// The manager's policy is the session's, and WithDefaults is what lets every
 	// reader below take a limit at face value — including on the zero-value
@@ -208,7 +211,7 @@ func (r *router) writeToClient(stdio mcp.Connection) {
 			return
 		case msg := <-r.out:
 			if err := stdio.Write(r.ctx, msg); err != nil {
-				r.errs <- err
+				r.reportError(err)
 				return
 			}
 		}
@@ -232,7 +235,7 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 	for {
 		msg, err := stdio.Read(r.ctx)
 		if err != nil {
-			r.errs <- err
+			r.reportError(err)
 			return
 		}
 		req, ok := msg.(*jsonrpc.Request)
@@ -279,6 +282,15 @@ func (r *router) forward(msg jsonrpc.Message) {
 	}
 }
 
+// One pending failure is enough to stop serve. A second reporter must never
+// block the ingress reader that serve waits for during shutdown.
+func (r *router) reportError(err error) {
+	select {
+	case r.errs <- err:
+	default:
+	}
+}
+
 // errorResponse builds the one error shape this bridge sends, in both
 // directions: refuse and failInFlight forward it to the client,
 // answeredUpstream writes it back to a gopls. Shared so they cannot drift into
@@ -291,16 +303,21 @@ func errorResponse(id jsonrpc.ID, code int64, format string, args ...any) *jsonr
 }
 
 func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
+	parent := r.ctx
+	if c, ok := conn.(interface{ lifetime() context.Context }); ok && c.lifetime() != nil {
+		parent = c.lifetime()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	// roots/list is answered off this loop: planning walks the worktree, and
 	// nothing else from this upstream is forwarded while the loop is in it. One
-	// worker per reader keeps the walks serial and the goroutines bounded; the
-	// queue is small because gopls asks rarely, and a full one only slows the
-	// reader to the old behaviour.
+	// reply worker per reader serializes replies; planRoots shares one filesystem
+	// worker across reconnects. The small queue backpressures only this reader.
 	asks := make(chan jsonrpc.ID, 4)
 	defer close(asks)
-	go r.answerRootsAsks(conn, worktree, asks)
+	go r.answerRootsAsks(ctx, conn, worktree, asks)
 	for {
-		msg, err := conn.Read(r.ctx)
+		msg, err := conn.Read(ctx)
 		if err != nil {
 			// An upstream dying is not the stdio client's problem. Its cached
 			// connection fails the next write, which redials and retries once.
@@ -341,13 +358,13 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 // answers it and the other finds nothing. Later asks on a failed connection are
 // drained unanswered, so the reader never blocks on a dead worker. It ends when
 // the reader closes asks.
-func (r *router) answerRootsAsks(conn mcp.Connection, worktree string, asks <-chan jsonrpc.ID) {
+func (r *router) answerRootsAsks(parent context.Context, conn mcp.Connection, worktree string, asks <-chan jsonrpc.ID) {
 	failed := false
 	for id := range asks {
 		if failed {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(r.ctx, sendBudget)
+		ctx, cancel := context.WithTimeout(parent, sendBudget)
 		err := r.answerRoots(ctx, conn, worktree, id)
 		cancel()
 		if err != nil {
@@ -396,7 +413,10 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 // nothing and answer "no package metadata" for a file that is right there on
 // disk — indistinguishable from a genuinely broken tree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) error {
-	plan := r.plan(worktree, r.limits.DirectoryFilters)
+	plan, err := r.planRoots(ctx, worktree)
+	if err != nil {
+		return err
+	}
 	r.m.rememberWatch(worktree, serverOf(conn), plan)
 	// Strings in a fixed shape: marshaling them cannot fail, and there would be
 	// nobody to tell anyway — the id belongs to the upstream, so an error reply
@@ -410,4 +430,47 @@ func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree 
 	//nolint:staticcheck // Legacy gopls SSE sessions still need roots for file watching.
 	result, _ := json.Marshal(mcp.ListRootsResult{Roots: roots})
 	return conn.Write(ctx, &jsonrpc.Response{ID: id, Result: result})
+}
+
+type rootsPlanning struct {
+	ctx      context.Context
+	worktree string
+	reply    chan watchPlan
+}
+
+// Filesystem calls cannot always be interrupted. Keep one planning worker per
+// router, including across reconnects; callers abandon their buffered reply on
+// expiry without creating replacement workers or publishing a late snapshot.
+func (r *router) planRoots(ctx context.Context, worktree string) (watchPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return watchPlan{}, err
+	}
+	started := time.Now()
+	r.planOnce.Do(func() {
+		go func() {
+			for {
+				select {
+				case <-r.ctx.Done():
+					return
+				case job := <-r.plans:
+					if job.ctx.Err() == nil {
+						job.reply <- r.plan(job.worktree, r.limits.DirectoryFilters)
+					}
+				}
+			}
+		}()
+	})
+	job := rootsPlanning{ctx: ctx, worktree: worktree, reply: make(chan watchPlan, 1)}
+	select {
+	case r.plans <- job:
+	case <-ctx.Done():
+		return watchPlan{}, ctx.Err()
+	}
+	select {
+	case plan := <-job.reply:
+		plan.started = started
+		return plan, ctx.Err()
+	case <-ctx.Done():
+		return watchPlan{}, ctx.Err()
+	}
 }

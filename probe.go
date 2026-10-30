@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,7 +14,12 @@ import (
 
 // A short probe bounds observation cost. A timeout is uncertainty, never
 // permission to discard or kill a shared server.
-var probeClient = &http.Client{Timeout: 500 * time.Millisecond}
+var probeClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return &http.Client{Transport: t, Timeout: 500 * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}()
 
 // endpointProbe reports whether the MCP endpoint on port answered, and whether
 // a negative answer is conclusive. Only a refused connection is, because only
@@ -134,5 +140,13 @@ func isOurGopls(ctx context.Context, pid, port int) (bool, error) {
 // spellings could disagree, and then status would vouch for a process the sweep
 // declines to touch.
 func matchesGopls(command string, port int) bool {
-	return strings.Contains(command, goplsBinary) && strings.Contains(command, mcpAddress(port))
+	fields := strings.Fields(command)
+	if len(fields) < 4 {
+		return false
+	}
+	// ps can include an interpreter prefix for a gopls wrapper. The manager's
+	// actual executable spelling and complete argument tail must still match;
+	// a port prefix or a diagnostic argument mentioning gopls is not identity.
+	args := fields[len(fields)-4:]
+	return filepath.Base(args[0]) == goplsBinary && args[1] == "mcp" && args[2] == "-listen" && args[3] == mcpAddress(port)
 }

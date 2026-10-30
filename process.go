@@ -47,12 +47,13 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// A per-record action lock serializes signal attempts across managers. The
+// A per-port action lock serializes signal attempts across managers. The
 // atomic registry snapshot and process identity are checked again immediately
 // before signalling, outside the global lock. PID identity still has POSIX's
-// check/signal race. Cleanup lock files stay in place to preserve flock identity.
+// check/signal race. Stable port keys bound the number of retained lock inodes
+// by portCount; files stay in place to preserve flock identity.
 func (m *manager) signalTerminating(ctx context.Context, r record) error {
-	return withFileLock(ctx, fmt.Sprintf("%s.cleanup-%d-%d", m.mapPath, r.PID, r.Port), func() error {
+	return withFileLock(ctx, fmt.Sprintf("%s.cleanup-%d", m.mapPath, r.Port), func() error {
 		current, _, err := readMap(m.mapPath)
 		if err != nil || !slices.Contains(current, r) {
 			return err

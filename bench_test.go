@@ -208,8 +208,15 @@ func BenchmarkStdioCodec(b *testing.B) {
 	require.NoError(b, err)
 	reader, err := right.Connect(b.Context())
 	require.NoError(b, err)
+	writerDone := make(chan struct{})
+	b.Cleanup(func() {
+		_ = writer.Close()
+		_ = reader.Close()
+		<-writerDone
+	})
 	req := toolCall(b, fileCallParams(file))
 	go func() {
+		defer close(writerDone)
 		for b.Context().Err() == nil {
 			if writer.Write(b.Context(), req) != nil {
 				return

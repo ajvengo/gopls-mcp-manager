@@ -7,9 +7,11 @@ import (
 	json "encoding/json/v2"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -108,25 +110,80 @@ func TestStdioRejectsAmbiguousJSON(t *testing.T) {
 
 func TestStdioPreservesBatchResponses(t *testing.T) {
 	t.Parallel()
-	var output bytes.Buffer
-	wire := `[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":"b","method":"tools/list"}]` + "\n"
-	c := NewStdio(io.NopCloser(strings.NewReader(wire)), &output, defaultTestLimit)
-	defer func() { _ = c.Close() }()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	for range 2 {
-		_, err := c.Read(ctx)
-		require.NoError(t, err)
+	for _, tc := range []struct {
+		name, wire        string
+		messages, replies int
+	}{
+		{name: "requests only", messages: 2, replies: 2,
+			wire: `[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":"b","method":"tools/list"}]`},
+		{name: "mixed notifications", messages: 3, replies: 1,
+			wire: `[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/progress"}]`},
+		{name: "notifications only", messages: 2,
+			wire: `[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","method":"notifications/progress"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var output bytes.Buffer
+			second := strings.NewReplacer(`"a"`, `"a2"`, `"b"`, `"b2"`).Replace(tc.wire)
+			c := NewStdio(io.NopCloser(strings.NewReader(tc.wire+"\n"+second+"\n")), &output, defaultTestLimit)
+			defer func() { _ = c.Close() }()
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			for range 2 {
+				var ids []jsonrpc.ID
+				for range tc.messages {
+					msg, err := c.Read(ctx)
+					require.NoError(t, err)
+					if id := msg.(*jsonrpc.Request).ID; id.IsValid() {
+						ids = append(ids, id)
+					}
+				}
+				require.Len(t, ids, tc.replies)
+				for i, id := range slices.Backward(ids) {
+					require.NoError(t, c.Write(ctx, &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
+					if i > 0 {
+						require.Zero(t, output.Len(), "partial batch response escaped")
+					}
+				}
+				if tc.replies == 0 {
+					require.Zero(t, output.Len())
+					continue
+				}
+				var responses []jsontext.Value
+				require.NoError(t, json.Unmarshal(output.Bytes(), &responses), "notifications stranded the batch response")
+				require.Len(t, responses, tc.replies)
+				output.Reset()
+			}
+		})
 	}
-	for _, id := range []string{"b", "a"} {
-		requestID, _ := jsonrpc.MakeID(id)
-		err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: jsontext.Value(`{}`)})
+}
+
+func FuzzStdioNotificationBatches(f *testing.F) {
+	f.Add(uint8(0), "")
+	f.Add(uint8(4), "payload\nwith newlines")
+	f.Fuzz(func(t *testing.T, count uint8, payload string) {
+		if len(payload) > 1024 || !utf8.ValidString(payload) {
+			t.Skip()
+		}
+		batch := []map[string]any{{"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}
+		for range int(count%8) + 1 {
+			batch = append(batch, map[string]any{"jsonrpc": "2.0", "method": "notifications/progress", "params": map[string]string{"text": payload}})
+		}
+		wire, err := json.Marshal(batch)
 		require.NoError(t, err)
-		require.Falsef(t, id == "b" && output.Len() != 0, "partial batch response escaped")
-	}
-	var responses []jsontext.Value
-	err := json.Unmarshal(output.Bytes(), &responses)
-	require.Truef(t, err == nil && len(responses) == 2, "batch response: %s, %v", output.Bytes(), err)
+		var output bytes.Buffer
+		c := NewStdio(io.NopCloser(bytes.NewReader(append(wire, '\n'))), &output, defaultTestLimit)
+		defer func() { _ = c.Close() }()
+		for range len(batch) {
+			_, err := c.Read(t.Context())
+			require.NoError(t, err)
+		}
+		id, _ := jsonrpc.MakeID("call")
+		require.NoError(t, c.Write(t.Context(), &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
+		var responses []jsontext.Value
+		require.NoError(t, json.Unmarshal(output.Bytes(), &responses))
+		require.Len(t, responses, 1)
+	})
 }
 
 func TestStdioCloseUnblocksRead(t *testing.T) {
