@@ -208,10 +208,7 @@ func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 			case r.out <- errorResponse(id, -32000, "execution deadline exceeded; upstream work may still be running"):
 			case <-r.ctx.Done():
 			default:
-				select {
-				case r.errs <- fmt.Errorf("client output queue is full during execution timeout"):
-				default:
-				}
+				r.reportError(fmt.Errorf("client output queue is full during execution timeout"))
 			}
 		}
 	})

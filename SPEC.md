@@ -785,7 +785,8 @@ values fail before unbounded buffering.
 → `TestStdioMessageLimitAndReadAhead`
 → `TestStdioMatchesSDK`, `TestStdioPreservesBatchResponses`,
 `TestStdioCloseUnblocksRead`, `FuzzDecodeScalarMatchesSDK`
-→ `TestStdioBatchNotificationsDoNotHoldResponses`, `FuzzStdioNotificationBatches`
+Batch cases cover requests only, mixed notifications, and notifications only.
+→ `FuzzStdioNotificationBatches`
 
 Complete upstream SSE events, including framing fields and comments, have the
 same per-message ceiling. Framing reserves allocated capacity from the shared

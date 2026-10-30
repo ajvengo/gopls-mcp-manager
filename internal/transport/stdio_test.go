@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
-	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -110,59 +110,48 @@ func TestStdioRejectsAmbiguousJSON(t *testing.T) {
 
 func TestStdioPreservesBatchResponses(t *testing.T) {
 	t.Parallel()
-	var output bytes.Buffer
-	wire := `[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":"b","method":"tools/list"}]` + "\n"
-	c := NewStdio(io.NopCloser(strings.NewReader(wire)), &output, defaultTestLimit)
-	defer func() { _ = c.Close() }()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	for range 2 {
-		_, err := c.Read(ctx)
-		require.NoError(t, err)
-	}
-	for _, id := range []string{"b", "a"} {
-		requestID, _ := jsonrpc.MakeID(id)
-		err := c.Write(ctx, &jsonrpc.Response{ID: requestID, Result: jsontext.Value(`{}`)})
-		require.NoError(t, err)
-		require.Falsef(t, id == "b" && output.Len() != 0, "partial batch response escaped")
-	}
-	var responses []jsontext.Value
-	err := json.Unmarshal(output.Bytes(), &responses)
-	require.Truef(t, err == nil && len(responses) == 2, "batch response: %s, %v", output.Bytes(), err)
-}
-
-func TestStdioBatchNotificationsDoNotHoldResponses(t *testing.T) {
-	t.Parallel()
-	for _, notificationsOnly := range []bool{false, true} {
-		t.Run(fmt.Sprint(notificationsOnly), func(t *testing.T) {
+	for _, tc := range []struct {
+		name, wire        string
+		messages, replies int
+	}{
+		{name: "requests only", messages: 2, replies: 2,
+			wire: `[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":"b","method":"tools/list"}]`},
+		{name: "mixed notifications", messages: 3, replies: 1,
+			wire: `[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/progress"}]`},
+		{name: "notifications only", messages: 2,
+			wire: `[{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","method":"notifications/progress"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var output bytes.Buffer
-			batch := `[{"jsonrpc":"2.0","method":"notifications/initialized"}`
-			if !notificationsOnly {
-				batch += `,{"jsonrpc":"2.0","id":"a","method":"tools/list"}`
-			}
-			batch += `,{"jsonrpc":"2.0","method":"notifications/progress"}]` + "\n"
-			second := strings.ReplaceAll(batch, `"a"`, `"b"`)
-			c := NewStdio(io.NopCloser(strings.NewReader(batch+second)), &output, defaultTestLimit)
+			second := strings.NewReplacer(`"a"`, `"a2"`, `"b"`, `"b2"`).Replace(tc.wire)
+			c := NewStdio(io.NopCloser(strings.NewReader(tc.wire+"\n"+second+"\n")), &output, defaultTestLimit)
 			defer func() { _ = c.Close() }()
-			for _, name := range []string{"a", "b"} {
-				count := 2
-				if !notificationsOnly {
-					count++
-				}
-				for range count {
-					_, err := c.Read(t.Context())
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			for range 2 {
+				var ids []jsonrpc.ID
+				for range tc.messages {
+					msg, err := c.Read(ctx)
 					require.NoError(t, err)
+					if id := msg.(*jsonrpc.Request).ID; id.IsValid() {
+						ids = append(ids, id)
+					}
 				}
-				if notificationsOnly {
+				require.Len(t, ids, tc.replies)
+				for i, id := range slices.Backward(ids) {
+					require.NoError(t, c.Write(ctx, &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
+					if i > 0 {
+						require.Zero(t, output.Len(), "partial batch response escaped")
+					}
+				}
+				if tc.replies == 0 {
 					require.Zero(t, output.Len())
 					continue
 				}
-				id, _ := jsonrpc.MakeID(name)
-				require.NoError(t, c.Write(t.Context(), &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
 				var responses []jsontext.Value
 				require.NoError(t, json.Unmarshal(output.Bytes(), &responses), "notifications stranded the batch response")
-				require.Len(t, responses, 1)
+				require.Len(t, responses, tc.replies)
 				output.Reset()
 			}
 		})

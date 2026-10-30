@@ -116,15 +116,18 @@ func (c *stdioConn) read() {
 			}
 			continue
 		}
-		if _, err := c.feed.Write(append(raw.Clone(), '\n')); err != nil {
-			c.deliver(nil, err)
-			return
-		}
-		msg, err := c.sdk.Read(context.Background())
+		msg, err := c.readSDK(raw.Clone())
 		if !c.deliver(msg, err) {
 			return
 		}
 	}
+}
+
+func (c *stdioConn) readSDK(raw []byte) (jsonrpc.Message, error) {
+	if _, err := c.feed.Write(append(raw, '\n')); err != nil {
+		return nil, err
+	}
+	return c.sdk.Read(context.Background())
 }
 
 // The SDK includes notifications in a batch's unresolved response set. They
@@ -149,10 +152,7 @@ func (c *stdioConn) readBatch(batch []jsontext.Value) bool {
 	if len(tracked) > 0 {
 		raw, err := json.Marshal(tracked)
 		if err == nil {
-			_, err = c.feed.Write(append(raw, '\n'))
-		}
-		if err == nil {
-			next, err = c.sdk.Read(context.Background())
+			next, err = c.readSDK(raw)
 		}
 		if err != nil {
 			c.deliver(nil, err)
@@ -160,23 +160,18 @@ func (c *stdioConn) readBatch(batch []jsontext.Value) bool {
 		}
 	}
 	for _, msg := range messages {
-		if req, ok := msg.(*jsonrpc.Request); ok && !req.ID.IsValid() {
-			if !c.deliver(msg, nil) {
-				return false
+		if req, ok := msg.(*jsonrpc.Request); !ok || req.ID.IsValid() {
+			if next == nil {
+				var err error
+				next, err = c.sdk.Read(context.Background())
+				if err != nil {
+					return c.deliver(nil, err)
+				}
 			}
-			continue
+			msg, next = next, nil
 		}
-		if !c.deliver(next, nil) {
+		if !c.deliver(msg, nil) {
 			return false
-		}
-		tracked = tracked[1:]
-		if len(tracked) > 0 {
-			var err error
-			next, err = c.sdk.Read(context.Background())
-			if err != nil {
-				c.deliver(nil, err)
-				return false
-			}
 		}
 	}
 	return true
