@@ -165,7 +165,8 @@ func (c *stdioConn) readBatch(batch []jsontext.Value) bool {
 				var err error
 				next, err = c.sdk.Read(context.Background())
 				if err != nil {
-					return c.deliver(nil, err)
+					c.deliver(nil, err)
+					return false
 				}
 			}
 			msg, next = next, nil
