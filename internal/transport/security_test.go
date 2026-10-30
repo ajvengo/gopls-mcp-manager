@@ -77,6 +77,8 @@ func TestSSERejectsRedirects(t *testing.T) {
 }
 
 func FuzzSSEFrameBudget(f *testing.F) {
+	f.Add("event: endpoint\ndata: //example.invalid/message\n\n")
+	f.Add("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":1,\"x\":2}}\n\n")
 	for _, seed := range []string{"data: {}\n\n", ": comment\n\n", "event: message\r\ndata: {\r\ndata: }\r\n\r\n", strings.Repeat("x", 4097)} {
 		f.Add(seed)
 	}

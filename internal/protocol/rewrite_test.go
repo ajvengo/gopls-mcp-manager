@@ -109,6 +109,9 @@ func TestWithCompleteResultType(t *testing.T) {
 // rather than believing it has none. Arbitrary because a client may send any
 // shape it likes.
 func FuzzWithRootsCapability(f *testing.F) {
+	f.Add([]byte(`{"capabilities":{"roots":null},"opaque":[{"a":1}]}`))
+	f.Add([]byte(`{"capabilities":{},"capabilities":{"roots":null}}`))
+	f.Add([]byte(`{"resultType":"input_required","arguments":{"file":"/alias"}}`))
 	f.Add([]byte(`{}`))
 	f.Add([]byte(`null`))
 	f.Add([]byte(`{"capabilities":{}}`))
@@ -121,6 +124,15 @@ func FuzzWithRootsCapability(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, params []byte) {
 		got := WithRootsCapability(params)
+		complete := WithCompleteResultType(params)
+		physical, _ := WithPhysicalPaths(params, "/physical/file.go", "", nil)
+		if jsontext.Value(params).IsValid() {
+			require.True(t, complete.IsValid())
+			require.True(t, physical.IsValid())
+		} else {
+			require.Equal(t, params, []byte(complete))
+			require.Equal(t, params, []byte(physical))
+		}
 
 		var object map[string]jsontext.Value
 		if err := json.Unmarshal(params, &object); err != nil || object == nil {

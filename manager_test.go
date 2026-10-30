@@ -161,14 +161,20 @@ func TestMapRoundTripEscapesPaths(t *testing.T) {
 // idleAs runs a process whose command line is exactly args, which is what
 // isOurGopls() inspects.
 //
-// The trailing ";:" matters: given a single simple command, sh execs it in
-// place and the process loses this argv along with the shell.
+// A shell builtin waits on stdin without spawning a grandchild or replacing
+// the argv that identity tests inspect. Cleanup kills and reaps the direct child.
 func idleAs(t *testing.T, args ...string) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command("sh", append([]string{"-c", "sleep 10; :"}, args...)...)
-	err := cmd.Start()
+	cmd := exec.Command("sh", append([]string{"-c", "read hold"}, args...)...)
+	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	err = cmd.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
 	return cmd
 }
 
@@ -593,7 +599,7 @@ func TestWithRecordsWritesOnlyWhenTheFileWouldChange(t *testing.T) {
 func stubGopls(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	script := "#!/bin/sh\nsleep 30\n"
+	script := "#!/bin/sh\nexec sleep 30\n"
 	// Named from the constant the manager spawns and matches on: a stub under any
 	// other name would be invisible to both.
 	err := os.WriteFile(filepath.Join(dir, goplsBinary), []byte(script), 0o700)
@@ -613,7 +619,7 @@ func TestClaimPortReturnsBeforeItsGoplsIsReady(t *testing.T) {
 	claimed, started, err := m.claimPort(t.Context(), worktree)
 	require.NoError(t, err)
 	require.NotNilf(t, started, "claimPort() started nothing for a worktree the map had no record of")
-	t.Cleanup(func() { _ = started.Signal(syscall.SIGTERM) })
+	t.Cleanup(func() { require.NoError(t, started.stop()) })
 	elapsed := time.Since(start)
 	assert.Lessf(t, elapsed, readyTimeout, "claimPort() took %s, want a return long before the %s readiness budget", elapsed, readyTimeout)
 
@@ -658,7 +664,7 @@ func TestConcurrentClaimPortSpawnsOnce(t *testing.T) {
 			continue
 		}
 		starter = spawned[i]
-		t.Cleanup(func() { _ = starter.Signal(syscall.SIGTERM) })
+		t.Cleanup(func() { require.NoError(t, starter.stop()) })
 	}
 	require.NotNil(t, starter, "no caller started a gopls, though the map held no record for the worktree")
 

@@ -55,6 +55,10 @@ func TestOverBudgetEvictsLeastFrequentlyUsed(t *testing.T) {
 			victims: []record{busy}, remaining: 10},
 		{name: "shared pid counted once", records: []record{busy, duplicate},
 			files: map[int]int{1: 10}, budget: 10, remaining: 10},
+		{name: "shared pid evicted once", records: []record{idle, idle, busy},
+			files: map[int]int{1: 20, 2: 10}, budget: 15, victims: []record{idle, busy}, remaining: 0},
+		{name: "busy alias spares whole process", records: []record{busy, duplicate},
+			files: map[int]int{1: 20}, busy: map[string]bool{duplicate.Worktree: true}, budget: 10, remaining: 20},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -77,7 +81,7 @@ func TestFlushUsesAgesAndAddsCounts(t *testing.T) {
 	for _, worktree := range []string{"/used", "/used", "/leaving", "/gone"} {
 		m.used(worktree)
 	}
-	got, err := m.withMap(t.Context(), m.flushUses)
+	got, err := m.flushUses(t.Context())
 	require.NoError(t, err)
 	// Eight uses one half-life ago age to four, plus the two just counted.
 	require.Falsef(t, math.Abs(got[0].Uses-6) > 0.01 || time.Since(time.Unix(got[0].UsedAt, 0)) > time.Minute,

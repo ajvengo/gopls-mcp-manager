@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -201,4 +202,104 @@ func TestAuditRealGoplsFailedStartReapsChild(t *testing.T) {
 		require.FailNow(t, "failed child was not reaped")
 	}
 	require.Empty(t, mustReadMap(t, m.mapPath))
+}
+
+// Hold one actual upstream result until local cancellation completes. This
+// tests real SSE delivery and late-result cleanup, without claiming the tool
+// was interrupted after gopls had already computed its answer.
+type auditHeldResponseConn struct {
+	mcp.Connection
+	id       jsonrpc.ID
+	received chan struct{}
+	release  <-chan struct{}
+}
+
+func (c *auditHeldResponseConn) Read(ctx context.Context) (jsonrpc.Message, error) {
+	msg, err := c.Connection.Read(ctx)
+	if resp, ok := msg.(*jsonrpc.Response); ok && resp.ID == c.id {
+		select {
+		case c.received <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return msg, err
+}
+
+func (c *auditHeldResponseConn) server() serverID { return serverOf(c.Connection) }
+
+func TestAuditRealGoplsCancellationAndWorktreeChurn(t *testing.T) {
+	t.Parallel()
+	m, root, linked := realGoplsFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	b := newHTTPBackend(ctx, m, root)
+	dial := b.r.dial
+	received, release := make(chan struct{}, 1), make(chan struct{})
+	heldID := mustID(t, "2")
+	b.r.dial = func(ctx context.Context, worktree string) (mcp.Connection, error) {
+		conn, err := dial(ctx, worktree)
+		if err != nil {
+			return nil, err
+		}
+		return &auditHeldResponseConn{Connection: conn, id: heldID, received: received, release: release}, nil
+	}
+	b.start()
+	defer b.close()
+	_, err := b.initialize(ctx)
+	require.NoError(t, err)
+	params := func(dir string) map[string]any {
+		return map[string]any{"name": "go_file_context", "arguments": map[string]any{"file": filepath.Join(dir, "fixture.go")}}
+	}
+	callCtx, stopCall := context.WithCancel(ctx)
+	defer stopCall()
+	done := make(chan error, 1)
+	go func() { done <- b.call(callCtx, "tools/call", params(root), new(jsontext.Value)) }()
+	select {
+	case <-received:
+	case <-ctx.Done():
+		require.FailNow(t, "real upstream did not produce the held response")
+	}
+	stopCall()
+	require.ErrorIs(t, <-done, context.Canceled)
+	close(release)
+	require.Eventually(t, func() bool { return b.r.requestUsage().UpstreamOperations == 0 }, 5*time.Second, time.Millisecond)
+
+	churn := filepath.Join(t.TempDir(), "churn")
+	runGit(t, "-C", root, "worktree", "add", "--detach", churn, "HEAD")
+	mustWriteFile(t, filepath.Join(churn, "go.mod"), "module example.com/churn\n\ngo 1.27\n")
+	mustWriteFile(t, filepath.Join(churn, "fixture.go"), "package fixture\nconst ChurnMarker = 1\n")
+	for _, dir := range []string{root, linked, churn} {
+		var result jsontext.Value
+		require.NoError(t, b.call(ctx, "tools/call", params(dir), &result))
+		require.NotContains(t, string(result), `"isError":true`)
+	}
+	records := mustReadMap(t, m.mapPath)
+	require.Len(t, records, 3)
+	m.openFiles = countOpenFiles
+	var status strings.Builder
+	require.NoError(t, m.status(ctx, &status))
+	t.Logf("owned real-gopls resources before removal: %s", &status)
+	latest := time.Time{}
+	for _, r := range records {
+		if start := time.Unix(r.StartedAt, 0); start.After(latest) {
+			latest = start
+		}
+	}
+	for _, dir := range []string{linked, churn} {
+		runGit(t, "-C", root, "worktree", "remove", "--force", dir)
+	}
+	require.NoError(t, waitContext(ctx, time.Until(latest.Add(startGrace))))
+	require.Eventually(t, func() bool {
+		_, err := m.sweepMaintenance(ctx)
+		if err != nil {
+			return false
+		}
+		records, _, err := readMap(m.mapPath)
+		return err == nil && len(records) == 1 && records[0].Worktree == root
+	}, 5*time.Second, 20*time.Millisecond, "removed worktree servers retained their records")
 }

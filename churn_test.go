@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,7 +21,8 @@ import (
 
 // Serial so the profiles do not include concurrently running package tests.
 // Each cycle exercises a backend/router, private handshake, roots worker,
-// successful call, cancelled unresolved call and shutdown against one manager.
+// successful call, uncertain-write reconnect, cancelled unresolved call and
+// shutdown against one manager.
 func TestAuditSessionChurn(t *testing.T) {
 	m := &manager{pending: newPendingCalls()}
 	profileDir := os.Getenv("GOPLS_MANAGER_AUDIT_PROFILES")
@@ -48,12 +50,18 @@ func TestAuditSessionChurn(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			b := newHTTPBackend(ctx, m, testHome)
 			b.r.plan = func(worktree string, _ []string) watchPlan { return watchPlan{roots: []string{worktree}} }
+			dials := 0
 			b.r.dial = func(context.Context, string) (mcp.Connection, error) {
+				dials++
+				generation := dials
 				conn := &fakeConn{reads: make(chan jsonrpc.Message, 4)}
 				conn.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
 					req, ok := msg.(*jsonrpc.Request)
-					if !ok || !req.ID.IsValid() || req.Method == "tools/call" {
+					if !ok || !req.ID.IsValid() || req.Method == "tools/call" && !strings.Contains(string(req.Params), `"reply"`) {
 						return nil
+					}
+					if generation == 1 && req.Method == "tools/list" {
+						return io.ErrUnexpectedEOF
 					}
 					result := jsontext.Value(`{}`)
 					if req.Method == "initialize" {
@@ -71,11 +79,14 @@ func TestAuditSessionChurn(t *testing.T) {
 			b.start()
 			_, err := b.initialize(ctx)
 			require.NoError(t, err)
+			require.NoError(t, b.call(ctx, "tools/list", map[string]any{}, new(jsontext.Value)))
+			require.Equal(t, 2, dials, "cycle did not reconnect")
+			require.NoError(t, b.call(ctx, "tools/call", map[string]any{"mode": "reply"}, new(jsontext.Value)))
 			// Expiring work retains its uncertain operation until backend close.
 			callCtx, stopCall := context.WithCancel(ctx)
 			done := make(chan error, 1)
 			go func() { done <- b.call(callCtx, "tools/call", map[string]any{}, new(jsontext.Value)) }()
-			require.Eventually(t, func() bool { return b.r.requestUsage().UpstreamOperations == 1 }, time.Second, time.Millisecond)
+			require.Eventually(t, func() bool { return b.r.requestUsage().UpstreamOperations == 2 }, time.Second, time.Millisecond)
 			stopCall()
 			require.ErrorIs(t, <-done, context.Canceled)
 			b.close()
@@ -132,4 +143,19 @@ func TestAuditDecodedBackpressure(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 	t.Logf("decoded_queue=64 payload_bytes=%d heap_before=%d heap_full=%d heap_after=%d", 256<<10, before.HeapAlloc, full.HeapAlloc, after.HeapAlloc)
+}
+
+func TestAuditCodecBenchmarkCleanup(t *testing.T) {
+	// Serial: compare the SDK pumps owned by one benchmark invocation without
+	// including concurrent transport tests in the same package.
+	pumps := func() int {
+		var stacks bytes.Buffer
+		_ = pprof.Lookup("goroutine").WriteTo(&stacks, 2)
+		return strings.Count(stacks.String(), "mcp.newIOConnLimited.func1")
+	}
+	before := pumps()
+	result := testing.Benchmark(BenchmarkStdioCodec)
+	require.Positive(t, result.N)
+	require.Eventually(t, func() bool { return pumps() <= before }, time.Second, time.Millisecond,
+		"codec benchmark retained SDK decoder pumps after cleanup")
 }

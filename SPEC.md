@@ -80,10 +80,14 @@ for the original write to finish before forwarding. A full control queue can
 drop the advisory notification but cannot undo local completion. Unknown,
 already completed or malformed cancellation ids are dropped. A notification
 itself has no response; the terminal response belongs to the request it names.
+Advisory writes and operation placement share a cancellable lane gate. Under
+that gate an advisory is dropped if its connection/id now belongs to another
+request generation; a later reuse cannot overtake an advisory already writing.
 → `TestQueuedCancellationPreventsDelivery`,
 `TestCancellationBypassesFullDeliveryQueue`,
 `TestCancellationCannotOvertakeItsCall`,
 `TestCancellationFollowsACallOntoItsRetryConnection`
+→ `TestDelayedCancellationCannotCancelReusedID`, `TestCancellationWriteFencesIDReuse`
 
 R8. Outstanding requests are bounded independently of queue depth: 128 per
 worktree lane and 1024 per session by default. A server accepting writes without
@@ -506,7 +510,12 @@ that should stop and one confirmed gone.
 
 L1. Explicit liveness reconciliation (`list`) probes every snapshot record with at most
 eight concurrent probes. Cancellation stops admission before reconciliation.
+Endpoint probes bypass environment proxies and refuse redirects, like SSE
+traffic. A redirect is inconclusive, never permission to signal. Process
+matching checks the complete `gopls mcp -listen <address>` argument tail rather
+than substrings; interpreter prefixes remain supported.
 → `TestSweepBoundsConcurrencyAndCancelsBeforeMutation`
+→ `TestProbeDoesNotFollowRedirects`, `TestProcessIdentityRejectsSubstringMatches`
 
 Duplicate worktree records are included. Acquisition (`ensure` and bridge dials)
 probes only records matching the requested worktree. All other records remain
@@ -520,10 +529,15 @@ mark a replacement.
 → `TestSweepReconcilesOnlyTheProbedIdentity`
 
 L2. Before signalling, persist Terminating=true. This commit survives a later
-caller mutation failure. A separate per-record action flock serializes signal
+caller mutation failure. A separate per-port action flock serializes signal
 attempts. Recheck the atomic registry snapshot and process identity before
 SIGTERM, without holding the global registry lock.
+The stable `<map>.cleanup-<port>.lock` names retain their inodes, with at most
+4001 new cleanup lock files per registry. Older PID/port-keyed lock files remain
+untouched. Upgrade all managers before relying on the new lock namespace;
+historical lock files may be removed only while every sharing manager is stopped.
 → `TestSweepSignalsOnlyAfterPersistingTermination`
+→ `TestCleanupLockFilesBoundedAcrossGenerations`
 
 L3. Sending SIGTERM is not proof of exit. Retain the record on signal error,
 ignored SIGTERM or delayed exit; ensure refuses its endpoint and does not spawn
@@ -549,7 +563,10 @@ is outside the flock, while the persisted record reserves its port.
 L6. Every maintenance sweep first adds this manager's delivered tools/call
 counts to the matching non-terminating records (`Uses` aged to now with a 1 h
 half-life, `UsedAt` now). It then counts lsof rows for every recorded pid,
-each pid once. While the total exceeds GOPLS_MANAGER_MAX_OPEN_FILES, it picks
+each pid once. A failed usage commit restores its batch alongside concurrently
+delivered counts. Duplicate PID records contribute one eviction candidate,
+ranked by their hottest record; any busy, new or terminating alias spares the
+whole process. While the total exceeds GOPLS_MANAGER_MAX_OPEN_FILES, it picks
 records in ascending aged-use order, then oldest UsedAt. Terminating records
 and records started less than 5 min ago are never picked but still count.
 Nor is a worktree with an upstream operation (beginOperation to
@@ -563,6 +580,7 @@ pending operations again and only then judged by identity, so it reaches
 SIGTERM only through L2. A missing or failing lsof skips the budget
 for that sweep but not the rest of it.
 → `TestOverBudgetEvictsLeastFrequentlyUsed`, `TestFlushUsesAgesAndAddsCounts`,
+`TestFailedUsageCommitPreservesConcurrentCounts`,
 `TestMaintenanceEvictsLeastFrequentlyUsedOverBudget`,
 `TestMaintenanceSweepsWhenOpenFilesCannotBeCounted`, `TestDeliveredToolCallsCountUses`,
 `TestMaintenanceSparesServersWithFreshPendingCalls`,
@@ -690,12 +708,19 @@ have no hard disk ceiling, and no archives are retained.
   eviction spare busy servers; see LEASES.md.
 - Message and frame limits bound wire data, not total heap or decoded-object
   overhead. Queued decoded results and GC high-water allocations remain outside
-  the HTTP and SSE byte budgets. Log retention requires explicit maintenance.
+  the HTTP and SSE byte budgets. Roots plans and uncovered-directory snapshots
+  scale with tree size and have no independent entry/byte ceiling. Log retention
+  requires explicit maintenance and has no aggregate disk ceiling.
 - A terminating process that ignores SIGTERM remains recorded and blocks ensure
   for its worktree. This preserves operator visibility. Owned failed children
   have bounded escalation; a sweeper has no owned process handle.
-- PID identity checks still race signals on POSIX. Per-record action locks
+- PID identity checks still race signals on POSIX. Per-port action locks
   serialize cooperating managers but cannot make OS PID reuse atomic.
+- Loopback endpoints are unauthenticated and assume trusted local clients and
+  listeners. Bind-and-close port selection does not authenticate the eventual
+  listener to the recorded child. Command-line matching is a conservative
+  cleanup check, not protection against a local actor spoofing process arguments.
+  Private per-user state directories and their existing ancestors are trusted.
 - Old manager binaries ignore Terminating. Upgrade all managers sharing the map
   before relying on termination retention; mixed-version safety is not promised.
 - Duplicate records for a worktree are preserved, and ensure uses the first.
@@ -749,6 +774,10 @@ file count, largest size and count above the trim threshold.
 
 Stdio uses a direct, case-sensitive parser for complete scalar messages; the
 pinned SDK still handles writes, batch correlation and fallback validation.
+The stdio adapter excludes notifications from the SDK's unresolved batch-response
+set while preserving original message order. Notification-only batches produce
+no response and retain no response ownership; mixed batches aggregate only
+ID-bearing requests.
 Raw fields are owned copies. SSE uses bounded framing with the SDK JSON-RPC codec.
 Stdio decoding enforces a per-value byte budget including preceding whitespace,
 accounting for read-ahead already buffered by the decoder. Oversized or incomplete
@@ -756,6 +785,7 @@ values fail before unbounded buffering.
 → `TestStdioMessageLimitAndReadAhead`
 → `TestStdioMatchesSDK`, `TestStdioPreservesBatchResponses`,
 `TestStdioCloseUnblocksRead`, `FuzzDecodeScalarMatchesSDK`
+→ `TestStdioBatchNotificationsDoNotHoldResponses`, `FuzzStdioNotificationBatches`
 
 Complete upstream SSE events, including framing fields and comments, have the
 same per-message ceiling. Framing reserves allocated capacity from the shared
