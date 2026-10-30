@@ -54,7 +54,7 @@ jobs:
       - run: python3 -m unittest discover -s scripts
       - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
       - run: go install golang.org/x/tools/gopls@v0.23.0
-      - run: go test -race -tags=integration -run '^TestEndToEndRealGopls$' -timeout=3m .
+      - run: go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*)$' -timeout=3m .
 
   lint:
     runs-on: ubuntu-latest

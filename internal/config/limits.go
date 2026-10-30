@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Limits is the resource policy for a manager and its routers.
@@ -123,16 +124,25 @@ func FromEnv() (Limits, error) {
 	return limits, nil
 }
 
+// MaxDirectoryFilterBytes bounds one rule before regexp compilation.
+const MaxDirectoryFilterBytes = 4096
+
 // ParseDirectoryFilters splits a comma-separated list of gopls directoryFilters
 // rules and validates each the way gopls does: a leading + or -, and no glob
 // operator but a whole "**" segment. Rules come back slash-cleaned, so
 // "-docs/" and "-docs" are the same rule. Blank entries are skipped.
 func ParseDirectoryFilters(raw string) ([]string, error) {
+	if !utf8.ValidString(raw) {
+		return nil, fmt.Errorf("directory filters must be valid UTF-8")
+	}
 	var filters []string
 	for _, field := range strings.Split(raw, ",") {
 		filter := strings.TrimSpace(field)
 		if filter == "" {
 			continue
+		}
+		if len(filter) > MaxDirectoryFilterBytes {
+			return nil, fmt.Errorf("directory filter exceeds %d bytes", MaxDirectoryFilterBytes)
 		}
 		if filter[0] != '+' && filter[0] != '-' {
 			return nil, fmt.Errorf("invalid filter %q: must start with + or -", filter)

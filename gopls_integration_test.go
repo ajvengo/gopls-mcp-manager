@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -108,4 +109,96 @@ func BenchmarkRealGoplsRoundTrip(b *testing.B) {
 		ok := response.Error == nil && strings.Contains(string(response.Result), "RootMarker")
 		require.Truef(b, ok, "real gopls tool response: %+v", response)
 	}
+}
+
+func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
+	t.Parallel()
+	m, root, linked := realGoplsFixture(t)
+	m.pending = newPendingCalls()
+	m.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
+	m.limits.DirectoryFilters = []string{"-excluded"}
+	require.NoError(t, os.Mkdir(filepath.Join(root, "excluded"), 0o700))
+	other := *m
+	other.pending = newPendingCalls()
+	other.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	first := newHTTPBackend(ctx, m, root)
+	second := newHTTPBackend(ctx, &other, root)
+	first.start()
+	second.start()
+	defer first.close()
+	defer second.close()
+	initialized := make(chan error, 2)
+	for _, b := range []*httpBackend{first, second} {
+		go func() { _, err := b.initialize(ctx); initialized <- err }()
+	}
+	require.NoError(t, <-initialized)
+	require.NoError(t, <-initialized)
+	records := mustReadMap(t, m.mapPath)
+	require.Len(t, records, 1, "simultaneous clients must share one child")
+	old := records[0]
+	call := func(b *httpBackend, file, marker string) {
+		t.Helper()
+		var result jsontext.Value
+		require.NoError(t, b.call(ctx, "tools/call", map[string]any{"name": "go_file_context", "arguments": map[string]any{"file": file}}, &result))
+		require.NotContains(t, string(result), `"isError":true`)
+		require.Contains(t, string(result), marker)
+	}
+	call(first, filepath.Join(root, "fixture.go"), "RootMarker")
+	call(second, filepath.Join(linked, "fixture.go"), "LinkedMarker")
+	require.Len(t, mustReadMap(t, m.mapPath), 2, "linked worktree must get its own shared child")
+	require.Eventually(t, func() bool {
+		m.watch.mu.Lock()
+		defer m.watch.mu.Unlock()
+		return len(m.watch.plans[root].partial) > 0
+	}, time.Second, time.Millisecond)
+	// Exercise the real start-grace policy rather than rewriting process identity.
+	require.NoError(t, waitContext(ctx, time.Until(time.Unix(old.StartedAt, 0).Add(startGrace))))
+	mustWriteFile(t, filepath.Join(root, "added.go"), "package fixture\nvar _ = RootMarker\n")
+	_, err := m.sweepMaintenance(ctx)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		if _, err := m.withRecords(ctx, keepRecords); err != nil {
+			return false
+		}
+		records, _, err := readMap(m.mapPath)
+		if err != nil {
+			return false
+		}
+		for _, r := range records {
+			if r.Worktree == root {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+	call(first, filepath.Join(root, "added.go"), "RootMarker")
+	for _, r := range mustReadMap(t, m.mapPath) {
+		if r.Worktree == root {
+			require.NotEqual(t, old.PID, r.PID)
+		}
+	}
+}
+
+func TestAuditRealGoplsFailedStartReapsChild(t *testing.T) {
+	t.Parallel()
+	m, root, _ := realGoplsFixture(t)
+	start := m.start
+	var child *childProcess
+	m.start = func(ctx context.Context, worktree string, port int) (*childProcess, error) {
+		var err error
+		child, err = start(ctx, worktree, port)
+		return child, err
+	}
+	m.ready = func(context.Context, int) error { return context.DeadlineExceeded }
+	_, err := m.ensure(t.Context(), root)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NotNil(t, child)
+	select {
+	case <-child.done:
+	default:
+		require.FailNow(t, "failed child was not reaped")
+	}
+	require.Empty(t, mustReadMap(t, m.mapPath))
 }

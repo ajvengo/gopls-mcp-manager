@@ -244,12 +244,19 @@ directories covering the worktree minus the excluded trees; a `+` rule
 re-includes a subtree below an excluded one. Directories gopls' watcher skips
 (names starting with `.` or `_`, and `testdata`) are neither roots nor
 exclusions, so `.git` is never watched whatever a rule says.
+Module metadata contributes filters only when it resolves to a regular file
+of at most 4 MiB; devices, FIFOs and oversized files contribute none. Regular
+file symlinks remain supported. Environment filter rules must be valid UTF-8.
+Individual rules are capped at 4096 bytes before regexp compilation; invalid
+decoded module paths and unusable module rules are ignored. Environment rules
+exceeding the cap are rejected at startup.
 → `TestUpstreamRootsCoverTheWorktreeMinusFilters`,
 `TestPlanWatchCoversTheWorktreeMinusExcludedTrees`,
 `TestPlanWatchWithoutExclusionsIsTheWorktree`,
 `TestPlanWatchReincludesBelowAnExcludedTree`, `TestGitDirectoryIsNeverWatched`,
 `TestPathIncludeFuncMatchesGopls`, `TestModuleIgnoreFiltersReadGoModAndGoWork`,
 `TestParseDirectoryFilters`
+→ `TestModuleMetadataReadsAreBounded`, `FuzzDirectoryFilterPrecedence`
 
 S1b. **A server that missed an uncovered change is restarted.** No root covers
 the entries directly inside a "partial" directory, one with an excluded
@@ -307,8 +314,17 @@ S4. **Every other server-initiated request is answered with
 S4a. Server-request replies have a 30 s ceiling, shortened by any existing
 handshake deadline. A failed reply closes the connection and explicitly fails
 its outstanding calls. The next call can reconnect using ordinary lane recovery.
+Planning shares this deadline through one router-owned filesystem worker.
+An uncancellable syscall may occupy that worker after expiry, but reconnects
+do not create replacement workers. Expired plans cannot publish snapshots,
+and an older plan cannot replace a newer generation's snapshot. Connection
+closure cancels its queued roots work even when its reader is backpressured.
 → `TestServerReplyFailureCompletesOutstanding`,
 `TestServerReplyKeepsShorterHandshakeDeadline`
+→ `TestRootsPlanningHonoursBudget`, `TestRootsWorkersStayBoundedAcrossTimeouts`,
+`TestExpiredRootsPlanCannotRememberSnapshot`,
+`TestLateRootsPlanCannotReplaceNewerGeneration`,
+`TestClosedConnectionCannotStartObsoleteRootsPlan`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
 lane also writes to, and the steady-state reader answers `roots/list` from a
@@ -488,7 +504,7 @@ that should stop and one confirmed gone.
 
 → `TestRecordAlive`, `FuzzWithinStartGrace`
 
-L1. Explicit full maintenance (`list`) probes every snapshot record with at most
+L1. Explicit liveness reconciliation (`list`) probes every snapshot record with at most
 eight concurrent probes. Cancellation stops admission before reconciliation.
 → `TestSweepBoundsConcurrencyAndCancelsBeforeMutation`
 
@@ -649,6 +665,11 @@ have no hard disk ceiling, and no archives are retained.
 
 ## 10. Known limits
 
+- Roots planning, like path resolution, uses one filesystem worker per router.
+  Shutdown does not wait for an uncancellable filesystem call; its worker exits
+  when the in-progress operation returns. Session churn tests exercise
+  interruptible work.
+
 - Routing waits are bounded even if the OS stalls a filesystem syscall, but the
   single resolver worker can remain occupied until that syscall returns.
   Session shutdown does not wait for that worker. Other filesystem operations,
@@ -747,8 +768,12 @@ frame blocked at the handoff. Oversize events or invalid JSON-RPC close the
 connection and fail its pending requests; oversize POSTs fail before HTTP Write.
 The byte budget excludes decoded messages, network buffers and garbage awaiting
 collection. It is not a process heap limit.
+Upstream SSE connects only to numeric HTTP loopback addresses. Endpoint events
+must retain the initial scheme and host/port, without credentials or fragments.
+The dedicated client bypasses environment proxies and refuses GET/POST redirects.
 → `TestSSEFrameBoundsAndOwnership`, `TestSSEReadAheadAndSlowConsumerClose`,
 `TestSSEOversizeBeforePost`
+→ `TestSSERejectsEndpointEscape`, `TestSSERejectsRedirects`, `FuzzSSEFrameBudget`
 
 Implementation remains one Go module. `internal/config` owns shared limits,
 defaults and environment validation. `internal/transport` owns bounded stdio/SSE

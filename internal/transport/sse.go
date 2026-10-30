@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -15,6 +16,16 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// Local upstream traffic must not be redirected or sent through an environment
+// proxy. The shared transport also bounds idle connection retention.
+var sseClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return &http.Client{Transport: t, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+}()
 
 type sseResult struct {
 	frame []byte
@@ -45,8 +56,11 @@ func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budg
 	if err != nil {
 		return nil, err
 	}
+	if req.URL.Scheme != "http" || !net.ParseIP(req.URL.Hostname()).IsLoopback() || req.URL.User != nil {
+		return nil, errors.New("SSE endpoint must be an HTTP loopback address")
+	}
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +90,11 @@ func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budg
 		if err == nil {
 			var posted *url.URL
 			if posted, err = req.URL.Parse(string(data)); err == nil {
-				c.endpoint = posted.String()
+				if posted.Scheme != req.URL.Scheme || posted.Host != req.URL.Host || posted.User != nil || posted.Fragment != "" {
+					err = errors.New("SSE endpoint event must stay on its original origin")
+				} else {
+					c.endpoint = posted.String()
+				}
 			}
 		}
 		budget.release(cap(frame))
@@ -159,7 +177,7 @@ func (c *sseConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return err
 	}

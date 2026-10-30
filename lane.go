@@ -334,7 +334,7 @@ func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 		return nil, err
 	}
 	// Handed to the connection, which releases it on Close — see boundedConn.
-	return &boundedConn{Connection: conn, release: cancel}, nil
+	return &boundedConn{Connection: conn, release: cancel, ctx: ctx}, nil
 }
 
 // boundedConn ties dialBounded's context to the life of its connection, so
@@ -345,10 +345,13 @@ func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 type boundedConn struct {
 	mcp.Connection
 	release context.CancelFunc
+	ctx     context.Context
 }
 
+func (c *boundedConn) lifetime() context.Context { return c.ctx }
+
 func (c *boundedConn) Close() error {
-	defer c.release()
+	c.release()
 	return c.Connection.Close()
 }
 

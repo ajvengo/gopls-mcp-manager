@@ -313,7 +313,9 @@ process is signalled when it is. Acquisition checks only records for the request
 worktree; unrelated records continue reserving their ports. Startup performs a
 full sweep before admission, and running bridge/HTTP managers repeat it every
 30 seconds so deleted temporary worktrees do not strand indexes. Run `list` for
-an immediate full maintenance sweep. Existing worktrees with healthy servers
+immediate liveness reconciliation; open-file eviction, deleted-worktree cleanup,
+and stale-watch restarts run at startup and on the maintenance timer.
+Existing worktrees with healthy servers
 remain shared; this is not idle eviction. Probes run outside
 the global registry lock. Reconciliation applies verdicts only to unchanged
 record identities:
@@ -420,6 +422,25 @@ costs; inspect stacks before attributing them to the manager.
 The integration benchmark includes actual gopls execution latency; its child
 process CPU and allocations require separate profiling and are outside the
 manager's pprof profile.
+
+`TestAuditSessionChurn` checks ten batches of 100 synthetic backend lifetimes,
+including roots planning, cancellation and unresolved-operation cleanup. To save
+quiescent heap/goroutine profiles outside the repository:
+
+```sh
+GOPLS_MANAGER_AUDIT_PROFILES=/tmp/gopls-audit-profiles go test -race -v -run '^TestAuditSessionChurn$' .
+go test -run '^$' -fuzz '^FuzzDirectoryFilterPrecedence$' -fuzztime=60s .
+go test -run '^$' -fuzz '^FuzzSSEFrameBudget$' -fuzztime=60s ./internal/transport
+```
+
+Roots planning uses one worker per router, and callers share their reply deadline
+with planning. An uncancellable filesystem call can retain that single worker
+until it returns. Module metadata larger than 4 MiB or resolving to a nonregular
+file contributes no ignore filters; symlinks to regular files remain supported.
+Filter rules are limited to 4096 bytes. Invalid UTF-8 environment rules fail
+startup; invalid decoded module ignore paths are skipped safely.
+Upstream SSE uses direct HTTP loopback connections, same-origin endpoint events,
+and no redirects. These limits do not bound decoded heap or shared gopls RSS.
 
 The bridge tests run under `testing/synctest`, whose clock only moves once every
 goroutine in the bubble has blocked, which makes timeouts free and exact: a test

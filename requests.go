@@ -226,8 +226,9 @@ func (r *router) clearRequests() {
 			owner.cancel()
 		}
 	}
-	clear(r.operations)
-	clear(r.operationsPerWorktree)
+	for key := range r.operations {
+		r.endOperationLocked(key)
+	}
 }
 
 // owed is a request in flight: the worktree it was routed to, and the upstream
