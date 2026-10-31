@@ -117,8 +117,8 @@ func (b *httpBackend) start() {
 			case <-b.r.ctx.Done():
 				return
 			case err := <-b.r.errs:
-				fmt.Fprintln(os.Stderr, "gopls-mcp-manager: http session:", err)
 				b.cancel()
+				fmt.Fprintln(os.Stderr, "gopls-mcp-manager: http session:", err)
 				return
 			case msg := <-b.r.out:
 				// Stateless JSON responses have no unsolicited notification stream.
@@ -136,13 +136,14 @@ func (b *httpBackend) start() {
 		}
 	}()
 	if b.r.limits.Metrics {
-		go b.r.reportUsage()
+		go b.r.reportUsage(os.Stderr)
 	}
 }
 
 func (b *httpBackend) close() {
 	b.cancel()
 	<-b.done
+	b.r.finishUsage()
 }
 
 func (b *httpBackend) call(ctx context.Context, method string, params any, result any) error {

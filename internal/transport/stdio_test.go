@@ -203,6 +203,9 @@ func TestStdioCloseUnblocksRead(t *testing.T) {
 }
 
 func FuzzDecodeScalarMatchesSDK(f *testing.F) {
+	f.Add([]byte(`{"jsonrpc":"2.0","id":1,"result":{},"error":null}`))
+	f.Add([]byte(`{"jsonrpc":"2.0","id":"reuse","method":"notifications/cancelled","params":{"requestId":"reuse"}}`))
+	f.Add([]byte(`{"jsonrpc":"2.0","id":1,"result":{"nested":[null,{},[]]}}`))
 	f.Add([]byte(`{"jsonrpc":"2.0","id":1,"method":"x","params":{"file":"/a.go"}}`))
 	f.Add([]byte(`{"jsonrpc":"2.0","id":"a","error":{"code":-1,"message":"oops","data":[1]}}`))
 	f.Fuzz(func(t *testing.T, raw []byte) {

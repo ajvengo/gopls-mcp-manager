@@ -136,6 +136,8 @@ func FuzzCleanRecords(f *testing.F) {
 // every process the user owns, and a port outside our range can only refuse a
 // probe and so condemn a live server.
 func FuzzReadMap(f *testing.F) {
+	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"Terminating":true,"Uses":1e309}`))
+	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"StartedAt":-1,"StartedAtMilli":1}`))
 	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"Terminating":true}`))
 	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"PID":0}`))
 	f.Add([]byte(`{"Worktree":"/repo","Port":62001,"PID":42,"StartedAtMilli":9223372036854775807}`))
@@ -345,6 +347,8 @@ func FuzzToolCallWorktrees(f *testing.F) {
 // answer has to be the one belonging to the id named — a target that returned
 // the wrong lane, or any lane at all for an id nobody owes, would show here.
 func FuzzCancelTarget(f *testing.F) {
+	f.Add([]byte(`{"requestId":1,"requestId":2}`))
+	f.Add([]byte(`{"requestId":1,"ignored":`))
 	f.Add([]byte(`{"requestId":1}`))
 	f.Add([]byte(`{"requestId":2}`))
 	f.Add([]byte(`{"requestId":3}`))
@@ -364,7 +368,12 @@ func FuzzCancelTarget(f *testing.F) {
 		var cancelled struct {
 			RequestID any `json:"requestId"`
 		}
-		_ = json.Unmarshal(params, &cancelled)
+		if err := json.Unmarshal(params, &cancelled); err != nil {
+			// v2 can populate RequestID before rejecting a duplicate name or
+			// malformed trailing field. Partial decoding grants no cancellation.
+			require.Empty(t, r.cancelTarget(params))
+			return
+		}
 		// Only a JSON number names one of the two tracked ids; every other shape
 		// — a string, an object, nothing at all — is owed by nobody.
 		var want string
@@ -382,6 +391,8 @@ func FuzzCancelTarget(f *testing.F) {
 // A request is routed on its method and params together, and target's answer is
 // the lane that will run it. It must always name one.
 func FuzzTargetNamesALane(f *testing.F) {
+	f.Add("tools/call", []byte(`{"arguments":{"files":["relative.go"],"File":"/opaque.go"},"opaque":{"file":"/other.go"}}`))
+	f.Add("notifications/cancelled", []byte(`{"requestId":"same","request\u0049d":1}`))
 	f.Add("tools/call", []byte(`{"arguments":{"files":["relative.go",null]}}`))
 	f.Add("tools/call", []byte(`{"arguments":{"file":"/repo/a.go","file":"/repo/b.go"}}`))
 	f.Add("tools/call", []byte(`{"arguments":{"files":{"nested":["/repo/a.go"]}}}`))

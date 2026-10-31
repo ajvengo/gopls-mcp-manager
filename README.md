@@ -62,7 +62,10 @@ gopls-mcp-manager http 127.0.0.1:6099 /absolute/path/to/repo
 Configure your MCP client's Streamable HTTP server URL as
 `http://127.0.0.1:6099/mcp`. The endpoint accepts MCP POST requests and returns
 JSON responses. It issues no session ID and ignores supplied session IDs;
-GET and DELETE return 405. The listener is restricted to loopback.
+GET and DELETE return 405. The listener is restricted to loopback. These stateless
+guarantees assume the SDK compatibility override
+`MCPGODEBUG=allowsessionsinstateless=1` is not enabled; that trusted environment
+setting restores the SDK's legacy session-header and DELETE behavior.
 
 HTTP requests route independently: absolute `file`, `dir`, and `files`
 arguments select a worktree; **pathless calls always use home**. There is no
@@ -193,8 +196,11 @@ Decoded messages use the existing bounded queues; even rejected frames can leave
 unreachable allocations awaiting GC. Increasing message size also increases the
 possible memory retained by those queues. Large diagnostics may require higher limits.
 A timeout releases local tracking and suppresses late results; upstream work may
-continue. If the client output queue is full at expiry, the session fails rather
-than accumulating blocked timer callbacks. Choose it to accommodate long diagnostics and vulnerability scans.
+continue. A full 64-message client output queue fails the session, including
+ordinary results and handshake notifications, so reconnects cannot accumulate
+blocked readers after their operation credits have been released. Transient
+bursts can also reach this limit. Choose the execution timeout to accommodate
+long diagnostics and vulnerability scans.
 
 Late terminal results release abandoned-operation credits. A lost connection
 cannot supply such proof, so its credits remain charged until this router shuts
@@ -208,7 +214,11 @@ durations. Session snapshots every 30 s and at exit report request counts,
 rejection reasons, cancellation/expiry counts, retained lanes and memo sizes,
 path-memo hits/misses, capacity rollovers and expiry epochs, unresolved/abandoned
 operation counts and current/peak SSE frame capacity,
-and count/total/max nanoseconds for routing, queue waits and handshake. MCP stdout stays protocol-only. The status command reports RSS in KiB
+and count/total/max nanoseconds for routing, queue waits and handshake. Periodic
+and final session metrics use the same worker; final output gets up to 100 ms
+to flush after request cleanup. Blocked stderr can retain that one worker,
+while session shutdown returns. Other synchronous CLI/maintenance diagnostics
+require writable stderr. MCP stdout stays protocol-only. The status command reports RSS in KiB
 only when the process identity matches; one bounded ps snapshot covers the
 recorded PIDs. Missing values and active-client counts are null rather than
 guessed. Status never signals a process or rewrites the map.
