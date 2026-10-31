@@ -692,10 +692,24 @@ have no hard disk ceiling, and no archives are retained.
   single resolver worker can remain occupied until that syscall returns.
   Session shutdown does not wait for that worker. Other filesystem operations,
   including registry reads, fsync and rename, are not context-interruptible.
-- The shared stdout queue still backpressures forwarding when the client
-  stops reading. An execution-timeout callback finding this queue full fails
-  the session rather than parking an unbounded number of timer goroutines. Delivery/handshake code forwarding unsolicited messages can
-  also encounter that output backpressure.
+- The shared 64-message output queue fails the session when full, including
+  terminal replies, upstream failures and unsolicited handshake messages.
+  Completed responses release operation credits before output, so parking
+  their readers here would otherwise allow reconnects to retain unbounded
+  readers and decoded results. A transient burst that fills the queue also
+  fails the session. One stdout writer already blocked in an OS write can
+  remain until the client reads or the CLI process exits; shutdown does not
+  wait for that writer.
+  → `TestClosedConnectionReleasesBackpressuredReader`,
+  `TestFullOutputQueueReleasesTerminalProducers`,
+  `TestOutputSaturationStopsSessionWithBlockedWriter`
+- Periodic and final session metrics share one output worker. Final snapshots
+  follow request cleanup and get up to 100 ms to flush before shutdown returns;
+  blocked stderr may retain that one worker, but cannot block this flush
+  indefinitely. HTTP fatal errors cancel the backend before diagnostic output.
+  Other synchronous CLI/maintenance diagnostics still depend on writable stderr.
+  → `TestHTTPErrorCancelsBeforeDiagnosticWrite`,
+  `TestMetricsShutdownDoesNotWaitForStderr`, `TestMetricsFinalSnapshotFollowsCleanup`
 - With execution deadlines disabled, an accepted request can wait indefinitely;
   outstanding limits bound retained requests, not execution duration.
   Cancellation or timeout cannot prove that a gopls mutation stopped.

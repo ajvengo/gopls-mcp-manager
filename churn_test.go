@@ -29,6 +29,9 @@ func TestAuditSessionChurn(t *testing.T) {
 	snapshot := func(batch int) {
 		t.Helper()
 		runtime.GC()
+		// Heap profiles may lag reclamation by a collection. Also clear pool
+		// victims before comparing quiescent batches.
+		runtime.GC()
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 		t.Logf("batch=%d heap_bytes=%d heap_objects=%d goroutines=%d", batch, mem.HeapAlloc, mem.HeapObjects, runtime.NumGoroutine())

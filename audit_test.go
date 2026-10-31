@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	json "encoding/json/v2"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -188,6 +190,202 @@ func TestClosedConnectionCannotStartObsoleteRootsPlan(t *testing.T) {
 	})
 }
 
+func TestClosedConnectionReleasesBackpressuredReader(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		r := newRouter(ctx, nil, testHome)
+		for range cap(r.out) {
+			r.out <- &jsonrpc.Request{Method: "notification"}
+		}
+		connCtx, closeConn := context.WithCancel(ctx)
+		conn := &boundedConn{Connection: newFakeConn(), release: closeConn, ctx: connCtx}
+		id := mustID(t, "completed")
+		state, err := r.admit(id, func() {})
+		require.NoError(t, err)
+		require.NoError(t, r.beginOperation(id, state, conn, testHome, func() {}, nil))
+		done := make(chan struct{})
+		go func() { defer close(done); r.readFromUpstream(conn, testHome) }()
+		conn.Connection.(*fakeConn).reads <- &jsonrpc.Response{ID: id, Result: []byte(`{}`)}
+		synctest.Wait()
+		require.Zero(t, r.requestUsage().UpstreamOperations, "the blocked reader no longer holds an operation credit")
+		require.NoError(t, conn.Close())
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			cancel() // release the old reader before failing the regression
+			<-done
+			require.FailNow(t, "closed connection retained a reader behind session output")
+		}
+		select {
+		case err := <-r.errs:
+			require.ErrorContains(t, err, "client output queue is full")
+		default:
+			require.FailNow(t, "an undeliverable terminal result must fail the session")
+		}
+	})
+}
+
+func TestFullOutputQueueReleasesTerminalProducers(t *testing.T) {
+	for _, terminal := range []string{"upstream failure", "delivery failure", "cancellation"} {
+		t.Run(terminal, func(t *testing.T) {
+			bubble(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				r := newRouter(ctx, nil, testHome)
+				conn := newFakeConn()
+				id := mustID(t, "terminal")
+				r.track(id, conn, testHome)
+				for range cap(r.out) {
+					r.out <- &jsonrpc.Request{Method: "notification"}
+				}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					switch terminal {
+					case "upstream failure":
+						r.failInFlight(conn, testHome, io.EOF)
+					case "delivery failure":
+						r.failDelivery(id, nil, -32000, "delivery failed")
+					case "cancellation":
+						r.cancelCall(&jsonrpc.Request{Method: "notifications/cancelled", Params: []byte(`{"requestId":"terminal"}`)})
+					}
+				}()
+				synctest.Wait()
+				select {
+				case <-done:
+				default:
+					cancel()
+					<-done
+					require.FailNow(t, "terminal producer retained by saturated output")
+				}
+				require.Zero(t, r.requestUsage().Outstanding)
+				require.Equal(t, 1, r.requestUsage().Completed)
+				require.ErrorContains(t, <-r.errs, "client output queue is full")
+			})
+		})
+	}
+}
+
+// Serial: replace only the Go stderr variable, restoring it after the output
+// worker has returned. Real pipe writes stay outside synctest bubbles.
+func TestHTTPErrorCancelsBeforeDiagnosticWrite(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	require.NoError(t, err)
+	oldStderr := os.Stderr
+	os.Stderr = writer
+	defer func() { os.Stderr = oldStderr }()
+	defer func() { _ = reader.Close(); _ = writer.Close() }()
+	b := newHTTPBackend(t.Context(), nil, testHome)
+	b.start()
+	// This exceeds pipe capacity, making the diagnostic block until we close
+	// the pipe. Backend cancellation must precede that write.
+	b.r.errs <- errors.New(strings.Repeat("diagnostic", 128<<10))
+	var first [1]byte
+	_, err = reader.Read(first[:]) // diagnostic has captured os.Stderr
+	require.NoError(t, err)
+	cancelled := false
+	select {
+	case <-b.r.ctx.Done():
+		cancelled = true
+	case <-time.After(time.Second):
+	}
+	// Drain to completion before restoring the process-global variable.
+	drained := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, reader); close(drained) }()
+	b.close()
+	require.NoError(t, writer.Close())
+	<-drained
+	require.True(t, cancelled, "blocked diagnostics delayed cancellation after terminal output loss")
+}
+
+func TestMetricsShutdownDoesNotWaitForStderr(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	require.NoError(t, err)
+	oldStderr := os.Stderr
+	os.Stderr = writer
+	defer func() { os.Stderr = oldStderr }()
+	defer func() { _ = reader.Close(); _ = writer.Close() }()
+	filled := make(chan struct{})
+	go func() { _, _ = writer.Write([]byte(strings.Repeat("x", 1<<20))); close(filled) }()
+	var first [1]byte
+	_, err = reader.Read(first[:])
+	require.NoError(t, err)
+	m := &manager{limits: config.Limits{Metrics: true}}
+	done := make(chan error, 1)
+	go func() { done <- serve(t.Context(), m, testHome, deadConn()) }()
+	returned := false
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		returned = true
+	case <-time.After(time.Second):
+	}
+	drained := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, reader); close(drained) }()
+	<-filled
+	if !returned {
+		require.NoError(t, <-done)
+	}
+	require.NoError(t, writer.Close())
+	<-drained
+	require.True(t, returned, "final metrics prevented session shutdown from returning")
+}
+
+func TestMetricsFinalSnapshotFollowsCleanup(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		r := newRouter(ctx, &manager{limits: config.Limits{Metrics: true}}, testHome)
+		var output strings.Builder
+		go r.reportUsage(&output)
+		_, err := r.admit(mustID(t, "cleanup"), func() {})
+		require.NoError(t, err)
+		r.clearRequests()
+		cancel()
+		r.finishUsage()
+		select {
+		case <-r.usageDone:
+		default:
+			require.FailNow(t, "writable final metrics did not flush")
+		}
+		var usage requestUsage
+		require.NoError(t, json.Unmarshal([]byte(output.String()), &usage))
+		require.Equal(t, "session_requests", usage.Event)
+		require.Equal(t, 1, usage.Completed)
+		require.Zero(t, usage.Outstanding)
+	})
+}
+
+func TestOutputSaturationStopsSessionWithBlockedWriter(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		release := make(chan struct{})
+		defer close(release)
+		client := &fakeConn{reads: make(chan jsonrpc.Message, 128)}
+		client.onWrite = func(context.Context, jsonrpc.Message) error {
+			<-release // a stdout write need not observe the session context
+			return nil
+		}
+		for i := range cap(client.reads) {
+			client.reads <- &jsonrpc.Request{ID: mustID(t, float64(i)), Method: "tools/list"}
+		}
+		done := make(chan error, 1)
+		go func() { done <- serve(ctx, nil, testHome, client) }()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			require.ErrorContains(t, err, "client output queue is full")
+		default:
+			cancel()
+			require.NoError(t, <-done)
+			require.FailNow(t, "saturated output kept the session alive")
+		}
+	})
+}
+
 func TestModuleMetadataReadsAreBounded(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -206,6 +404,8 @@ func TestModuleMetadataReadsAreBounded(t *testing.T) {
 }
 
 func FuzzDirectoryFilterPrecedence(f *testing.F) {
+	f.Add("-,+cmd,-cmd/generated,+cmd/generated/public", "cmd/generated/public/nested")
+	f.Add("-**/vendor,+internal/**/vendor", "internal/a/vendor")
 	f.Add("-**, +cmd", "cmd/internal")
 	f.Add("-docs,+docs/go", "docs/go")
 	f.Add("-**/node_modules", "a/node_modules")

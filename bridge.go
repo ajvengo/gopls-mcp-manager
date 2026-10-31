@@ -54,6 +54,8 @@ type router struct {
 	operationsPerWorktree map[string]int
 	limits                config.Limits
 	usage                 requestUsage
+	finalUsage            chan requestUsage // one final snapshot, consumed by the existing metrics worker
+	usageDone             chan struct{}
 	resolver              *pathResolver
 	sseBudget             *transport.Budget
 
@@ -84,6 +86,8 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 		operations:            make(map[operationKey]operation),
 		operationsPerWorktree: make(map[string]int),
 		usage:                 requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
+		finalUsage:            make(chan requestUsage, 1),
+		usageDone:             make(chan struct{}),
 		out:                   make(chan jsonrpc.Message, 64),
 		errs:                  make(chan error, 4),
 		plans:                 make(chan rootsPlanning),
@@ -136,8 +140,8 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	defer cancel()
 	r := newRouter(ctx, m, home)
 	if r.limits.Metrics {
-		defer func() { _ = json.MarshalEncode(jsontext.NewEncoder(os.Stderr), r.requestUsage()) }()
-		go r.reportUsage()
+		defer r.finishUsage()
+		go r.reportUsage(os.Stderr)
 	}
 	// Only the reader is waited for, because r.lanes is its state and
 	// closeLanes must not race it. The writer is left where it stands: the
@@ -166,15 +170,38 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 
 // One reporter bounds blocked metric output to one goroutine per session.
 // Snapshots contain fixed stage/reason names, never worktree labels.
-func (r *router) reportUsage() {
+func (r *router) reportUsage(output io.Writer) {
+	defer close(r.usageDone)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-r.ctx.Done():
+			// The session owner publishes after clearing request accounting.
+			// Keep final output on this same worker: blocked stderr must neither
+			// block shutdown nor create an additional diagnostic goroutine.
+			usage := <-r.finalUsage
+			_ = json.MarshalEncode(jsontext.NewEncoder(output), usage)
 			return
 		case <-ticker.C:
-			_ = json.MarshalEncode(jsontext.NewEncoder(os.Stderr), r.requestUsage())
+			_ = json.MarshalEncode(jsontext.NewEncoder(output), r.requestUsage())
+		}
+	}
+}
+
+func (r *router) finishUsage() {
+	if r.limits.Metrics {
+		select {
+		case r.finalUsage <- r.requestUsage():
+		default:
+		}
+		// Give writable diagnostics a chance to flush before CLI exit, without
+		// making an unread stderr pipe a prerequisite for session shutdown.
+		timer := time.NewTimer(100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-r.usageDone:
+		case <-timer.C:
 		}
 	}
 }
@@ -273,12 +300,16 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 	}
 }
 
-// forward hands a message to the client, giving up once the session is over so
-// that a stopped writer cannot strand its sender.
+// forward hands a message to the client. Saturation fails the session: a reader
+// may already have released its response's operation credit, so parking here
+// would let reconnects accumulate readers and decoded responses without a bound.
+// Never silently discard a terminal response while leaving the session usable.
 func (r *router) forward(msg jsonrpc.Message) {
 	select {
 	case r.out <- msg:
 	case <-r.ctx.Done():
+	default:
+		r.reportError(fmt.Errorf("client output queue is full"))
 	}
 }
 
