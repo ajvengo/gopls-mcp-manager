@@ -8,9 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -25,17 +23,20 @@ func main() {
 // it forks a gopls or shells out to git, and the grammar is the part that
 // decides which.
 func run(args []string, stdout io.Writer) error {
+	if len(args) > 1 && args[1] == "internal-guardian" {
+		return runGuardian(args[2:])
+	}
 	command := "bridge"
 	if len(args) > 1 {
 		command = args[1]
 	}
-	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | list | status | trim-logs", args[0])
+	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | supervisor | list | status | trim-logs", args[0])
 	switch command {
 	case "http":
 		if len(args) > 4 {
 			return usage
 		}
-	case "list", "status", "trim-logs":
+	case "list", "status", "trim-logs", "supervisor":
 		if len(args) != 2 {
 			return usage
 		}
@@ -54,6 +55,9 @@ func run(args []string, stdout io.Writer) error {
 	// Cover startup and list's lock wait as well as the running bridge.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if command == "supervisor" {
+		return runSupervisor(ctx, m)
+	}
 	if command == "trim-logs" {
 		logs, err := m.logs(ctx, true)
 		if err != nil {
@@ -65,6 +69,11 @@ func run(args []string, stdout io.Writer) error {
 		return m.status(ctx, stdout)
 	}
 	if command == "list" {
+		if err := supervisorPing(ctx, m); err == nil {
+			return querySupervisor(ctx, m, "/list", "", stdout)
+		} else if !supervisorAbsent(err) {
+			return err
+		}
 		return m.list(ctx, stdout)
 	}
 	worktreeArg := "."
@@ -79,54 +88,21 @@ func run(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// Starting the home gopls up front keeps a broken install a startup error
-	// rather than a failed initialize halfway into a session.
-	// Reclaim stale slots before admission, including leftovers from an exited
-	// manager; otherwise a full registry prevents maintenance from ever starting.
-	if err := m.prepareAdmission(ctx, worktree); err != nil {
-		return err
-	}
-	port, err := m.ensure(ctx, worktree)
-	if err != nil {
+	if err := ensureSupervisor(ctx, m); err != nil {
 		return err
 	}
 	if command == "ensure" {
-		_, err := fmt.Fprintln(stdout, port)
-		return err
+		return querySupervisor(ctx, m, "/ensure", worktree, stdout)
 	}
-	maintenanceCtx, cancelMaintenance := context.WithCancel(ctx)
-	var background sync.WaitGroup
-	background.Go(func() { m.maintain(maintenanceCtx, 30*time.Second) })
-	background.Go(func() { m.publishPending(maintenanceCtx) })
-	defer func() {
-		cancelMaintenance()
-		background.Wait()
-	}()
 	if command == "http" {
 		address := "127.0.0.1:6099"
 		if len(args) > 2 {
 			address = args[2]
 		}
-		return serveHTTP(ctx, m, worktree, address, stdout)
+		return proxyHTTPViaSupervisor(ctx, m, worktree, address, stdout)
 	}
 
-	return bridge(ctx, m, worktree)
+	return bridgeViaSupervisor(ctx, m, worktree, os.Stdin, os.Stdout)
 }
 
 // Acquisition probes only the requested worktree. Sweep independently of
-// traffic so deleted temporary worktrees cannot retain their servers forever.
-func (m *manager) maintain(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_, err := m.sweepMaintenance(ctx)
-			if err != nil && ctx.Err() == nil {
-				fmt.Fprintln(os.Stderr, "gopls-mcp-manager maintenance:", err)
-			}
-		}
-	}
-}

@@ -6,14 +6,13 @@ on:
   pull_request:
 
 # Read is all any job here needs, and the merge gate is the reason to say so:
-# every pull request from now on runs these three, including one from a fork.
+# every pull request runs these checks, including one from a fork.
 permissions:
   contents: read
 
-# Three jobs rather than three steps of one, because a required status check is
-# named per job: the gate lists build, test and lint separately, so a red run
-# says which one without being opened. They also run at once, and a lint failure
-# stops hiding a test failure behind it.
+# Preserve the build, test and lint job names used by the existing merge gate.
+# Native Darwin tests and protocol proofs also run independently: cross-building
+# cannot validate kqueue, Unix socket limits, process groups or descriptor release.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,10 +29,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
 
-      # Built for darwin as well, because that is where this tool is developed
-      # and run while every job here is linux. Signalling, flock and the ps this
-      # shells out to are what differ between them, and nothing else in CI
-      # compiles those for a Mac.
+      # Retain cross-build coverage independently of the native test runners.
       - run: go build ./...
         env:
           GOOS: darwin
@@ -48,13 +44,20 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Install pinned GitButler CLI for native fixtures
+        run: |
+          curl --fail --silent --show-error --location https://gitbutler.com/install.sh --output "${{ runner.temp }}/install-but.sh"
+          sh "${{ runner.temp }}/install-but.sh" 0.23.4
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/but" --version
+
       # The tests shell out to git worktree, and the runner's default identity
       # is enough only because newLinkedWorktree passes its own -c user.*.
       - run: go test -race -coverprofile="${{ runner.temp }}/coverage.out" ./...
       - run: python3 -m unittest discover -s scripts
       - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
       - run: go install golang.org/x/tools/gopls@v0.23.0
-      - run: go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*)$' -timeout=3m .
+      - run: go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
 
   lint:
     runs-on: ubuntu-latest
@@ -68,3 +71,59 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
+
+  test-darwin:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Install pinned GitButler CLI for native fixtures
+        run: |
+          curl --fail --silent --show-error --location https://gitbutler.com/install.sh --output "${{ runner.temp }}/install-but.sh"
+          sh "${{ runner.temp }}/install-but.sh" 0.23.4
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/but" --version
+      - run: go test -race -count=1 -coverprofile="${{ runner.temp }}/coverage.out" . ./internal/config ./internal/transport ./internal/protocol
+      - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
+      - run: go install golang.org/x/tools/gopls@v0.23.0
+      - run: go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
+
+  formal:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      GOPLS_FORMAL_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - run: bun --install=force run formal/check.ts all
+        # runner context is unavailable in job-level env.
+        env:
+          GOPLS_FORMAL_TOOLS: ${{ runner.temp }}/formal-tools
+          GOPLS_FORMAL_OUT: ${{ runner.temp }}/formal-evidence
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: formal-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/formal-evidence/*.json
+            ${{ runner.temp }}/formal-evidence/*.log
+            ${{ runner.temp }}/formal-evidence/*.stderr
+            ${{ runner.temp }}/formal-evidence/*.tla
+            ${{ runner.temp }}/formal-evidence/*.cfg
+          if-no-files-found: error
+          retention-days: 14

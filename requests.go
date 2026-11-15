@@ -6,6 +6,7 @@ import (
 	json "encoding/json/v2"
 	"fmt"
 	"maps"
+	"math"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -14,7 +15,10 @@ import (
 
 // The state pointer is a generation token. An expired timer cannot complete a
 // later request that happens to use the same wire id.
-type callState struct{ timer *time.Timer }
+type callState struct {
+	timer    *time.Timer
+	identity *operationIdentity
+}
 
 type requestUsage struct {
 	Event                                                                 string
@@ -59,16 +63,13 @@ func (r *router) timed(stage string, start time.Time) {
 func (r *router) requestUsage() requestUsage {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	usage := r.usage
 	usage.Event = "session_requests"
 	usage.Outstanding = len(r.awaitingUpstream)
 	usage.SSEBufferBytes, usage.PeakSSEBufferBytes = r.sseBudget.Snapshot()
-	usage.UpstreamOperations = len(r.operations)
-	for _, op := range r.operations {
-		if op.abandoned {
-			usage.AbandonedOperations++
-		}
-	}
+	usage.UpstreamOperations, usage.AbandonedOperations = r.owner.sessionUsage(r.remote)
+
 	usage.Rejections = maps.Clone(r.usage.Rejections)
 	usage.Stages = maps.Clone(r.usage.Stages)
 	r.lanesMu.Lock()
@@ -88,8 +89,12 @@ func (r *router) requestUsage() requestUsage {
 // No worktree is taken here because none is known yet: per-lane admission is
 // bindWorktree's, once routing has picked the lane. See owed.
 func (r *router) admit(id jsonrpc.ID, cancel func()) (*callState, error) {
+	if !validOwnerID(id) {
+		return nil, fmt.Errorf("opaque request id exceeds %d bytes", maxOwnerIDBytes)
+	}
 	if !id.IsValid() {
-		return nil, nil
+		state := &callState{identity: &operationIdentity{}}
+		return state, r.owner.admit(state)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -101,7 +106,11 @@ func (r *router) admit(id jsonrpc.ID, cancel func()) (*callState, error) {
 		r.rejectedLocked("session_outstanding")
 		return nil, fmt.Errorf("session outstanding request limit reached")
 	}
-	state := &callState{}
+	state := &callState{identity: &operationIdentity{}}
+	if err := r.owner.admit(state); err != nil {
+		r.rejectedLocked("owner_outstanding")
+		return nil, err
+	}
 	r.awaitingUpstream[id] = owed{cancel: cancel, state: state}
 	r.usage.Admitted++
 	r.usage.Peak = max(r.usage.Peak, len(r.awaitingUpstream))
@@ -112,7 +121,8 @@ func (r *router) admit(id jsonrpc.ID, cancel func()) (*callState, error) {
 // cancelled before unlocking so a lane cannot revive it. Network output always
 // happens after unlocking, so a slow client cannot hold the tracker.
 func (r *router) removeLocked(id jsonrpc.ID, owner owed) {
-	r.abandonOperationLocked(operationKey{owner.conn, id})
+	r.owner.releaseQueued(owner.state)
+	r.owner.abandon(operationKey{owner.conn, id})
 	if owner.conn == nil && owner.cancel != nil {
 		owner.cancel()
 	}
@@ -126,11 +136,7 @@ func (r *router) removeLocked(id jsonrpc.ID, owner owed) {
 	r.usage.Completed++
 }
 
-// release gives one count in a per-worktree tally back, dropping the entry once
-// nothing holds it — so a session that touched many worktrees does not keep a
-// key per worktree for the rest of its life. Shared by the two tallies (see
-// endOperationLocked) because a second spelling of it already disagreed about
-// whether zero or negative is the empty case.
+// Drop empty entries so worktree churn cannot retain an unbounded index.
 func release(counts map[string]int, key string) {
 	counts[key]--
 	if counts[key] <= 0 {
@@ -159,7 +165,7 @@ func (r *router) finish(id jsonrpc.ID, conn mcp.Connection, state *callState) (o
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if conn != nil {
-		r.endOperationLocked(operationKey{conn, id})
+		r.owner.answered(operationKey{conn, id})
 	}
 	owner, ok := r.ownerLocked(id, state)
 	if !ok || (conn != nil && owner.conn != conn) {
@@ -167,22 +173,6 @@ func (r *router) finish(id jsonrpc.ID, conn mcp.Connection, state *callState) (o
 	}
 	r.removeLocked(id, owner)
 	return owner, true
-}
-
-func (r *router) retry(id jsonrpc.ID, conn mcp.Connection, state *callState) bool {
-	if !id.IsValid() {
-		return true
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	owner, ok := r.ownerLocked(id, state)
-	if !ok || owner.conn != conn {
-		return false
-	}
-	owner.conn = nil
-	r.abandonOperationLocked(operationKey{conn, id})
-	r.awaitingUpstream[id] = owner
-	return true
 }
 
 func (r *router) startExecution(id jsonrpc.ID, state *callState) {
@@ -204,12 +194,7 @@ func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 			// Timer callbacks must not accumulate behind a client that stopped
 			// reading. If the bounded output cannot accept a terminal answer,
 			// fail the session instead of leaving an unbounded blocked callback.
-			select {
-			case r.out <- errorResponse(id, -32000, "execution deadline exceeded; upstream work may still be running"):
-			case <-r.ctx.Done():
-			default:
-				r.reportError(fmt.Errorf("client output queue is full during execution timeout"))
-			}
+			r.forward(errorResponse(id, -32000, "execution deadline exceeded; upstream work may still be running"))
 		}
 	})
 }
@@ -223,9 +208,7 @@ func (r *router) clearRequests() {
 			owner.cancel()
 		}
 	}
-	for key := range r.operations {
-		r.endOperationLocked(key)
-	}
+	r.owner.abandonSession(r.remote)
 }
 
 // owed is a request in flight: the worktree it was routed to, and the upstream
@@ -278,6 +261,7 @@ func (r *router) rejectedLocked(reason string) {
 // in the shared function and half in every caller.
 func (r *router) failIngress(call delivery, code int64, message string) {
 	defer call.cancel()
+	defer releaseMessage(call.req)
 	if !r.failDelivery(call.req.ID, call.state, code, message) {
 		return
 	}
@@ -303,13 +287,16 @@ func (r *router) bindWorktree(call delivery, worktree string, cancel context.Can
 		return fmt.Errorf("session retained lane limit reached")
 	}
 	if !call.req.ID.IsValid() {
-		return nil
+		return r.owner.bind(call.state, worktree)
 	}
 	if r.perWorktree[worktree] >= r.limits.PerLane {
 		r.rejectedLocked("lane_outstanding")
 		return fmt.Errorf("gopls for %s reached its outstanding request limit", worktree)
 	}
 	owner.worktree, owner.cancel = worktree, cancel
+	if err := r.owner.bind(call.state, worktree); err != nil {
+		return err
+	}
 	r.awaitingUpstream[call.req.ID] = owner
 	r.perWorktree[worktree]++
 	return nil
@@ -321,9 +308,13 @@ func (r *router) bindWorktree(call delivery, worktree string, cancel context.Can
 // Ids arrive off the wire as the same nil/float64/string that json.Unmarshal
 // produces here, and both sides go through MakeID, so one rebuilt from the
 // notification compares equal to the one the route was recorded under.
+// MakeID truncates numbers to int64, so reject values that would name another id.
 func cancelledID(params jsontext.Value) (jsonrpc.ID, bool) {
 	var cancelled mcp.CancelledParams
 	if json.Unmarshal(params, &cancelled) != nil {
+		return jsonrpc.ID{}, false
+	}
+	if number, ok := cancelled.RequestID.(float64); ok && (math.Trunc(number) != number || number < -0x1p63 || number >= 0x1p63) {
 		return jsonrpc.ID{}, false
 	}
 	id, err := jsonrpc.MakeID(cancelled.RequestID)
@@ -358,9 +349,18 @@ func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
 	l := r.lanes[owner.worktree]
 	r.lanesMu.Unlock()
 	if l != nil {
+		l.controlMu.Lock()
+		defer l.controlMu.Unlock()
+		if l.ctx.Err() != nil {
+			return
+		}
+		if err := retainMessage(r.owner, req); err != nil {
+			return // Advisory overload never delays local cancellation.
+		}
 		select {
 		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, state: owner.state, deadline: time.Now().Add(sendBudget)}:
 		default:
+			releaseMessage(req)
 		}
 	}
 }
@@ -401,7 +401,7 @@ func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error)
 	r.mu.Unlock()
 
 	for _, id := range stranded {
-		r.forward(errorResponse(id, jsonrpc.CodeInternalError, "gopls for %s went away mid-call: %v", worktree, cause))
+		r.forward(errorResponse(id, jsonrpc.CodeInternalError, "gopls for %s went away mid-call; request may have executed: %v", worktree, cause))
 	}
 }
 
@@ -413,12 +413,6 @@ type operationKey struct {
 	id   jsonrpc.ID
 }
 
-type operation struct {
-	worktree  string
-	abandoned bool
-	state     *callState
-}
-
 // Reserve and place atomically, before Write: cancellation cannot make a
 // delivered operation invisible, and a fast result cannot precede reservation.
 func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connection, worktree string, cancel context.CancelFunc, placed <-chan struct{}) error {
@@ -427,41 +421,17 @@ func (r *router) beginOperation(id jsonrpc.ID, state *callState, conn mcp.Connec
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	owner, ok := r.ownerLocked(id, state)
+	waiter, ok := r.ownerLocked(id, state)
 	if !ok {
 		return context.Canceled
 	}
-	key := operationKey{conn, id}
-	if _, exists := r.operations[key]; exists {
-		return fmt.Errorf("request id %v still has an unresolved upstream operation", id)
-	}
-	if len(r.operations) >= r.limits.Session || r.operationsPerWorktree[worktree] >= r.limits.PerLane {
+	if err := r.owner.begin(state, operationKey{conn, id}, worktree, r.remote, r.limits.Session, r.limits.PerLane); err != nil {
 		r.rejectedLocked("upstream_operations")
-		return fmt.Errorf("upstream operation limit reached; cancelled or disconnected work may still be running")
+		return err
 	}
-	r.operations[key] = operation{worktree: worktree, state: state}
-	r.operationsPerWorktree[worktree]++
-	r.m.beginPending(key, worktree)
-	owner.conn, owner.cancel, owner.placed = conn, cancel, placed
-	r.awaitingUpstream[id] = owner
+	waiter.conn, waiter.cancel, waiter.placed = conn, cancel, placed
+	r.awaitingUpstream[id] = waiter
 	return nil
-}
-
-// A terminal response or proven rejection before POST releases a credit.
-// Caller holds mu; this is atomic with matching the response to its client.
-func (r *router) endOperationLocked(key operationKey) {
-	if op, ok := r.operations[key]; ok {
-		delete(r.operations, key)
-		release(r.operationsPerWorktree, op.worktree)
-		r.m.endPending(key)
-	}
-}
-
-func (r *router) abandonOperationLocked(key operationKey) {
-	if op, ok := r.operations[key]; ok {
-		op.abandoned = true
-		r.operations[key] = op
-	}
 }
 
 // Direct send callers may omit expected; queued deliveries always carry their
@@ -472,13 +442,13 @@ func (r *router) placeDelivery(id jsonrpc.ID, expected *callState, cancel contex
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	owner, ok := r.ownerLocked(id, expected)
+	waiter, ok := r.ownerLocked(id, expected)
 	if !ok {
 		return nil, false
 	}
-	owner.conn, owner.cancel, owner.placed = nil, cancel, nil
-	r.awaitingUpstream[id] = owner
-	return owner.state, true
+	waiter.conn, waiter.cancel, waiter.placed = nil, cancel, nil
+	r.awaitingUpstream[id] = waiter
+	return waiter.state, true
 }
 
 // failDelivery answers a call this caller has just taken terminal ownership of,

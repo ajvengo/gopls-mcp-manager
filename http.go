@@ -10,7 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
+	"net/netip"
+	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -35,9 +36,9 @@ type httpBackend struct {
 	pending  map[jsonrpc.ID]chan *jsonrpc.Response
 }
 
-func newHTTPBackend(parent context.Context, m *manager, home string) *httpBackend {
+func newHTTPBackend(parent context.Context, owner *supervisor, home string) *httpBackend {
 	ctx, cancel := context.WithCancel(parent)
-	r := newRouter(ctx, m, home)
+	r := newRouter(ctx, owner, home)
 	r.stateless = true
 	// The internal legacy session has its own capabilities and lifecycle.
 	// HTTP initialization and client roots never mutate this shared session.
@@ -49,6 +50,7 @@ func newHTTPBackend(parent context.Context, m *manager, home string) *httpBacken
 
 func (b *httpBackend) start() {
 	cold := make(chan delivery, laneQueue)
+	var coldMu sync.Mutex
 	type resolved struct {
 		call      delivery
 		worktrees []string
@@ -56,6 +58,18 @@ func (b *httpBackend) start() {
 	}
 	ready := make(chan resolved)
 	go func() {
+		defer func() {
+			coldMu.Lock()
+			defer coldMu.Unlock()
+			for {
+				select {
+				case call := <-cold:
+					releaseMessage(call.req)
+				default:
+					return
+				}
+			}
+		}()
 		for {
 			select {
 			case <-b.r.ctx.Done():
@@ -68,6 +82,7 @@ func (b *httpBackend) start() {
 				case ready <- resolved{call, worktrees, err}:
 				case <-b.r.ctx.Done():
 					call.cancel()
+					releaseMessage(call.req)
 					return
 				}
 			}
@@ -75,6 +90,19 @@ func (b *httpBackend) start() {
 	}()
 	go func() {
 		defer close(b.done)
+		defer b.r.releaseRetainedMessages()
+		defer func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for {
+				select {
+				case call := <-b.queue:
+					releaseMessage(call.req)
+				default:
+					return
+				}
+			}
+		}()
 		defer b.r.clearRequests()
 		defer b.r.awaitLanes()
 		defer b.r.closeLanes()
@@ -102,12 +130,19 @@ func (b *httpBackend) start() {
 					b.r.routeResolved(call, worktree, err)
 					continue
 				}
+				coldMu.Lock()
+				if b.r.ctx.Err() != nil {
+					releaseMessage(call.req)
+					coldMu.Unlock()
+					return
+				}
 				select {
 				case cold <- call:
 				default:
 					b.r.rejected("resolution_queue")
 					b.r.failIngress(call, -32000, "resolution queue is full")
 				}
+				coldMu.Unlock()
 			}
 		}
 	}()
@@ -118,7 +153,7 @@ func (b *httpBackend) start() {
 				return
 			case err := <-b.r.errs:
 				b.cancel()
-				fmt.Fprintln(os.Stderr, "gopls-mcp-manager: http session:", err)
+				_, _ = fmt.Fprintln(b.r.owner.m.diagnosticWriter(), "gopls-mcp-manager: http session:", err)
 				return
 			case msg := <-b.r.out:
 				// Stateless JSON responses have no unsolicited notification stream.
@@ -132,11 +167,12 @@ func (b *httpBackend) start() {
 					}
 					b.mu.Unlock()
 				}
+				releaseMessage(msg)
 			}
 		}
 	}()
 	if b.r.limits.Metrics {
-		go b.r.reportUsage(os.Stderr)
+		go b.r.reportUsage(b.r.owner.m.diagnosticWriter())
 	}
 }
 
@@ -174,12 +210,20 @@ func (b *httpBackend) call(ctx context.Context, method string, params any, resul
 		b.mu.Unlock()
 	}()
 	if call, ok := b.r.prepare(req); ok {
+		b.mu.Lock()
+		if b.r.ctx.Err() != nil {
+			b.mu.Unlock()
+			call.cancel()
+			releaseMessage(call.req)
+			return b.r.ctx.Err()
+		}
 		select {
 		case b.queue <- call:
 		default:
 			b.r.rejected("routing_queue")
 			b.r.failIngress(call, -32000, "routing queue is full")
 		}
+		b.mu.Unlock()
 	}
 	select {
 	case resp := <-reply:
@@ -211,12 +255,23 @@ func (b *httpBackend) initialize(ctx context.Context) (string, error) {
 	if err := b.call(ctx, "initialize", b.r.initialize.Load().Params, &result); err != nil {
 		return "", err
 	}
-	call, _ := b.r.prepare(&jsonrpc.Request{Method: "notifications/initialized"})
+	call, ok := b.r.prepare(&jsonrpc.Request{Method: "notifications/initialized"})
+	if !ok {
+		return "", fmt.Errorf("initialize notification admission failed")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.r.ctx.Err() != nil {
+		call.cancel()
+		releaseMessage(call.req)
+		return "", b.r.ctx.Err()
+	}
 	select {
 	case b.queue <- call:
 		return result.Instructions, nil
 	case <-ctx.Done():
 		call.cancel()
+		releaseMessage(call.req)
 		return "", ctx.Err()
 	}
 }
@@ -309,6 +364,11 @@ func newHTTPHandler(b *httpBackend, instructions string) http.Handler {
 				http.Error(w, "invalid JSON", http.StatusBadRequest)
 				return
 			}
+			if err := validateHTTPWireID(body); err != nil {
+				http.Error(w, "invalid or oversized request id", http.StatusBadRequest)
+				return
+			}
+
 			req.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		requestCtx := context.WithValue(req.Context(), httpRequestContextKey{}, req.Context())
@@ -341,35 +401,60 @@ func (w *httpReplyWriter) Write(data []byte) (int, error) {
 	return w.ResponseWriter.Write(data)
 }
 
-func serveHTTP(ctx context.Context, m *manager, home, address string, output io.Writer) error {
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return err
+// Bound sockets before net/http starts header readers, including quiet keepalives.
+// Accept may hold one transient excess socket; reject it before starting a worker.
+type httpConnectionListener struct {
+	net.Listener
+	slots chan struct{}
+}
+
+func (l *httpConnectionListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &httpLimitedConn{Conn: conn, slots: l.slots}, nil
+		default:
+			_ = conn.Close()
+		}
 	}
-	defer func() { _ = listener.Close() }()
-	if !listener.Addr().(*net.TCPAddr).IP.IsLoopback() {
-		return fmt.Errorf("HTTP MCP must listen on a loopback address")
-	}
-	b := newHTTPBackend(ctx, m, home)
-	b.start()
-	defer b.close()
-	instructions, err := b.initialize(ctx)
-	if err != nil {
-		return fmt.Errorf("initialize home gopls: %w", err)
-	}
-	mux := http.NewServeMux()
-	mux.Handle("/mcp", newHTTPHandler(b, instructions))
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
-		BaseContext: func(net.Listener) context.Context { return b.r.ctx }}
-	stop := context.AfterFunc(b.r.ctx, func() { _ = server.Close() })
-	defer stop()
-	if _, err := fmt.Fprintf(output, "MCP endpoint: http://%s/mcp\n", listener.Addr()); err != nil {
-		return err
-	}
-	err = server.Serve(listener)
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-	return err
+}
+
+type httpLimitedConn struct {
+	net.Conn
+	slots    chan struct{}
+	once     sync.Once
+	closeErr error
+}
+
+func (c *httpLimitedConn) Close() error {
+	c.once.Do(func() {
+		c.closeErr = c.Conn.Close()
+		<-c.slots
+	})
+	return c.closeErr
+}
+
+// Validate the browser-facing authority before proxy rewriting hides it from
+// the SDK. Loopback binding alone does not prevent DNS rebinding.
+func protectLoopbackHTTP(next http.Handler) http.Handler {
+	protected := http.NewCrossOriginProtection().Handler(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w = &httpReplyWriter{ResponseWriter: w}
+		authority, err := url.Parse("http://" + req.Host)
+		if err != nil || authority.Host != req.Host {
+			http.Error(w, "invalid loopback Host", http.StatusForbidden)
+			return
+		}
+		host := authority.Hostname()
+		address, err := netip.ParseAddr(host)
+		if host != "localhost" && (err != nil || !address.IsLoopback()) {
+			http.Error(w, "loopback Host required", http.StatusForbidden)
+			return
+		}
+		protected.ServeHTTP(w, req)
+	})
 }

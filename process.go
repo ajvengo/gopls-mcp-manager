@@ -5,35 +5,56 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"os"
+	"net/http"
 	"os/exec"
 	"path/filepath"
-	"slices"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
-// goplsBinary is both what we spawn and what isOurGopls looks for in a command
-// line. Named once because those two have to agree: a rename that reached only
-// the spawn would leave every identity check failing, and a failing check does
-// not error — it silently declines to kill a server this tool started, stranding
-// its index and its port for the life of the machine.
+var probeClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return &http.Client{Transport: t, Timeout: 500 * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}()
+
+func endpointProbe(ctx context.Context, port int) (alive, conclusive bool) {
+	// The url is ours and fixed, so NewRequest cannot reject it.
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, mcpURL(port), nil)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		// Refusal is named, not inferred from "not a timeout": every other way
+		// a dial can fail — descriptors gone, host unreachable, our own context
+		// cancelled — says something about this process, not about whether a
+		// gopls is listening, and inferring death from it condemns live servers.
+		return false, errors.Is(err, syscall.ECONNREFUSED)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	alive = resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+	return alive, false
+}
+
+func matchesGopls(command string, port int) bool {
+	fields := strings.Fields(command)
+	if len(fields) < 4 {
+		return false
+	}
+	// ps can include an interpreter prefix for a gopls wrapper. The manager's
+	// actual executable spelling and complete argument tail must still match;
+	// a port prefix or a diagnostic argument mentioning gopls is not identity.
+	args := fields[len(fields)-4:]
+	return filepath.Base(args[0]) == goplsBinary && args[1] == "mcp" && args[2] == "-listen" && args[3] == mcpAddress(port)
+}
+
 const goplsBinary = "gopls"
 
-// readyTimeout bounds the wait for a freshly spawned gopls to serve its
-// endpoint. startGrace is the window a sweep spares that record for. Derived
-// rather than written out, because it has to outlast the wait: the two are
-// spent in different processes, so a start still inside its own budget must not
-// be reapable by anyone else's sweep, and an edit to one number alone would
-// reopen exactly the window the grace exists to close.
 const (
 	readyTimeout = 10 * time.Second
-	startGrace   = readyTimeout + 5*time.Second
-	// exitGrace bounds how long a gopls that failed to become ready is given to
-	// honour its SIGTERM before it is killed outright. Short, because nothing is
-	// waiting on it: the server never served, so it has no session to unwind and
-	// no index worth flushing.
-	exitGrace = 2 * time.Second
+	exitGrace    = 2 * time.Second
 )
 
 func waitContext(ctx context.Context, delay time.Duration) error {
@@ -47,108 +68,11 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// A per-port action lock serializes signal attempts across managers. The
-// atomic registry snapshot and process identity are checked again immediately
-// before signalling, outside the global lock. PID identity still has POSIX's
-// check/signal race. Stable port keys bound the number of retained lock inodes
-// by portCount; files stay in place to preserve flock identity.
-func (m *manager) signalTerminating(ctx context.Context, r record) error {
-	return withFileLock(ctx, fmt.Sprintf("%s.cleanup-%d", m.mapPath, r.Port), func() error {
-		current, _, err := readMap(m.mapPath)
-		if err != nil || !slices.Contains(current, r) {
-			return err
-		}
-		ours, err := isOurGopls(ctx, r.PID, r.Port)
-		if err != nil || ctx.Err() != nil || !ours {
-			return nil
-		}
-		if err := syscall.Kill(r.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("terminate gopls pid %d (record retained): %w", r.PID, err)
-		}
-		return nil // the next sweep confirms exit; never forget on signal alone
-	})
-}
-
 func (m *manager) logPath(worktree string) string {
 	hash := sha256.Sum256([]byte(worktree))
 	return filepath.Join(filepath.Dir(m.mapPath), "gopls-mcp-logs", fmt.Sprintf("%x.log", hash[:8]))
 }
 
-// startGopls spawns a gopls for worktree and returns as soon as the child
-// exists. Whether it ever serves its endpoint is awaitReady's question, and the
-// caller's to ask outside the map lock — see ensure.
-func (m *manager) startGopls(ctx context.Context, worktree string, port int) (*childProcess, error) {
-	logPath := m.logPath(worktree)
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return nil, err
-	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = logFile.Close() }()
-
-	// exec.Command stashes a failed PATH lookup in cmd.Err and Start returns it,
-	// so a missing gopls arrives here as "start gopls: ... not found in $PATH".
-	cmd := exec.Command(goplsBinary, "mcp", "-listen", mcpAddress(port))
-	cmd.Dir = worktree
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	// Do not tie the child lifetime to ctx: other clients share this server.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start gopls: %w", err)
-	}
-	// Reap the child rather than releasing it. Setsid does not reparent, so an
-	// unwaited gopls stays a zombie child of this process for the whole session
-	// — and kill(pid, 0) succeeds against a zombie, which would make the PID
-	// half of recordAlive report a dead server as alive.
-	child := &childProcess{Process: cmd.Process, done: make(chan struct{})}
-	go func() {
-		_ = cmd.Wait()
-		close(child.done)
-	}()
-	return child, nil
-}
-
-// childProcess retains both identity and proof of exit for our own starts.
-type childProcess struct {
-	*os.Process
-	done chan struct{}
-}
-
-func (p *childProcess) stop() error {
-	select {
-	case <-p.done:
-		return nil
-	default:
-	}
-	_ = p.Signal(syscall.SIGTERM)
-	timer := time.NewTimer(exitGrace)
-	defer timer.Stop()
-	select {
-	case <-p.done:
-		return nil
-	case <-timer.C:
-	}
-	if err := p.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("kill gopls pid %d: %w", p.Pid, err)
-	}
-	timer.Reset(exitGrace)
-	select {
-	case <-p.done:
-		return nil
-	case <-timer.C:
-		return fmt.Errorf("gopls pid %d has not exited after SIGKILL", p.Pid)
-	}
-}
-
-// awaitReady polls until the gopls just spawned on port serves its endpoint.
-// The caller signals the process it holds when this gives up, rather than the
-// recorded pid — see isOurGopls for why a bare pid is not enough.
 func awaitReady(ctx context.Context, port int) error {
 	ctx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
@@ -165,4 +89,124 @@ func awaitReady(ctx context.Context, port int) error {
 		}
 	}
 	return fmt.Errorf("gopls did not become ready on %s: %w", mcpAddress(port), ctx.Err())
+}
+
+const (
+	maxCommandStderrBytes = 64 << 10
+	// A descendant may retain a pipe after the direct child exits. Close the
+	// manager's pipe readers instead of retaining their copying goroutines.
+	subprocessWaitDelay = 250 * time.Millisecond
+)
+
+var errCommandOutputLimit = errors.New("subprocess output limit exceeded")
+
+// Run joins the sole os/exec writer before fields are read. Allocate the cap
+// once to avoid retaining both an old buffer and an over-budget replacement.
+type commandOutputBuffer struct {
+	data     []byte
+	limit    int
+	cancel   context.CancelFunc
+	overflow bool
+}
+
+func (b *commandOutputBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.limit-len(b.data) {
+		b.overflow = true
+		b.cancel()
+		return 0, errCommandOutputLimit
+	}
+	if len(p) > 0 && b.data == nil {
+		b.data = make([]byte, 0, b.limit)
+	}
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+// boundedCommandOutput owns and reaps the direct child. Each stream has a hard
+// capture-capacity ceiling; os/exec's fixed pipe-copy buffers are additional.
+// Caller cancellation and overflow kill the direct child; WaitDelay bounds
+// pipe retention by descendants, but does not claim ownership of grandchildren.
+//
+// An ordinary ExitError retains stdout and bounded stderr, including lsof's
+// useful exit-1 output. Overflow never wraps an ExitError and returns nil output
+// so that an exit-status exception cannot accidentally accept truncated data.
+func boundedCommandOutput(ctx context.Context, maxStdoutBytes int, name string, args ...string) ([]byte, error) {
+	return boundedCommandOutputEnv(ctx, nil, maxStdoutBytes, name, args...)
+}
+
+// nil env inherits; a non-nil env replaces it without entering argv or diagnostics.
+func boundedCommandOutputEnv(ctx context.Context, env []string, maxStdoutBytes int, name string, args ...string) ([]byte, error) {
+	if maxStdoutBytes <= 0 {
+		return nil, errors.New("subprocess stdout limit must be positive")
+	}
+	commandCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdout := &commandOutputBuffer{limit: maxStdoutBytes, cancel: cancel}
+	stderr := &commandOutputBuffer{limit: maxCommandStderrBytes, cancel: cancel}
+	cmd := exec.CommandContext(commandCtx, name, args...)
+	cmd.Env = env
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = subprocessWaitDelay
+	err := cmd.Run()
+	switch {
+	case stdout.overflow:
+		return nil, fmt.Errorf("%w: stdout exceeds %d bytes", errCommandOutputLimit, maxStdoutBytes)
+	case stderr.overflow:
+		return nil, fmt.Errorf("%w: stderr exceeds %d bytes", errCommandOutputLimit, maxCommandStderrBytes)
+	case err == nil:
+		return stdout.data, nil
+	case ctx.Err() != nil:
+		return nil, errors.Join(ctx.Err(), err)
+	}
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+		exit.Stderr = stderr.data
+		return stdout.data, err
+	}
+	return nil, err
+}
+
+const openFilesTimeout = 5 * time.Second
+
+func countOpenFiles(ctx context.Context, records []record) (map[int]int, error) {
+	ctx, cancel := context.WithTimeout(ctx, openFilesTimeout)
+	defer cancel()
+	list := make([]string, len(records))
+	for i, r := range records {
+		list[i] = strconv.Itoa(r.PID)
+	}
+	out, err := boundedCommandOutput(ctx, 4<<20, "lsof", "-n", "-P", "-w", "-F", "f", "-p", strings.Join(list, ","))
+	if ctx.Err() != nil || errors.Is(err, errCommandOutputLimit) {
+		return nil, err
+	}
+	// lsof exits 1 when a listed pid has gone, and still lists the others.
+	var exit *exec.ExitError
+	if err != nil && (!errors.As(err, &exit) || exit.ExitCode() != 1) {
+		return nil, err
+	}
+	return parseOpenFiles(string(out))
+}
+
+func parseOpenFiles(out string) (map[int]int, error) {
+	counts := make(map[int]int)
+	pid := 0
+	for line := range strings.SplitSeq(out, "\n") {
+		switch {
+		case line == "":
+			continue
+		case strings.HasPrefix(line, "p"):
+			var err error
+			pid, err = strconv.Atoi(line[1:])
+			if err != nil || pid <= 0 {
+				return nil, errors.New("invalid lsof process identity")
+			}
+		case strings.HasPrefix(line, "f") && len(line) > 1 && pid > 0:
+			if line == "ferr" || line == "fNOFD" {
+				return nil, errors.New("incomplete lsof file snapshot")
+			}
+			counts[pid]++
+		default:
+			return nil, errors.New("invalid lsof file snapshot")
+		}
+	}
+	return counts, nil
 }

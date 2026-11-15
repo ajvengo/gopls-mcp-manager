@@ -6,7 +6,6 @@ import (
 	json "encoding/json/v2"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -252,7 +251,7 @@ func worktreeOfDir(ctx context.Context, dir string) (string, error) {
 	// git -C resolves its own cwd physically, so the toplevel it prints already
 	// has the symlinks taken out of it — and a relative dir resolves against
 	// this process's cwd, which is what the "." default means.
-	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	out, err := boundedCommandOutput(ctx, 64<<10, "git", "-C", dir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse --show-toplevel: %w", err)
 	}

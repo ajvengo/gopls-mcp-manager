@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -25,8 +24,9 @@ import (
 // to its own lane; the in-flight map is shared under mu, because the
 // per-upstream reader goroutines touch it too.
 type router struct {
-	ctx       context.Context
-	m         *manager
+	ctx context.Context
+
+	owner     *supervisor
 	home      string
 	lanes     map[string]*lane    // worktree -> its upstream, see lane
 	lanesMu   sync.Mutex          // protects lane lookup by the cancellation reader
@@ -37,30 +37,31 @@ type router struct {
 	// ctx bounds the dial, and only the dial: the connection it hands back is
 	// read under this same context for the rest of its life, so the caller
 	// cancels it on expiry rather than passing a deadline down. See dialBounded.
-	dial func(context.Context, string) (mcp.Connection, error)
+	dial func(context.Context, string, int) (mcp.Connection, error)
 	// plan computes a worktree's roots for answerRoots. A seam, like dial: the
 	// real one walks the tree, which a test cannot hold open any other way.
-	plan     func(worktree string, global []string) watchPlan
-	planOnce sync.Once
-	plans    chan rootsPlanning
+	plan func(worktree string, global []string) watchPlan
 
 	mu sync.Mutex
 	// Client requests still in flight, so that a dying gopls fails its callers
 	// instead of leaving them hanging. Holding an id is also what confers the
 	// right to answer it: see finish in requests.go.
-	awaitingUpstream      map[jsonrpc.ID]owed
-	perWorktree           map[string]int
-	operations            map[operationKey]operation
-	operationsPerWorktree map[string]int
-	limits                config.Limits
-	usage                 requestUsage
-	finalUsage            chan requestUsage // one final snapshot, consumed by the existing metrics worker
-	usageDone             chan struct{}
-	resolver              *pathResolver
-	sseBudget             *transport.Budget
+	awaitingUpstream map[jsonrpc.ID]owed
+	perWorktree      map[string]int
+	remote           *ownerSession
 
-	out  chan jsonrpc.Message
-	errs chan error
+	limits     config.Limits
+	usage      requestUsage
+	finalUsage chan requestUsage // one final snapshot, consumed by the existing metrics worker
+	usageDone  chan struct{}
+	resolver   *pathResolver
+	sseBudget  *transport.Budget
+
+	out                   chan jsonrpc.Message
+	errs                  chan error
+	retentionMu           sync.Mutex
+	retentionClosed       bool
+	initializeReservation *ownerMessageReservation
 
 	// Replayed to every upstream opened later. Written by readFromClient and
 	// read by every lane's handshake, so it carries its own synchronisation —
@@ -73,35 +74,18 @@ type router struct {
 	stateless  bool   // HTTP calls must not inherit another client's worktree
 }
 
-func newRouter(ctx context.Context, m *manager, home string) *router {
+func newRouter(ctx context.Context, owner *supervisor, home string) *router {
 	r := &router{
-		ctx:                   ctx,
-		m:                     m,
-		home:                  home,
-		lanes:                 make(map[string]*lane),
-		worktrees:             make(map[string]string),
-		paths:                 make(map[string]pathMemo),
-		awaitingUpstream:      make(map[jsonrpc.ID]owed),
-		perWorktree:           make(map[string]int),
-		operations:            make(map[operationKey]operation),
-		operationsPerWorktree: make(map[string]int),
-		usage:                 requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
-		finalUsage:            make(chan requestUsage, 1),
-		usageDone:             make(chan struct{}),
-		out:                   make(chan jsonrpc.Message, 64),
-		errs:                  make(chan error, 4),
-		plans:                 make(chan rootsPlanning),
+		ctx: ctx, owner: owner, home: home,
+		lanes: make(map[string]*lane), worktrees: make(map[string]string), paths: make(map[string]pathMemo),
+		awaitingUpstream: make(map[jsonrpc.ID]owed), perWorktree: make(map[string]int),
+		remote: &ownerSession{perWorktree: make(map[string]int)},
+		limits: owner.m.limits, sseBudget: owner.sseBudget,
+		usage:      requestUsage{Rejections: make(map[string]int), Stages: make(map[string]stageTiming)},
+		finalUsage: make(chan requestUsage, 1), usageDone: make(chan struct{}),
+		out: make(chan jsonrpc.Message, 64), errs: make(chan error, 4),
 	}
-	// The manager's policy is the session's, and WithDefaults is what lets every
-	// reader below take a limit at face value — including on the zero-value
-	// manager a test hands in, and on no manager at all.
-	if m != nil {
-		r.limits = m.limits
-	}
-	r.limits = r.limits.WithDefaults()
-	r.dial = r.dialGopls
-	r.plan = planWatch
-	r.sseBudget = transport.NewBudget(r.limits.SSEBytes)
+	r.dial, r.plan = r.dialGopls, planWatch
 	return r
 }
 
@@ -119,11 +103,6 @@ func newRouter(ctx context.Context, m *manager, home string) *router {
 // Calls with no path argument (go_workspace, go_search, go_package_api) carry no
 // routable evidence. They follow the most recent path-bearing call, falling back
 // to the worktree the bridge was started in.
-func bridge(ctx context.Context, m *manager, home string) error {
-	stdio := transport.NewStdio(os.Stdin, os.Stdout, m.limits.MessageBytes)
-	return serve(ctx, m, home, stdio)
-}
-
 // serve is the session over an already-connected client transport: everything
 // bridge does once it has one. Split out so that the shutdown order below — the
 // one thing here with a wrong answer — is reachable over a pair of in-memory
@@ -135,13 +114,14 @@ func bridge(ctx context.Context, m *manager, home string) error {
 // Connect ignores the one it is given — so what stops the traffic is this
 // context, which every Read and Write below runs under, and Close, which ends
 // the connection itself. Both happen here, in that order.
-func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) error {
+func serve(ctx context.Context, owner *supervisor, home string, stdio mcp.Connection) error {
+	m := owner.m
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	r := newRouter(ctx, m, home)
+	r := newRouter(ctx, owner, home)
 	if r.limits.Metrics {
 		defer r.finishUsage()
-		go r.reportUsage(os.Stderr)
+		go r.reportUsage(m.diagnosticWriter())
 	}
 	// Only the reader is waited for, because r.lanes is its state and
 	// closeLanes must not race it. The writer is left where it stands: the
@@ -162,6 +142,7 @@ func serve(ctx context.Context, m *manager, home string, stdio mcp.Connection) e
 	r.closeLanes()
 	r.awaitLanes()
 	r.clearRequests()
+	r.releaseRetainedMessages()
 	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, mcp.ErrConnectionClosed) {
 		return nil
 	}
@@ -184,7 +165,10 @@ func (r *router) reportUsage(output io.Writer) {
 			_ = json.MarshalEncode(jsontext.NewEncoder(output), usage)
 			return
 		case <-ticker.C:
-			_ = json.MarshalEncode(jsontext.NewEncoder(output), r.requestUsage())
+			if err := json.MarshalEncode(jsontext.NewEncoder(output), r.requestUsage()); err != nil {
+				r.reportError(fmt.Errorf("metrics output: %w", err))
+				return
+			}
 		}
 	}
 }
@@ -237,7 +221,9 @@ func (r *router) writeToClient(stdio mcp.Connection) {
 		case <-r.ctx.Done():
 			return
 		case msg := <-r.out:
-			if err := stdio.Write(r.ctx, msg); err != nil {
+			err := stdio.Write(r.ctx, msg)
+			releaseMessage(msg)
+			if err != nil {
 				r.reportError(err)
 				return
 			}
@@ -273,6 +259,22 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 		}
 		if req.Method == "initialize" {
 			req.Params = protocol.WithRootsCapability(req.Params)
+			owner := r.owner
+			if r.initialize.Load() != nil {
+				r.refuse(req, jsonrpc.CodeInvalidRequest, "client already initialized")
+				continue
+			}
+			if len(req.Params)+len(req.Method) > maxOwnerInitializeBytes || !validOwnerID(req.ID) {
+				r.reportError(fmt.Errorf("initialize or opaque id exceeds owner limit"))
+				return
+			}
+			var err error
+			r.initializeReservation, err = owner.reserveMessageBytes(maxOwnerInitializeBytes)
+			if err != nil {
+				r.reportError(err)
+				return
+			}
+
 			r.initialize.Store(req)
 		} else if r.initialize.Load() == nil {
 			// A request the client sent before its own initialize, which the
@@ -292,6 +294,7 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 		case incoming <- call:
 		case <-r.ctx.Done():
 			call.cancel()
+			releaseMessage(call.req)
 			return
 		default:
 			r.rejected("routing_queue")
@@ -305,10 +308,22 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 // would let reconnects accumulate readers and decoded responses without a bound.
 // Never silently discard a terminal response while leaving the session usable.
 func (r *router) forward(msg jsonrpc.Message) {
+	if err := retainMessage(r.owner, msg); err != nil {
+		r.reportError(err)
+		return
+	}
+	r.retentionMu.Lock()
+	defer r.retentionMu.Unlock()
+	if r.retentionClosed {
+		releaseMessage(msg)
+		return
+	}
 	select {
 	case r.out <- msg:
 	case <-r.ctx.Done():
+		releaseMessage(msg)
 	default:
+		releaseMessage(msg)
 		r.reportError(fmt.Errorf("client output queue is full"))
 	}
 }
@@ -444,14 +459,61 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 // nothing and answer "no package metadata" for a file that is right there on
 // disk — indistinguishable from a genuinely broken tree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) error {
+	owner := r.owner
+	var g *ownedGeneration
+	owner.mu.Lock()
+	g = owner.generations[worktree]
+	if !owner.rootsGenerationLocked(worktree, g, conn) {
+		owner.mu.Unlock()
+		return fmt.Errorf("roots plan belongs to a retired generation")
+	}
+	if g.rootReplies == nil {
+		g.rootReplies = make(chan struct{}, 1)
+	}
+	replies := g.rootReplies
+	owner.mu.Unlock()
+	// The first watcher view must not depend on HTTP acknowledgement order.
+	select {
+	case replies <- struct{}{}:
+		defer func() { <-replies }()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-owner.ctx.Done():
+		return owner.ctx.Err()
+	}
+	owner.mu.Lock()
+	current := owner.rootsGenerationLocked(worktree, g, conn)
+	owner.mu.Unlock()
+	if !current {
+		return fmt.Errorf("roots plan belongs to a retired generation")
+	}
+
 	plan, err := r.planRoots(ctx, worktree)
 	if err != nil {
 		return err
 	}
-	r.m.rememberWatch(worktree, serverOf(conn), plan)
-	// Strings in a fixed shape: marshaling them cannot fail, and there would be
-	// nobody to tell anyway — the id belongs to the upstream, so an error reply
-	// sent to the client would answer a question it never asked.
+	if plan.err != nil {
+		return plan.err
+	}
+	quota, estimateErr := ownerFilesystemCall(ctx, owner, func() watchFDQuota {
+		return owner.estimateQuota(ctx, plan, owner.m.limits.OpenFiles)
+	})
+	owner.mu.Lock()
+	if !owner.rootsGenerationLocked(worktree, g, conn) {
+		owner.mu.Unlock()
+		return fmt.Errorf("roots plan belongs to a retired generation")
+	}
+	err = errors.Join(estimateErr, quota.err)
+	if err == nil && quota.quota > g.fdQuota {
+		err = fmt.Errorf("roots plan needs %d descriptors but generation reserved %d; a new generation is required", quota.quota, g.fdQuota)
+	}
+	if err != nil {
+		g.err = err
+		owner.mu.Unlock()
+		return err
+	}
+	owner.mu.Unlock()
+
 	//nolint:staticcheck // Legacy gopls SSE sessions still need roots for file watching.
 	roots := make([]*mcp.Root, len(plan.roots))
 	for i, dir := range plan.roots {
@@ -459,49 +521,43 @@ func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree 
 		roots[i] = &mcp.Root{URI: (&url.URL{Scheme: "file", Path: dir}).String(), Name: filepath.Base(dir)}
 	}
 	//nolint:staticcheck // Legacy gopls SSE sessions still need roots for file watching.
-	result, _ := json.Marshal(mcp.ListRootsResult{Roots: roots})
-	return conn.Write(ctx, &jsonrpc.Response{ID: id, Result: result})
+	result, err := json.Marshal(mcp.ListRootsResult{Roots: roots})
+	if err != nil {
+		return err
+	}
+	writeErr := conn.Write(ctx, &jsonrpc.Response{ID: id, Result: result})
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if !owner.rootsGenerationLocked(worktree, g, conn) {
+		if writeErr != nil {
+			return writeErr
+		}
+		return fmt.Errorf("roots plan belongs to a retired generation")
+	}
+
+	if errors.Is(writeErr, transport.ErrMessageTooLarge) || errors.Is(writeErr, errOwnerPreDelivery) {
+		return writeErr
+	}
+	plan.uncertain = writeErr != nil
+	if plan.uncertain {
+		g.err = fmt.Errorf("roots delivery is uncertain: %w", writeErr)
+	}
+	r.owner.m.rememberWatch(worktree, serverOf(conn), plan)
+	return writeErr
 }
 
-type rootsPlanning struct {
-	ctx      context.Context
-	worktree string
-	reply    chan watchPlan
+func (s *supervisor) rootsGenerationLocked(worktree string, g *ownedGeneration, conn mcp.Connection) bool {
+	upstream, ok := conn.(*ownedUpstream)
+	return ok && upstream.s == s && upstream.g == g && g != nil && s.generations[worktree] == g && g.state == generationReady
 }
 
-// Filesystem calls cannot always be interrupted. Keep one planning worker per
-// router, including across reconnects; callers abandon their buffered reply on
-// expiry without creating replacement workers or publishing a late snapshot.
+// One owner worker bounds uninterruptible planning across all sessions.
 func (r *router) planRoots(ctx context.Context, worktree string) (watchPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return watchPlan{}, err
 	}
 	started := time.Now()
-	r.planOnce.Do(func() {
-		go func() {
-			for {
-				select {
-				case <-r.ctx.Done():
-					return
-				case job := <-r.plans:
-					if job.ctx.Err() == nil {
-						job.reply <- r.plan(job.worktree, r.limits.DirectoryFilters)
-					}
-				}
-			}
-		}()
-	})
-	job := rootsPlanning{ctx: ctx, worktree: worktree, reply: make(chan watchPlan, 1)}
-	select {
-	case r.plans <- job:
-	case <-ctx.Done():
-		return watchPlan{}, ctx.Err()
-	}
-	select {
-	case plan := <-job.reply:
-		plan.started = started
-		return plan, ctx.Err()
-	case <-ctx.Done():
-		return watchPlan{}, ctx.Err()
-	}
+	plan, err := ownerFilesystemCall(ctx, r.owner, func() watchPlan { return r.plan(worktree, r.limits.DirectoryFilters) })
+	plan.started = started
+	return plan, err
 }

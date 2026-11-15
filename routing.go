@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json/jsontext"
-
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -44,12 +43,21 @@ func (r *router) admitted(req *jsonrpc.Request) (delivery, bool) {
 // prepare tracks calls before they wait for routing, so cancellation can finish
 // both queued and resolving work without racing admission.
 func (r *router) prepare(req *jsonrpc.Request) (delivery, bool) {
+	if err := retainMessage(r.owner, req); err != nil {
+		r.reportError(err)
+		return delivery{}, false
+	}
 	ctx, cancel := context.WithTimeout(r.ctx, routingBudget+sendBudget)
 	state, err := r.admit(req.ID, cancel)
 	if err != nil {
+		releaseMessage(req)
 		cancel()
 		r.refuse(req, -32000, "%s", err)
 		return delivery{}, false
+	}
+	if !req.ID.IsValid() && state != nil {
+		stop := cancel
+		cancel = func() { stop(); r.owner.releaseQueued(state) }
 	}
 	return delivery{req: req, ctx: ctx, cancel: cancel, state: state, queued: r.now()}, true
 }
@@ -100,6 +108,11 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 		if params, rewritten := r.canonicalToolCall(req.Params); rewritten {
 			forwarded := *req
 			forwarded.Params = params
+			if err := retainMessage(r.owner, &forwarded); err != nil {
+				r.failIngress(call, -32000, err.Error())
+				return
+			}
+			defer releaseMessage(call.req)
 			req = &forwarded
 		}
 	}
@@ -107,7 +120,9 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 	case l.reqs <- delivery{req: req, ctx: ctx, cancel: cancel, state: call.state, queued: r.now()}:
 	case <-r.ctx.Done():
 		cancel()
+		releaseMessage(req)
 	default:
+		releaseMessage(req)
 		// The compound cancel, not failIngress's: this one also stops the send
 		// budget's timer by name rather than waiting for the parent to reach it.
 		cancel()
@@ -216,7 +231,14 @@ func (r *router) resolveWorktrees(parent context.Context, params jsontext.Value)
 		// and their lock, never request tracking or lane state — and it runs
 		// under the job's own context, not the session's, so a routing budget
 		// that expires cuts the lookup it paid for and no other.
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: r.toolCallWorktrees}
+
+		owner := r.owner
+		lookup := func(ctx context.Context, params jsontext.Value) []string {
+			found, _ := ownerFilesystemCall(ctx, owner, func() []string { return r.toolCallWorktrees(ctx, params) })
+			return found
+		}
+
+		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: lookup}
 		go r.resolver.run(r.ctx)
 	}
 	ctx, cancel := context.WithTimeout(parent, routingBudget)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
@@ -41,11 +42,12 @@ const laneQueue = 64
 // Order within a worktree is the channel's. Between worktrees there never was
 // any: the client's ids are what pair answers with calls.
 type lane struct {
-	r        *router
-	worktree string
-	reqs     chan delivery
-	controls chan cancellation
-	done     chan struct{}
+	r         *router
+	worktree  string
+	reqs      chan delivery
+	controls  chan cancellation
+	controlMu sync.Mutex
+	done      chan struct{}
 	// Serialize operation placement with advisory check/write, so an old
 	// cancellation cannot race a new use of the same connection/id. Waiting
 	// for this gate spends the caller's existing delivery budget.
@@ -101,6 +103,7 @@ func (l *lane) run() {
 			l.send(call.ctx, call.req, call.state)
 		}
 		call.cancel()
+		releaseMessage(call.req)
 	}
 	if l.conn != nil {
 		_ = l.conn.Close()
@@ -126,12 +129,25 @@ type cancellation struct {
 }
 
 func (l *lane) runControls() {
+	defer func() {
+		l.controlMu.Lock()
+		defer l.controlMu.Unlock()
+		for {
+			select {
+			case control := <-l.controls:
+				releaseMessage(control.req)
+			default:
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case <-l.ctx.Done():
 			return
 		case control := <-l.controls:
 			l.sendCancellation(control)
+			releaseMessage(control.req)
 		}
 	}
 }
@@ -168,9 +184,9 @@ func (l *lane) sendCancellation(control cancellation) {
 		return
 	}
 	l.r.mu.Lock()
-	op, exists := l.r.operations[operationKey{control.conn, id}]
+	stale := l.r.owner.staleCancellation(operationKey{control.conn, id}, control.state)
 	l.r.mu.Unlock()
-	if exists && op.state != control.state {
+	if stale {
 		return // this id now belongs to a later upstream operation
 	}
 	// With no operation left, sending is harmless: the gate prevents a new
@@ -241,11 +257,11 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 		err = conn.Write(ctx, req)
 		close(placed)
 		<-l.writes
-		if errors.Is(err, transport.ErrMessageTooLarge) {
+		if errors.Is(err, transport.ErrMessageTooLarge) || errors.Is(err, errOwnerPreDelivery) {
 			// The bounded transport rejected before POST; unlike a write failure,
 			// this proves no upstream operation was started by this attempt.
 			l.r.mu.Lock()
-			l.r.endOperationLocked(operationKey{conn, id})
+			l.r.owner.answered(operationKey{conn, id})
 			l.r.mu.Unlock()
 			l.giveUp(conn, id, state, err)
 			return
@@ -258,24 +274,17 @@ func (l *lane) send(parent context.Context, req *jsonrpc.Request, expected *call
 			// to decide whether the client saw a transparent retry or an error.
 			l.cache(conn)
 			l.r.startExecution(id, state)
-			if req.Method == "tools/call" {
-				l.r.m.used(l.worktree)
-			}
+
 			return
 		}
-		// A failed write and conn's own reader seeing the upstream die are the
-		// same event racing, and whoever claims the id owns the reply.
-		claimed := l.r.retry(id, conn, state)
-		// Forgotten unconditionally: a write can only fail on the connection the
-		// lane just used, so l.conn is either conn itself or already nil.
+		// Once POST/Write started, a transport error does not prove rejection.
+		// Retain its operation credit and report uncertainty rather than replay
+		// a mutation. A known retired cache is discarded before Write in upstream.
 		l.conn = nil
 		_ = conn.Close()
-		if !claimed {
-			// Its reader answered this call already. Retrying would reply again
-			// to an id the client has closed — a reply it ignores, so the retry
-			// would look fine while the client kept the error.
-			return
-		}
+		l.r.failDelivery(id, state, jsonrpc.CodeInternalError,
+			fmt.Sprintf("gopls for %s: upstream write failed; request may have executed: %v", l.worktree, err))
+		return
 	}
 	code := int64(jsonrpc.CodeInternalError)
 	if errors.Is(err, context.Canceled) {
@@ -317,6 +326,12 @@ func (l *lane) cache(conn mcp.Connection) {
 // answered from the state of the connection, not from the order the client's
 // messages happened to arrive in.
 func (l *lane) upstream(ctx context.Context, initial bool) (mcp.Connection, error) {
+	if current, ok := l.conn.(interface{ available() bool }); ok && !current.available() {
+		// This transport retired before any new Write; redial the first fresh
+		// call without replaying an ambiguously delivered operation.
+		_ = l.conn.Close()
+		l.conn = nil
+	}
 	if l.conn != nil {
 		if initial {
 			// Cached means handshaken, so the client's initialize would be this
@@ -362,76 +377,45 @@ func (l *lane) upstream(ctx context.Context, initial bool) (mcp.Connection, erro
 func (l *lane) dialBounded(budget context.Context) (mcp.Connection, error) {
 	ctx, cancel := context.WithCancel(l.r.ctx)
 	watchdog := context.AfterFunc(budget, cancel)
-	conn, err := l.r.dial(ctx, l.worktree)
+	server, err := l.r.owner.ensureRecord(ctx, l.worktree)
+	var conn mcp.Connection
+	if err == nil {
+		conn, err = l.r.dial(ctx, l.worktree, server.Port)
+	}
 	if !watchdog() {
-		// The watchdog won: ctx is cancelled, so a connection handed back here
-		// is already unreadable — its stream lives under that same context.
-		if err == nil {
+		cancel()
+		if conn != nil {
 			_ = conn.Close()
 		}
-		// budget is provably done, so this names why: a deadline of send's own
-		// making, or the session going away underneath it.
 		return nil, budget.Err()
 	}
-	if err != nil {
-		cancel()
-		return nil, err
+	if err == nil {
+		var owned mcp.Connection
+		owned, err = l.r.owner.connection(conn, server, ctx, cancel)
+		if err == nil {
+			return owned, nil
+		}
+		_ = conn.Close()
 	}
-	// Handed to the connection, which releases it on Close — see boundedConn.
-	return &boundedConn{Connection: conn, release: cancel, ctx: ctx}, nil
+	cancel()
+	return nil, err
 }
 
-// boundedConn ties dialBounded's context to the life of its connection, so
-// closing the connection releases it. It cannot be released when the dial
-// returns — the SSE stream reads under it throughout — but every site that
-// gives a connection up closes it. Left to the session context instead, the
-// children accumulate: a wedged upstream redials on every call.
-type boundedConn struct {
-	mcp.Connection
-	release context.CancelFunc
-	ctx     context.Context
-}
-
-func (c *boundedConn) lifetime() context.Context { return c.ctx }
-
-func (c *boundedConn) Close() error {
-	c.release()
-	return c.Connection.Close()
-}
-
-func (r *router) dialGopls(ctx context.Context, worktree string) (mcp.Connection, error) {
-	server, err := r.m.ensureRecord(ctx, worktree)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := transport.ConnectSSE(ctx, mcpURL(server.Port), r.limits.MessageBytes, r.sseBudget)
+func (r *router) dialGopls(ctx context.Context, worktree string, port int) (mcp.Connection, error) {
+	conn, err := transport.ConnectSSE(ctx, mcpURL(port), r.limits.MessageBytes, r.sseBudget)
 	if err != nil {
 		return nil, fmt.Errorf("connect to shared gopls MCP: %w", err)
 	}
-	return &identifiedConn{Connection: conn, id: server.server()}, nil
+	return conn, nil
 }
 
-// identifiedConn is a connection that knows which gopls it talks to: the one
-// ensure vouched for just before the dial. answerRoots reads it to keep the
-// first watch snapshot of a server (see rememberWatch). A connection without
-// one, such as a test's stub, is of unknown identity.
-type identifiedConn struct {
-	mcp.Connection
-	id serverID
-}
-
-// serverOf is the identity of the gopls conn talks to, unknown for a connection
-// that carries none. boundedConn passes its inner connection's through.
+// serverOf associates watch snapshots with the generation that received them.
 func serverOf(conn mcp.Connection) serverID {
 	if c, ok := conn.(interface{ server() serverID }); ok {
 		return c.server()
 	}
 	return serverID{}
 }
-
-func (c *identifiedConn) server() serverID { return c.id }
-
-func (c *boundedConn) server() serverID { return serverOf(c.Connection) }
 
 // handshake replays the client's initialize under a private id and swallows the
 // reply, so the client sees exactly one initialize result — the home server's.

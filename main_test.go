@@ -2,19 +2,247 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"testing/synctest"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var (
+	// A test or fuzz target, as declared in Go and as cited in the docs.
+	declaredPattern = regexp.MustCompile(`func ((?:Test|Fuzz)[A-Za-z0-9_]*)\(`)
+	citedPattern    = regexp.MustCompile("`((?:Test|Fuzz)[A-Za-z0-9_]*)`")
+	// A table row's name, and the citation naming one or more of them.
+	rowPattern      = regexp.MustCompile(`name:\s*"([^"]*)"`)
+	citedRowPattern = regexp.MustCompile(`\(cases? ("[^)]*")\)`)
+	quotedPattern   = regexp.MustCompile(`"([^"]*)"`)
+	spacePattern    = regexp.MustCompile(`\s+`)
+)
+
+// SPEC.md and README.md name the test behind each invariant, which is worth
+// something only while the names still resolve. Eight had already drifted when
+// this check was written: folding four recordAlive tests and three worktreeOf
+// tests into tables renamed them, and prose cannot fail to compile.
+//
+// Case names are checked too, since a table's rows are where the invariants
+// ended up. Whitespace is collapsed first, because a citation — and a quoted
+// case name inside it — may be wrapped across lines.
+func TestDocsNameTestsThatExist(t *testing.T) {
+	t.Parallel()
+
+	declared := make(map[string]bool)
+	rows := make(map[string]bool)
+	testFiles, err := filepath.Glob("*_test.go")
+	require.NoError(t, err)
+	internalFiles, err := filepath.Glob("internal/*/*_test.go")
+	require.NoError(t, err)
+	testFiles = append(testFiles, internalFiles...)
+	for _, path := range testFiles {
+		source := mustReadString(t, path)
+		for _, m := range declaredPattern.FindAllStringSubmatch(source, -1) {
+			declared[m[1]] = true
+		}
+		for _, m := range rowPattern.FindAllStringSubmatch(source, -1) {
+			rows[m[1]] = true
+		}
+	}
+
+	// Both sides are counted, because a pattern that matched nothing would let
+	// this pass on anything — which is the failure it exists to prevent.
+	var citedTests, citedRows int
+	for _, doc := range []string{"SPEC.md", "README.md"} {
+		prose := spacePattern.ReplaceAllString(mustReadString(t, doc), " ")
+		for _, m := range citedPattern.FindAllStringSubmatch(prose, -1) {
+			citedTests++
+			assert.Truef(t, declared[m[1]], "%s names %s, which no test declares", doc, m[1])
+		}
+		for _, citation := range citedRowPattern.FindAllStringSubmatch(prose, -1) {
+			for _, m := range quotedPattern.FindAllStringSubmatch(citation[1], -1) {
+				citedRows++
+				assert.Truef(t, rows[m[1]], "%s names case %q, which no table row declares", doc, m[1])
+			}
+		}
+	}
+	switch {
+	case len(declared) == 0:
+		require.FailNow(t, "no tests found, so this check would pass on anything")
+	case citedTests == 0:
+		require.FailNow(t, "no test citation found in the docs, so this check would pass on anything")
+	case citedRows == 0:
+		require.FailNow(t, "no case citation found in the docs, so the case check would pass on anything")
+	}
+}
+
+func mustReadString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(b)
+}
+
+func (c *fakeConn) Close() error { return nil }
+
+// Tests use the production owner lifecycle with fake OS boundaries and raw dials.
+func newTestRouter(tb testing.TB, home string) *router {
+	tb.Helper()
+	return newRouter(tb.Context(), routerTestOwner(tb, nil), home)
+}
+
+func routerTestOwner(tb testing.TB, m *manager) *supervisor {
+	tb.Helper()
+	if m == nil {
+		m = &manager{}
+	}
+	if m.limits.OwnerRetainedBytes == 0 {
+		m.limits.OwnerRetainedBytes = 1 << 30
+	}
+	m.limits = m.limits.WithDefaults()
+	if m.watch == nil {
+		m.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
+	}
+	ctx, cancel := context.WithCancel(tb.Context())
+	s := newSupervisor(ctx, m)
+	tb.Cleanup(func() { s.shutdown(); cancel() })
+	s.validateToolchain = func(context.Context, string) error { return nil }
+	s.portBusy = func(int) bool { return false }
+	s.estimateQuota = func(context.Context, watchPlan, int) watchFDQuota { return watchFDQuota{quota: 512} }
+	s.start = func(context.Context, string, int, int) (*guardianChild, error) {
+		done := make(chan struct{})
+		var once sync.Once
+		stop := func(os.Signal) error { once.Do(func() { close(done) }); return nil }
+		return &guardianChild{Process: &os.Process{Pid: 123}, ConfirmedDone: done, Signal: stop, CloseOwner: func() error { return stop(syscall.SIGTERM) }}, nil
+	}
+	s.ready = func(context.Context, int) error { return nil }
+	useMemoryRegistry(s)
+	return s
+}
+
+func useMemoryRegistry(s *supervisor) {
+	var mu sync.Mutex
+	var records []record
+	s.updateRecords = func(_ context.Context, update func([]record) ([]record, error)) ([]record, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		next, err := update(slices.Clone(records))
+		if err == nil {
+			records = next
+		}
+		return slices.Clone(records), err
+	}
+}
+
+func testUpstream(r *router, worktree string, raw mcp.Connection, ctx context.Context, cancel context.CancelFunc) *ownedUpstream {
+	rec, err := r.owner.ensureRecord(r.owner.ctx, worktree)
+	if err != nil {
+		panic(err)
+	}
+	conn, err := r.owner.connection(raw, rec, ctx, cancel)
+	if err != nil {
+		panic(err)
+	}
+	return conn.(*ownedUpstream)
+}
+
+func testConnection(r *router, raw mcp.Connection, worktree string) mcp.Connection {
+	if raw == nil {
+		return nil
+	}
+	if _, ok := raw.(*ownedUpstream); ok {
+		return raw
+	}
+	r.owner.mu.Lock()
+	for _, g := range r.owner.generations {
+		for c := range g.connections {
+			if c.Connection == raw {
+				r.owner.mu.Unlock()
+				return c
+			}
+		}
+	}
+	r.owner.mu.Unlock()
+	c := testUpstream(r, worktree, raw, r.ctx, func() {})
+	if id := serverOf(raw); id.known() {
+		r.owner.mu.Lock()
+		c.g.record.PID = id.pid
+		c.g.record.StartedAt = id.started
+		r.owner.mu.Unlock()
+	}
+	return c
+}
+
+// Tests drive send synchronously so assertions do not race a lane worker.
+func connectedLane(r *router, worktree string, conn mcp.Connection) *lane {
+	conn = testConnection(r, conn, worktree)
+	l := newLane(r, worktree)
+	l.conn = conn
+	r.lanes[worktree] = l
+	return l
+}
+
+// parkedDial makes every dial hang until the test is over, which is what an
+// flock held by another process's cold start looks like from here.
+//
+// Parked on the test's own context rather than the dial's: dialBounded cancels
+// that one at sendBudget, which would unpark the dial mid-bubble.
+func parkedDial(t *testing.T, r *router) {
+	t.Helper()
+	r.dial = func(context.Context, string, int) (mcp.Connection, error) {
+		<-t.Context().Done()
+		return nil, io.EOF
+	}
+}
+
+// fixedDial hands every lane the same connection, for the tests whose subject
+// is what the bridge does with an upstream rather than how it came by one.
+func fixedDial(r *router, conn mcp.Connection) {
+	r.dial = func(context.Context, string, int) (mcp.Connection, error) { return conn, nil }
+}
+
+// forbidDial fails the test if a lane reaches for a connection at all, naming
+// what that would mean. For the tests whose whole property is that it does not.
+func forbidDial(t *testing.T, r *router, whatWouldBeWrong string) {
+	t.Helper()
+	r.dial = func(context.Context, string, int) (mcp.Connection, error) {
+		assert.Fail(t, whatWouldBeWrong)
+		return nil, io.EOF
+	}
+}
+
+// wantClientError is its twin: the bridge must answer a call nothing else will
+// ever answer, or a client without a timeout hangs on it forever. Same rule —
+// call it from inside a bubble.
+// Returns the response so a caller that cares which error it was can hand it to
+// wantWireError; most only care that the call was answered at all.
+func wantClientError(t *testing.T, r *router, id jsonrpc.ID, whatWouldBeWrong string) *jsonrpc.Response {
+	t.Helper()
+	synctest.Wait()
+	select {
+	case msg := <-r.out:
+		releaseMessage(msg)
+		resp, ok := msg.(*jsonrpc.Response)
+		require.Truef(t, ok, "client got %T, want an error *jsonrpc.Response", msg)
+		assert.Equalf(t, id, resp.ID, "failed id = %v, want the call %v", resp.ID, id)
+		assert.NotNilf(t, resp.Error, "call %v was answered without an error", id)
+		return resp
+	default:
+		require.FailNow(t, whatWouldBeWrong)
+		return nil
+	}
+}
 
 // The argument grammar decides between three commands, two of which fork a
 // gopls, and it is the last point at which a mistyped command line is cheap.
@@ -64,24 +292,14 @@ func TestRunListReportsThroughTheWriterItWasGiven(t *testing.T) {
 	require.Equalf(t, wantOutput, out.String(), "run(list) wrote %q, want %q", out.String(), wantOutput)
 }
 
-// runnableWorktree sets up everything the two commands past the grammar need
-// before they can answer: a home for the map file, a git worktree to resolve,
-// and a record naming a gopls already serving that worktree. The record is what
-// keeps this off a real gopls — ensure answers with a port it finds alive
-// without starting anything, which is also the ordinary case in a session.
-//
-// Callers cannot be parallel: HOME is process-wide.
-func runnableWorktree(t *testing.T) (repo string, port int) {
-	t.Helper()
+// HOME is process-wide, so this legacy-adoption regression must remain serial.
+func TestRunRefusesLegacySharedProcesses(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	repo = filepath.Join(t.TempDir(), "repo")
+	repo := filepath.Join(t.TempDir(), "repo")
 	runGit(t, "init", repo)
 
 	worktree, err := worktreePath(t.Context(), repo)
 	require.NoError(t, err)
-	// Answering from the moment it binds, so the probe reaches its verdict
-	// outright instead of waiting out a silent server and then forking a ps to
-	// ask whose process it is.
 	listener, port := listenInAllocationRange(t, worktree)
 	serveEndpoint(t, listener, 0)
 
@@ -90,10 +308,12 @@ func runnableWorktree(t *testing.T) (repo string, port int) {
 	// map nothing reads and fail the tests below for the wrong reason.
 	m, err := newManager()
 	require.NoError(t, err)
-	// StartedAt zero puts the record outside any start grace, which is what makes
-	// ensure probe it and answer rather than wait for a start of its own.
 	mustWriteMap(t, m.mapPath, []record{{Worktree: worktree, Port: port, PID: os.Getpid()}})
-	return repo, port
+	var out bytes.Buffer
+	err = run([]string{"gopls-mcp-manager", "ensure", repo}, &out)
+	require.ErrorContains(t, err, "cannot adopt live or uncertain legacy gopls")
+	require.Empty(t, out.String())
+	require.Equal(t, []record{{Worktree: worktree, Port: port, PID: os.Getpid()}}, mustReadMap(t, m.mapPath), "legacy reservation changed during refused adoption")
 }
 
 // The port is the whole output of ensure, and it is what a caller wiring an
@@ -102,7 +322,7 @@ func runnableWorktree(t *testing.T) (repo string, port int) {
 //
 // Not parallel: HOME is process-wide.
 func TestRunEnsurePrintsThePortOfAGoplsAlreadyServing(t *testing.T) {
-	repo, port := runnableWorktree(t)
+	repo, port := supervisorRunFixture(t)
 	var out bytes.Buffer
 
 	err := run([]string{"gopls-mcp-manager", "ensure", repo}, &out)
@@ -119,7 +339,7 @@ func TestRunEnsurePrintsThePortOfAGoplsAlreadyServing(t *testing.T) {
 //
 // Not parallel: HOME and os.Stdin are both process-wide.
 func TestRunBridgeReturnsCleanlyWhenTheClientGoesAway(t *testing.T) {
-	repo, _ := runnableWorktree(t)
+	repo, _ := supervisorRunFixture(t)
 	// A stdin already at end of file, which is a client that connected and
 	// closed. The real one is this process's, so it is swapped for the call and
 	// put back after — the transport reads os.Stdin when it connects.
@@ -213,8 +433,7 @@ func TestNewManagerPutsItsMapUnderTheHomeDirectory(t *testing.T) {
 	require.Equalf(t, want, m.mapPath, "mapPath = %q, want %q", m.mapPath, want)
 	// Both hooks are what production runs with; a nil one would be a panic on
 	// the first sweep or the first cold start rather than a test failure.
-	require.NotNilf(t, m.alive, "newManager() left a manager the first sweep or start would panic on")
-	require.NotNilf(t, m.ready, "newManager() left a manager the first sweep or start would panic on")
+
 }
 
 // With no home there is nowhere to put the map, and that is a startup error
@@ -232,6 +451,7 @@ func TestNewManagerFailsWithNoHomeDirectory(t *testing.T) {
 
 // track seeds or updates an outstanding request for tests of delivered traffic.
 func (r *router) track(id jsonrpc.ID, conn mcp.Connection, worktree string) {
+	conn = testConnection(r, conn, worktree)
 	if !id.IsValid() {
 		return
 	}
@@ -271,32 +491,9 @@ func (r *router) target(req *jsonrpc.Request) (string, error) {
 	return r.targetContext(r.ctx, req)
 }
 
-// cleanRecords drops the records whose server is gone. Every record is offered
-// to alive, which reaps what it rejects, so none may be skipped — including a
-// second record for a worktree ensure will never answer with, since the record
-// is the only handle on that process and its port really is taken.
-//
-// The probes run at once, so alive has to be safe to call from several
-// goroutines. Every caller holds the map's exclusive flock across this and a
-// probe waits out its own timeout, so in sequence a few servers too busy to
-// answer would keep every other invocation of this tool — and so every other
-// worktree's next tool call — waiting for the sum of them. Nothing bounds the
-// fan-out because nothing needs to: the records are one per live gopls, and a
-// machine that could run enough of those to matter here has already run out of
-// memory.
-func cleanRecords(records []record, alive func(record) bool) []record {
-	live := make([]bool, len(records))
-	var probes sync.WaitGroup
-	for i, r := range records {
-		probes.Go(func() { live[i] = alive(r) })
-	}
-	probes.Wait()
-
-	kept := make([]record, 0, len(records))
-	for i, r := range records {
-		if live[i] {
-			kept = append(kept, r)
-		}
-	}
-	return kept
+type identifiedConn struct {
+	mcp.Connection
+	id serverID
 }
+
+func (c *identifiedConn) server() serverID { return c.id }
