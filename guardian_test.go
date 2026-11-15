@@ -73,6 +73,10 @@ func TestGuardianHelperProcess(t *testing.T) {
 	if os.Getenv("GOPLS_GUARDIAN_TEST_HELPER") != "1" {
 		return
 	}
+	// Test runners can be killed before Cleanup runs. Every disposable helper,
+	// including escaped descendants, must still have a finite lifetime.
+	watchdog := time.AfterFunc(5*time.Minute, func() { os.Exit(124) })
+	defer watchdog.Stop()
 	var args []string
 	for i, arg := range os.Args {
 		if arg == "--" {
@@ -241,8 +245,17 @@ func newGuardianFixture(t *testing.T, mode string, guardianArgs ...string) guard
 			assert.Eventually(t, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) },
 				5*time.Second, 10*time.Millisecond, "disposable child/descendant must exit before TempDir cleanup")
 		}
-		assert.Eventually(t, func() bool { return errors.Is(syscall.Kill(child.GuardianPID, 0), syscall.ESRCH) },
-			5*time.Second, 10*time.Millisecond, "disposable guardian must exit")
+		if !assert.Eventually(t, func() bool { return errors.Is(syscall.Kill(child.GuardianPID, 0), syscall.ESRCH) },
+			5*time.Second, 10*time.Millisecond, "disposable guardian must exit") {
+			// This is the direct subprocess handle created by this fixture,
+			// never a PID rediscovered from a manifest.
+			killErr := command.Process.Kill()
+			if !errors.Is(killErr, os.ErrProcessDone) {
+				assert.NoError(t, killErr)
+			}
+			assert.Eventually(t, func() bool { return errors.Is(syscall.Kill(child.GuardianPID, 0), syscall.ESRCH) },
+				5*time.Second, 10*time.Millisecond, "forced disposable guardian teardown must be reaped")
+		}
 	})
 	require.Eventually(t, func() bool { _, err := os.Stat(stop + ".ready"); return err == nil }, 5*time.Second, 10*time.Millisecond)
 	return fixture
