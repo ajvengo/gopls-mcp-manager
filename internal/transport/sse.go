@@ -40,6 +40,8 @@ type sseConn struct {
 	// scheme, host and path on every call, and this one never changes after the
 	// handshake below settles it.
 	endpoint string
+	ctx      context.Context
+	cancel   context.CancelFunc
 	body     io.ReadCloser
 	budget   *Budget
 	maxBytes int
@@ -52,19 +54,23 @@ type sseConn struct {
 // ctx owns the stream until Close. maxBytes is taken at face value: config.Limits
 // is normalized where it enters the program, so there is no second opinion here.
 func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budget) (mcp.Connection, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if req.URL.Scheme != "http" || !net.ParseIP(req.URL.Hostname()).IsLoopback() || req.URL.User != nil {
+		cancel()
 		return nil, errors.New("SSE endpoint must be an HTTP loopback address")
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := sseClient.Do(req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	c := &sseConn{body: resp.Body, budget: budget, maxBytes: maxBytes,
+	c := &sseConn{ctx: ctx, cancel: cancel, body: resp.Body, budget: budget, maxBytes: maxBytes,
 		incoming: make(chan sseResult), done: make(chan struct{})}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = c.Close()
@@ -105,11 +111,15 @@ func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budg
 		return nil, err
 	}
 	go func() {
+		defer func() { _ = c.Close() }()
 		for {
 			frame, err := c.readFrame(reader)
 			select {
 			case c.incoming <- sseResult{frame, err}:
 			case <-c.done:
+				budget.release(cap(frame))
+				return
+			case <-ctx.Done():
 				budget.release(cap(frame))
 				return
 			}
@@ -172,6 +182,14 @@ func (c *sseConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 	if len(data) > c.maxBytes {
 		return ErrMessageTooLarge
 	}
+	// A POST belongs to both its caller and this connection. Closing the SSE
+	// stream must not leave a write waiting on a peer that never sends headers.
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -190,7 +208,11 @@ func (c *sseConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 
 func (c *sseConn) Close() error {
 	var err error
-	c.once.Do(func() { close(c.done); err = c.body.Close() })
+	c.once.Do(func() {
+		close(c.done)
+		c.cancel()
+		err = c.body.Close()
+	})
 	return err
 }
 

@@ -18,9 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The shipped message ceiling, for the tests that are not about the limit.
-const defaultTestLimit = 4 << 20
-
 func TestStdioMessageLimitAndReadAhead(t *testing.T) {
 	t.Parallel()
 	wire := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
