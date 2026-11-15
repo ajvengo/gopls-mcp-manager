@@ -6,15 +6,116 @@ from the code as it stands; each invariant names the test that pins it.
 ## 1. Roles
 
 ```
-MCP client ──stdio──▶ gopls-mcp-manager ──SSE/HTTP──▶ gopls mcp -listen 127.0.0.1:P   (home)
-                                        ──SSE/HTTP──▶ gopls mcp -listen 127.0.0.1:Q   (worktree B)
-                                        ──SSE/HTTP──▶ …
+MCP client → stdio/HTTP frontend → private Unix owner → SSE/HTTP → guarded gopls
 ```
 
 - **home** — the worktree the bridge was started in. Always the first upstream.
 - **upstream** — one connection to one gopls, identified by its worktree path.
 - **sticky** — the worktree of the most recent tool call that named a resolvable
   absolute path.
+
+### Persistent owner contract
+
+O1. Production frontends are thin transports. One persistent singleton hosts
+routers, HTTP backends and every upstream write; no direct fallback is allowed.
+Its private versioned Unix endpoint and configuration fingerprint reject mixed
+clients. Canonical registry identity determines a short socket beneath `/tmp`,
+independent of TMPDIR/HOME length. Singleton authority is a lifetime registry lock.
+→ `TestSupervisorSocketUsesShortStablePrivateIdentity`,
+`TestSupervisorProtocolAndConfigMismatchFailBeforeAllocation`
+
+O2. One mutex serializes admission, target binding and drain eligibility. Queued,
+active and protected abandoned operations prevent retirement. Quiet attachments
+do not. Readiness starts the monotonic completion clock; definitive responses
+advance it. The default idle period is positive one hour, sampled every 30 s,
+and the age is rechecked at the drain verdict. Cancellation/disconnect does not
+complete remote work. Abandoned work retains capacity through a separate idle
+grace and controlled generation retirement.
+→ `TestSupervisorIdleBoundaryAndQuietConnections`,
+`TestSupervisorQueuedAndActiveWorkSurviveIdle`,
+`TestSupervisorAbandonedOperationsRetireOnlyAfterGrace`,
+`TestSupervisorIdleCandidateRechecksLastCompletion`
+
+O3. Drain fences delivery before graceful SIGTERM. Guardian-owned handles and
+anchored process groups provide signals and exit observations. Ordinary shared
+cleanup waits ten seconds and never escalates to SIGKILL. Uncertain starts,
+ignored TERM, guardian loss and storage failures retain discoverability and
+capacity. Only confirmed child/group/guardian exit permits release. Durable
+pre-fork manifests and stable lifetime locks fence restart and owner-crash windows.
+Legacy records prevent migration. PID disappearance alone is not proof.
+A successful process census must include the observing process in its actual
+process group; an empty or incomplete view cannot prove group absence. Missing
+initial ancestry evidence remains uncertain after later successful observations.
+→ `TestGuardianSnapshotRequiresObserverIdentity`,
+`TestGuardianFailedInitialObservationRetainsUncertainty`
+
+O4. Defaults are 16 combined frontend attachments/cached HTTP backends, 1024
+global queued/unconfirmed operations, and 64 generation slots. Private handshake
+and server control requests consume that same operation cap. All routers share
+64 MiB SSE capacity and HTTP maximum-body reservations (16 exchanges by default).
+Per-router queues/lanes/memos compose under the frontend cap. One owner-wide
+filesystem worker contains blocked calls across retired sessions. Managed logs
+have one process-global disk worker, a bounded queue and aggregate retention;
+queue/storage failure fences owner delivery.
+Retained ingress/delivery, output and advisory payloads share64MiB maximum-message
+reservations, released by actual consumption/discard/Write return. Local cancel
+does not refund a queued object. Opaque string IDs are≤1024bytes and the retained
+initialize template≤64KiB. These bounds exclude transient decoder/serializer/GC
+overhead. Budget exhaustion fails admission/output explicitly; advisory overload
+still completes local cancellation immediately.
+→ `TestSupervisorGlobalAdmissionDoesNotMultiplyWithRouters`,
+`TestSupervisorSharedFilesystemWorkerSurvivesSessionChurnBoundedly`
+
+O5. Before spawn, complete watched-tree admission reserves child FD quota plus
+guardian/control headroom. Kernel RLIMIT_NOFILE enforces managed child/owner
+quotas. Prospective victims remain charged until confirmed exit. These limits
+do not bound total RSS, arbitrary project process fanout, external caches or all
+kernel watcher memory. Darwin process groups cannot prove universal containment
+of arbitrary escaped project subprocesses. Managed telemetry compatibility is
+checked explicitly; unsupported selected Go/gopls toolchains fail.
+
+Each later roots reply is checked against the original immutable child quota
+before snapshot publication or upstream Write. Expanded plans fail explicitly
+and require a new generation, preserving the established watch snapshot and
+active/unknown-work retirement protection. HTTP backend retirement keeps its
+entry charged until actual router teardown completes, rejects reuse during
+closing, and has one teardown owner across sweep/shutdown.
+→ `TestSupervisorRetiringBackendKeepsCapacityUntilCloseCompletes`,
+`TestSupervisorExpandedRootsRefuseBeforePublicationAndPreserveRetirement`,
+`TestSupervisorSameAndSmallerRootsFitImmutableQuota`
+
+The data proxy has no fixed response-header timeout that overrides Execution=0
+or a longer execution policy. Request cancellation and body/write/socket limits
+still apply. Ping/startup/CONNECT retain explicit budgets; management queries
+use at most40seconds overall (an earlier caller deadline wins). A canceled cached
+HTTP router fails the current request without replay, retires independently of
+recent traffic, and keeps capacity through active handlers and actual teardown.
+Only a later independent request initializes a replacement backend.
+→ `TestSupervisorProxyExecutionFollowsCallerBudget`,
+`TestSupervisorFailedHTTPBackendRetiresDespiteRecentUse`,
+`TestSupervisorFailedHTTPBackendKeepsCapacityUntilActiveHandlersFinish`,
+`TestSupervisorFailedHTTPBackendReinitializesOnIndependentRequest`
+
+O6. The owner survives zero clients. The first normal call after proven idle
+retirement reconnects before caller delivery. Actual uncertain caller writes
+fail explicitly and are never replayed (F1). See section 9 for recovery scope.
+Legacy process reservations are never adopted or signalled automatically;
+nonempty offline registries require explicit operator reconciliation.
+→ `TestSupervisorTwoBridgesAndHTTPShareAndReconnectAfterIdle`
+
+O7. Each router requires an explicit owner and keeps only local waiters/timers.
+The owner alone records remote operations and per-session/worktree counts, under
+its mutex. Remote records retain separate connection/admission identity tokens
+and counters, without routers, timers, payloads, callbacks or HTTP writers.
+One upstream type owns transport, generation identity and cancellation lifetime.
+For caller responses, releasing the remote identity and claiming the matching
+local waiter occur under the router lock; merely reading a response cannot make
+its ID reusable. Private handshake responses complete within the upstream.
+Empty per-worktree count entries are removed on terminal completion or confirmed
+exit. Disconnect abandons remote work; it never refunds its credits.
+→ `TestResponseReadCannotReleaseIDBeforeWaiterClaim`,
+`TestConfirmedExitRestoresLongSessionCapacity`,
+`TestUnconfirmedExitRetainsRouterOperationCredits`
 
 ## 2. Routing
 
@@ -78,7 +179,9 @@ or dialling delivery is cancelled. Once assigned to a connection, advisory
 cancellation carries that exact connection on the lane's control queue and waits
 for the original write to finish before forwarding. A full control queue can
 drop the advisory notification but cannot undo local completion. Unknown,
-already completed or malformed cancellation ids are dropped. A notification
+already completed or malformed cancellation ids are dropped. Fractional or
+out-of-range decoded numeric ids are rejected before the SDK can truncate them
+to another request id. A notification
 itself has no response; the terminal response belongs to the request it names.
 Advisory writes and operation placement share a cancellable lane gate. Under
 that gate an advisory is dropped if its connection/id now belongs to another
@@ -86,8 +189,9 @@ request generation; a later reuse cannot overtake an advisory already writing.
 → `TestQueuedCancellationPreventsDelivery`,
 `TestCancellationBypassesFullDeliveryQueue`,
 `TestCancellationCannotOvertakeItsCall`,
-`TestCancellationFollowsACallOntoItsRetryConnection`
-→ `TestDelayedCancellationCannotCancelReusedID`, `TestCancellationWriteFencesIDReuse`
+`TestCancellationAfterUncertainWriteCannotReachANewConnection`
+→ `TestDelayedCancellationCannotCancelReusedID`, `TestCancellationWriteFencesIDReuse`,
+`TestCancellationNumericIDDoesNotAliasAnotherRequest`
 
 R8. Outstanding requests are bounded independently of queue depth: 128 per
 worktree lane and 1024 per session by default. A server accepting writes without
@@ -99,13 +203,17 @@ the same session/per-worktree ceilings. Local completion and connection failure
 do not release them. Terminal upstream responses release the exact connection/id
 credit, even after local cancellation; a proven pre-POST size rejection releases
 its reservation too. An uncertain retry on another connection needs another
-credit. Lost-connection credits remain until router shutdown. Reusing an id on
-the same connection is refused while its old operation remains unresolved.
-This bounds unconfirmed operations through one live router, not work across
-manager restarts or other clients of the shared server.
+credit. Lost-connection credits remain until authoritative generation exit or
+router shutdown. A surviving router reclaims confirmed-exit credits before
+rejecting delivery at its operation ceiling and when reporting usage. Connection
+loss or unconfirmed termination cannot reclaim them. Reusing an id on the same
+connection is refused while its old operation remains unresolved. The persistent
+owner also accounts globally across frontend lifetimes.
 → `TestAbandonedOperationsBoundFurtherDelivery`,
 `TestDisconnectedOperationsDoNotReleaseCredits`,
-`TestAbandonedIDCannotBeReusedOnItsConnection`
+`TestAbandonedIDCannotBeReusedOnItsConnection`,
+`TestConfirmedExitRestoresLongSessionCapacity`,
+`TestUnconfirmedExitRetainsRouterOperationCredits`
 Per-worktree counts are updated in constant time; all terminal paths remove
 accounting centrally. Retained lanes have a separate default ceiling of 64.
 Requests rejected by session or lane-retention limits do not create new lanes.
@@ -178,19 +286,19 @@ free to be nothing but a refusal of the offending message: no ordering race
 between the reader and a lane can put a duplicate on the wire.
 → `TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream`
 
-H3. If the *initial* `initialize` fails to write, the retry re-sends the
-client's own request rather than a private handshake.
-→ `TestSendRetriesInitialInitializeWithoutPrivateHandshake`
+H3. An uncertain write of the initial `initialize` fails explicitly and is not
+replayed. No private handshake is sent in its place.
+→ `TestSendDoesNotReplayAnUncertainInitialize`
 
 H4. The handshake ends with a `notifications/initialized` notification.
 
 H5. **The handshake is bounded** (the readiness budget plus 20 s — 30 s today —
-per client message, F1's retry included —
+per client message, including pre-delivery dial/private-handshake retries —
 a per-attempt deadline would stall the client twice over). It runs on the lane's
 goroutine, so an upstream that accepts the connection and then answers nothing
 would stall every later call to that worktree for the rest of the session, with
 neither side timing out — and §8 deliberately keeps such a server alive, so
-`ensure` hands one back. A budget already spent cancels F1's retry
+`ensure` hands one back. A budget already spent cancels a pre-delivery retry
 rather than restarting it. The deadline starts at queue admission and covers
 lock acquisition, readiness, connect, handshake, roots replies and delivery.
 Cleanup of an owned failed child has its own budget (P2a).
@@ -206,12 +314,12 @@ that would cut a healthy upstream loose the moment the budget expired, which is
 the failure H5 exists to prevent. So the context is cancellable, only a
 watchdog cancels it, and the watchdog is disarmed the moment the dial returns;
 a connection handed back after it fired is closed, since its stream is already
-unreadable. The same cancellation reaches `ensure`: lock acquisition uses
-nonblocking flock retries, HTTP probes carry the context, ps has a one-second
-ceiling, and readiness polls wait on the context. A cancelled sweep writes
-nothing and does not treat cancellation as evidence against a shared server.
-→ `TestEnsureCancelledAtLockDoesNotSpawn`, `TestCancelledSweepPreservesRecords`,
-  `TestReadinessProbeHonoursCancellation`
+unreadable. The caller cancellation stops waiting for owner acquisition and closes any
+connection returned after expiry. The shared start uses the owner's lifetime
+context: a cancelled waiter cannot cancel another client's generation. Readiness
+still has its own bounded polling budget.
+→ `TestReadinessProbeHonoursCancellation`,
+`TestSupervisorCancelledWaiterCannotCancelSharedStart`
 
 **The context is the connection's, and is released with it.** Surviving the dial
 is not the same as surviving the session: the connection is what still needs it,
@@ -318,17 +426,26 @@ S4. **Every other server-initiated request is answered with
 S4a. Server-request replies have a 30 s ceiling, shortened by any existing
 handshake deadline. A failed reply closes the connection and explicitly fails
 its outstanding calls. The next call can reconnect using ordinary lane recovery.
-Planning shares this deadline through one router-owned filesystem worker.
+Production planning shares this deadline through the owner's single filesystem worker.
 An uncancellable syscall may occupy that worker after expiry, but reconnects
 do not create replacement workers. Expired plans cannot publish snapshots,
 and an older plan cannot replace a newer generation's snapshot. Connection
 closure cancels its queued roots work even when its reader is backpressured.
+The owner serializes roots replies per generation. Encoding failures and proven
+pre-delivery rejections publish no watcher view. An uncertain write preserves
+the first possible view and stays stale until generation retirement.
 → `TestServerReplyFailureCompletesOutstanding`,
 `TestServerReplyKeepsShorterHandshakeDeadline`
 → `TestRootsPlanningHonoursBudget`, `TestRootsWorkersStayBoundedAcrossTimeouts`,
 `TestExpiredRootsPlanCannotRememberSnapshot`,
 `TestLateRootsPlanCannotReplaceNewerGeneration`,
-`TestClosedConnectionCannotStartObsoleteRootsPlan`
+`TestClosedConnectionCannotStartObsoleteRootsPlan`,
+`TestRootsSnapshotTracksDeliveryCertainty`,
+`TestRootsSnapshotCannotCrossGenerationReplacement`,
+`TestInvalidRootNameCannotPublishWatcherSnapshot`,
+`TestRootsFirstViewSurvivesAcknowledgementOrder`,
+`TestWaitingRootsReplyCanCancelWithoutReleasingAnotherReply`,
+`TestUncertainRootsStayStaleThroughLaterSuccessfulReplies`
 
 S5. S1 and S4 make the upstream reader a **second writer** on a connection its
 lane also writes to, and the steady-state reader answers `roots/list` from a
@@ -356,10 +473,15 @@ it exits.
 
 ## 5. Failure semantics
 
-F1. **An upstream dying never ends the session**, not even home. Its cached
-connection fails the next write, which redials, replays the handshake, and
-retries once.
-→ `TestHomeUpstreamEOFDoesNotCloseClient`
+F1. **An upstream dying never ends the session**, not even home. A proven retired
+cached connection is replaced before caller delivery. Dial/private-handshake
+failures may retry within the original bounded budget. After an actual caller
+Write fails uncertainly, the caller gets an explicit "may have executed" error,
+the connection closes and the operation credit remains. No transparent replay is
+permitted. Proven size/pre-delivery rejection releases its reservation. Explicit
+client retries can still duplicate a mutation; no end-to-end at-most-once claim.
+→ `TestHomeUpstreamEOFDoesNotCloseClient`,
+`TestSupervisorUncertainPostDoesNotReplayExecutedTool`
 
 F2. **A call in flight when its upstream dies is failed explicitly** with an
 internal error carrying its id. Nothing else will ever produce that id, and MCP
@@ -380,18 +502,14 @@ answer and F2 would later emit a second, contradictory reply to the same id.
 
 F5. **Whoever takes an id off the pending list owns the reply.** Responses,
 connection failure, cancellation and execution timeout compete for completion.
-A retry atomically changes the owning connection to nil while retaining the
-admission slot and cancellation state; it cannot revive a completed call. In particular, a failed write and
-that connection's reader seeing the death are one event seen twice. If the
-reader wins it has already answered under F2, and a retry that then succeeded
-would produce a second reply to an id the client has closed — which the client
-discards, so the call would stay failed while the retry looked fine. The rule is
-symmetric: a reader that loses the claim **drops** the answer it read, because
+An uncertain failed write and that connection's reader seeing death are one
+event seen twice. Neither may revive or replay the completed local call.
+A reader that loses the claim **drops** the answer it read, because
 the id it names has already been answered by whoever won.
 → `TestSendLeavesACallItsDyingUpstreamAlreadyFailed`,
   `TestUpstreamAnswerToAnAlreadyFailedCallIsDropped`
 
-Queued deliveries, operation reservation, retry ownership, local delivery errors
+Queued deliveries, operation reservation, local delivery errors
 and execution-timer startup carry the original call generation. An old queued
 entry or returning Write cannot alter a newer call that reused its id.
 → `TestDeliveryCompletionCannotTouchReusedID`,
@@ -399,14 +517,11 @@ entry or returning Write cannot alter a newer call that reused its id.
 
 F5a. **A lane's connection always has a reader**, because `cache` is the only
 thing that sets `lane.conn` and it starts the reader in the same step. It is
-called only once the connection has taken a successful write, so a dial that
-hands back an already-dead upstream fails on the lane's own goroutine, where the
-retry is, rather than racing a reader that could claim the id first and answer
-the client an error the retry is then not allowed to replace. The first attempt
-on a new connection is single-goroutine. The converse does not hold: the failure
+called only once the connection has taken a successful write. A failed first
+caller write is handled on the lane's goroutine and never replayed. The converse
+does not hold: the failure
 path clears `lane.conn` while its reader is still winding down.
-→ `TestSendRetriesInitialInitializeWithoutPrivateHandshake` (the retry, which
-  only a single-goroutine first attempt can reach)
+→ `TestSendDoesNotReplayAnUncertainInitialize`
 
 F6. The stdio client going away or the session context being cancelled stops
 the bridge. `io.EOF`, `context.Canceled` and `ErrConnectionClosed` exit zero.
@@ -425,51 +540,40 @@ M1. Written atomically: temp file in the same directory, `fsync`, `rename`.
 Mode is set explicitly, because `CreateTemp`'s `0600` is still subject to umask
 and an exotic umask could leave the file unreadable to its own writer.
 
-M2. Every read-modify-write is wrapped in an exclusive `flock` on
-`<map>.lock`, so concurrent `bridge`/`ensure`/`list` processes serialize.
-Acquisition uses nonblocking attempts separated by cancellable 10 ms waits.
-All CLI commands install signal cancellation before manager operations.
-
-The write is therefore skipped when it would change nothing — the steady state,
-a warm worktree whose record is present and still answering. The `fsync` in M1
-costs some forty times everything else inside that lock and up — around 6ms
-against 150µs for sixteen records, the ratio moving with how busy the disk is
-(`BenchmarkWithRecords`) — and it is a lock every process on the machine
-shares.
-The skip needs both halves of the question: equal records, *and* a read that
-dropped no lines, since M3's repair is otherwise owed and would never come.
+M2. Owner registry transactions use an exclusive flock on `<map>.lock`, with
+cancellable nonblocking acquisition. The owner lifetime lock excludes competing
+owners. Port reservation, spawn and publication have distinct phases; no network
+readiness wait holds either the owner mutex or registry transaction lock.
+Unchanged transactions skip replacement; blank formatting may be normalised.
+Malformed nonblank records fail without mutation.
 → `TestWithRecordsWritesOnlyWhenTheFileWouldChange`, `FuzzReadMap`,
-`TestReadMapSkipsUnparseableLines`
+`TestReadMapRefusesUncertainProcessReservations`
 
-M3. **A line that cannot be parsed is skipped, not fatal.** Every command reads
-this file; one bad line must not lock the operator out of the tool. The next
-write drops it.
-→ `TestReadMapSkipsUnparseableLines`
+M3. **Every malformed nonblank or invalid-field record fails the complete read.**
+No partial records or rewrite are allowed: the line may reserve a live process.
+Blank lines are permitted but consume input budget. Errors name the file without
+including contents. Explicit operator repair is required.
+→ `TestReadMapRefusesUncertainProcessReservations`
 
-One exception, deliberate: a line longer than `bufio.Scanner`'s 64 KiB limit
-fails the read outright. Skipping it would hide records the next write then
-drops without terminating their processes, stranding exactly the indexes L2
-exists to protect. Failing names the file, which is repairable; the alternative
-is silent.
+Reads also fail above 4 MiB total, 4001 lines or scanner's 64 KiB token limit.
+Writers reject more than 4001 records, 4 MiB total or an encoded record above
+65535 bytes before rename, preserving the previous file. Nonregular/symlink state
+is refused using nonblocking descriptor-checked reads.
 
-M4. **Fields are validated, not merely decoded.** `Worktree` must be non-empty,
-`PID` must be positive, `Port` must lie inside the allocation range. Each is an
-argument to `kill(2)` or to a probe that decides on a `kill`: pid `0` signals
-the manager's own process group, a negative pid signals every process the user
-owns, and an out-of-range port can only refuse a probe and condemn a live
-server.
-→ same test
+M4. Fields are validated, not merely decoded: Worktree is nonempty, PID is
+between 1 and 2^31−1, and Port is within the allocation range. Valid metadata never
+authorises PID-based signalling or adoption. Owner/generation identity and the
+guardian's owned handles remain authoritative.
+→ `TestReadMapRefusesUncertainProcessReservations`
 
-M4a. `StartedAt` is unix seconds, and is the one field that is *not* validated
-into a range, because it is not an argument to anything: it only widens or
-narrows the grace of L7. Absent — a map written before the field existed — it
-reads as zero, which is 1970, which is no grace at all: exactly the behaviour
-those records already had.
+M4a. StartedAt is unix seconds; absent values remain zero for legacy decoding.
+The owner uses readiness and monotonic completion time for retirement, with no
+legacy start-grace or popularity eviction policy.
 
 M4b. `StartedAtMilli` is the same instant in unix milliseconds, written beside
 `StartedAt` from one clock reading and omitted when zero. Only S1b reads it, to
-compare module-file mtimes with the start; server identity, the start grace and
-the eviction window stay in whole seconds, so an older manager dropping the
+compare module-file mtimes with the start. Legacy connection identity remains in
+whole seconds, so an older manager dropping the
 field changes none of them. It is used only when
 `StartedAtMilli / 1000 == StartedAt`: a map written by an older manager has none,
 and a hand-edited one may contradict the seconds, and both fall back to
@@ -490,203 +594,82 @@ fails, are skipped in order.
 
 ## 8. Liveness
 
-Probing is read-only and returns one of four verdicts: live, uncertain,
-terminate, or gone. A boolean cannot express the distinction between a process
-that should stop and one confirmed gone.
+Only the persistent owner makes admission and retirement decisions. Quiet
+attachments do not pin a generation; queued work, writes and protected remote
+operations do. Idle/stale-worktree retirement rechecks eligibility under the
+owner mutex, persists the matching generation as terminating, then asks its
+guardian to signal. Failed persistence, uncertain observation and ignored TERM
+retain the generation and its descriptor/slot reservations (O2–O5).
+→ `TestSupervisorIdleCandidateRechecksLastCompletion`,
+`TestMaintenanceRestartsAServerThatMissedAnUncoveredChange`,
+`TestMaintenanceSparesUncertainWatchMetadata`,
+`TestSupervisorGuardianLossRetainsCapacityThroughStorageFailure`
 
-1. Check process existence with kill(pid, 0). A missing process is gone.
-2. For a record already marked Terminating, check process identity. Keep it
-   terminating while it still belongs to us; an identity error is uncertainty.
-3. Otherwise, a living process inside the 15 s start grace is kept without an
-   HTTP probe. Future timestamps receive no grace.
-4. Probe the endpoint with a 500 ms ceiling. A valid SSE response is live;
-   connection refused is the only conclusive endpoint failure.
-5. On other results, check that ps still identifies our gopls and listen address.
-   Identity failure is uncertainty. A different process means our old record is
-   gone and is never signalled. Refusal plus matching identity requests
-   termination; other matching results remain uncertain.
+`list` contacts the owner for maintenance. Without an owner, an empty registry
+prints the normal header; any retained records fail with offline-cleanup
+instructions. There is no legacy PID-based signalling, advisory pending-file
+publication, or sampled LFU eviction. Stop old writers and reconcile legacy
+processes explicitly before migration. `status` remains observational.
 
-→ `TestRecordAlive`, `FuzzWithinStartGrace`
-
-L1. Explicit liveness reconciliation (`list`) probes every snapshot record with at most
-eight concurrent probes. Cancellation stops admission before reconciliation.
-Endpoint probes bypass environment proxies and refuse redirects, like SSE
-traffic. A redirect is inconclusive, never permission to signal. Process
-matching checks the complete `gopls mcp -listen <address>` argument tail rather
-than substrings; interpreter prefixes remain supported.
-→ `TestSweepBoundsConcurrencyAndCancelsBeforeMutation`
-→ `TestProbeDoesNotFollowRedirects`, `TestProcessIdentityRejectsSubstringMatches`
-
-Duplicate worktree records are included. Acquisition (`ensure` and bridge dials)
-probes only records matching the requested worktree. All other records remain
-reserved, including stale and terminating ones; maintenance is explicit.
-→ `TestAcquisitionDoesNotProbeUnrelatedRecords`
-
-Probes run outside the global registry flock. Reconciliation rereads
-the current map under lock and applies a verdict only to an exactly matching
-record. New or replaced records are retained; a stale result cannot delete or
-mark a replacement.
-→ `TestSweepReconcilesOnlyTheProbedIdentity`
-
-L2. Before signalling, persist Terminating=true. This commit survives a later
-caller mutation failure. A separate per-port action flock serializes signal
-attempts. Recheck the atomic registry snapshot and process identity before
-SIGTERM, without holding the global registry lock.
-The stable `<map>.cleanup-<port>.lock` names retain their inodes, with at most
-4001 new cleanup lock files per registry. Older PID/port-keyed lock files remain
-untouched. Upgrade all managers before relying on the new lock namespace;
-historical lock files may be removed only while every sharing manager is stopped.
-→ `TestSweepSignalsOnlyAfterPersistingTermination`
-→ `TestCleanupLockFilesBoundedAcrossGenerations`
-
-L3. Sending SIGTERM is not proof of exit. Retain the record on signal error,
-ignored SIGTERM or delayed exit; ensure refuses its endpoint and does not spawn
-another process for that worktree. A later sweep removes it only when the old
-process is gone or identity belongs to a different process. This cross-process
-path does not automatically escalate to SIGKILL; owned failed children use P2a.
-→ `TestSweepRetainsAProcessIgnoringTermination`
-
-L4. Ordinary reconciliation and caller mutation share a single atomic commit.
-When the body refuses and no termination action is required, nothing is written.
-A terminating transition is deliberately a separate prior commit: even if
-ensure then refuses that worktree, its cleanup record must stay discoverable.
-Cancelled probes do not reach reconciliation.
-→ `TestWithRecordsWritesNothingWhenTheBodyRefuses`,
-`TestCancelledSweepPreservesRecords`
-
-L5. Start grace is readyTimeout plus 5 s by construction. Existence is checked
-before grace, so an already dead start is not spared. The initial readiness wait
-is outside the flock, while the persisted record reserves its port.
-→ `TestClaimPortReturnsBeforeItsGoplsIsReady`,
-`TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`
-
-L6. Every maintenance sweep first adds this manager's delivered tools/call
-counts to the matching non-terminating records (`Uses` aged to now with a 1 h
-half-life, `UsedAt` now). It then counts lsof rows for every recorded pid,
-each pid once. A failed usage commit restores its batch alongside concurrently
-delivered counts. Duplicate PID records contribute one eviction candidate,
-ranked by their hottest record; any busy, new or terminating alias spares the
-whole process. While the total exceeds GOPLS_MANAGER_MAX_OPEN_FILES, it picks
-records in ascending aged-use order, then oldest UsedAt. Terminating records
-and records started less than 5 min ago are never picked but still count.
-Nor is a worktree with an upstream operation (beginOperation to
-endOperationLocked) that started less than 30 s ago in any manager.
-Each manager publishes the newest such start per worktree to
-`gopls-mcp-pending/<pid>` beside the map. Writes are coalesced and atomic,
-the file is removed when nothing is pending or at exit, and a file whose pid
-is gone is deleted by readers. Entries older than 30 s, or dated in the
-future, protect nothing. A picked record that probes live is checked against
-pending operations again and only then judged by identity, so it reaches
-SIGTERM only through L2. A missing or failing lsof skips the budget
-for that sweep but not the rest of it.
-→ `TestOverBudgetEvictsLeastFrequentlyUsed`, `TestFlushUsesAgesAndAddsCounts`,
-`TestFailedUsageCommitPreservesConcurrentCounts`,
-`TestMaintenanceEvictsLeastFrequentlyUsedOverBudget`,
-`TestMaintenanceSweepsWhenOpenFilesCannotBeCounted`, `TestDeliveredToolCallsCountUses`,
-`TestMaintenanceSparesServersWithFreshPendingCalls`,
-`TestBusyWorktreesAgesEntriesAndDropsDeadManagers`, `TestPublishPendingFollowsOperations`
+Readiness probes bypass proxies and redirects. Process-command and lsof output
+are bounded diagnostic observations, never authority to signal or refund slots.
+Malformed census output, including ferr/fNOFD, is rejected completely.
+→ `TestProbeDoesNotFollowRedirects`, `TestProcessIdentityRejectsSubstringMatches`,
+`TestCountOpenFilesRejectsMalformedSnapshot`, `TestParseOpenFilesRejectsDescriptorErrors`
 
 ## 9. Spawning
 
-Started as `gopls mcp -listen 127.0.0.1:<port>` with `cwd` set to the worktree
-and `setsid`, stdout and stderr appended to
-`~/.local/share/gopls-mcp-logs/<sha256(worktree)[:8]>.log`. The hash is not for
-brevity: a worktree is arbitrary bytes off the command line or out of `git`, and
-this is the one place one becomes a path this process opens for writing.
-→ `FuzzLogPath`
+P1. The owner reserves one generation and immutable FD quota, selects a port
+excluding both persisted records and concurrent starts, then starts its guardian.
+The guardian persists a manifest and inherits a stable lifetime lease before any
+child spawn. Registry publication and readiness must succeed before delivery.
+An owner-death pipe triggers autonomous guardian cleanup across an owner crash,
+including the spawn-before-registry window. Confirmation requires direct-child
+reaping, fresh anchored-group exit observation and actual guardian exit. An
+unstarted failure can refund only after released lifetime-lease reconciliation
+proves no child started. Recovery refuses unresolved manifests or busy leases;
+age and PID guesses never authorize reuse. There is one startup implementation;
+frontends never spawn gopls directly.
 
-P1. The child is **reaped**, not released. `setsid` does not reparent, so an
-unwaited gopls would stay a zombie child for the whole session — and
-`kill(pid, 0)` succeeds against a zombie, which would make step 1 of §8 report a
-dead server as alive.
+P2. Readiness polls for up to ten seconds, backing off from 10ms to100ms. Spawn
+and readiness run outside the owner mutex and readiness runs outside the registry
+lock. Concurrent callers for one worktree await the same generation. Cancelling
+a waiter cannot cancel a shared start or signal another callers process.
+→ `TestReadinessProbeHonoursCancellation`,
+`TestSupervisorTwoBridgesAndHTTPShareAndReconnectAfterIdle`
 
-P2. Readiness is polled for 10 s, backing off from 10 ms to a 100 ms ceiling —
-flat at the ceiling, a gopls that binds a few ms after the fork goes unnoticed
-for the rest of a tick, and this wait runs on the lane with H5's budget already
-running. On timeout the child is signalled
-through its `*os.Process`, which knows whether the reaper already collected it;
-a bare `kill(pid)` could land on a recycled pid.
+P2a. A successfully spawned generation that fails registry publication or
+readiness is cleaned through its guardian before that start returns: TERM,
+two seconds for cleanup proof, then KILL and another two seconds. Ordinary
+retirement never escalates. Failed cleanup retains the reservation. A partial
+guardian start retains its typed error and lease/manifest proof obligation, even
+when no child PID was learned. Reconciliation also ends its owner observer.
+→ `TestAuditRealGoplsFailedStartReapsChild`,
+`TestGuardianPartialStartReturnsRetainedCapacityContract`
 
-P2a. **Failed-child cleanup completes before return.** Send SIGTERM, wait up to
-2 s for reaping, then SIGKILL and wait up to another 2 s. This uses the owned
-process handle and its reaper's done channel, independent of request cancellation.
-The CLI and bridge shutdown therefore cannot abandon a delayed escalation.
-If exit cannot be confirmed, return an error naming the pid and retain any
-existing registry record. Once exit is confirmed, forgetting has an independent
-2 s lock-acquisition budget; a failed forget leaves a dead record for a later sweep.
-→ `TestFailedChildIsReapedBeforeReturn`
+P3. Only confirmed child/group/guardian exit releases unresolved operations.
+Failed durable registry cleanup still retains the generation and FD capacity;
+maintenance retries it. A stale completion cannot alter a replacement. Corrupt
+storage cannot reach startup or silently discard reservations.
+→ `TestSupervisorGuardianLossRetainsCapacityThroughStorageFailure`,
+`TestSupervisorCorruptRegistryNeverLosesReservations`
 
-P3. `startGopls` returns a child handle containing `*os.Process` and proof of
-reaping. Map-write failure uses the same termination procedure, since the child
-has no persisted record. Cancellation is checked before spawn; the running
-shared server is not tied to the request context.
-
-P4. **The map lock is released before the readiness wait.** Held across it, one
-cold start made every other `gopls-mcp-manager` process — and so every other
-worktree's next tool call — queue behind it for up to the full 10 s, which is
-precisely what worktree isolation produces. The record written before the lock
-is dropped is what makes this safe: it reserves the port, and L7 keeps another
-process's sweep off the server until it has bound.
-→ `TestClaimPortReturnsBeforeItsGoplsIsReady`
-
-P5. An owned gopls that never becomes ready has its record **dropped after
-confirmed exit**,
-under the lock again, rather than left for the next sweep: L7 would spare it for
-a whole grace window, during which every `ensure` for that worktree would be
-answered with a port nothing listens on. Dropped by identity rather than by
-worktree and port: §7 makes the port deterministic in the worktree, so the port
-a failed start held is the one the next start is handed, and a process delayed
-past its own grace would otherwise delete the live record that replaced its own.
-→ `TestEnsureSignalsAndForgetsAGoplsOfItsOwnThatNeverBecameReady` drives a
-  spawned-but-never-ready gopls through `ensure` and gates both halves — the
-  signal and the drop — since either alone is a leak: without the signal the
-  index outlives the map that named it (P2a), without the drop the port is
-  answered with for a whole grace window.
-  `TestForgetDropsOnlyTheNamedRecord` gates which record is dropped.
-  The readiness wait itself is a hook on the manager, so these cost a call
-  rather than the full 10 s budget.
-
-P6. **An `ensure` that did not start the gopls still waits for it, when the
-record it found is inside its start grace.** L7 vouched for that record without
-probing it, so its port can still refuse; waiting is what holding the flock used
-to do for this caller, and skipping it hands the very next dial an
-`ECONNREFUSED` for a server that was coming up perfectly. The failure belongs to
-the process that started it — that one signals and forgets — so this caller only
-reports it.
-→ `TestEnsureWaitsForAGoplsAnotherProcessIsStillStarting`,
-  `TestEnsureLeavesAnotherProcessesFailedStartAlone`,
-  `TestCancelledReadinessLeavesAnotherProcessesServerAlone`
-
-P7. Concurrent `ensure` calls for one worktree start **one** gopls between them:
-M2's `flock` covers reconciliation, allocation, spawn and the record write as
-one step, so no second caller can see the port free while a spawn is in flight.
-→ `TestConcurrentClaimPortSpawnsOnce`
-
-P8. New spawns are refused when the registry already contains
-GOPLS_MANAGER_MAX_SERVERS records (default 64), checked under the spawn lock.
-Existing endpoint reuse is allowed at capacity. Terminating and unrelated stale
-records consume capacity; `list` reconciles dead records. The cap requires all
-managers to cooperate with the same setting; it is not an RSS ceiling, does not
-count unrecorded processes and never evicts a live server.
-→ `TestSharedServerCapSerializesConcurrentManagers`
-
-P9. `status` reports per-record log bytes and aggregate log observations,
-including retired-worktree files. `trim-logs` explicitly clears all contents of
-managed regular files above GOPLS_MANAGER_LOG_TRIM_BYTES (default 64 MiB).
-It scans in batches of 128 entries, skips symlinks/unrelated names, rechecks the
-opened descriptor, and truncates without replacing the inode. Inherited append
-descriptors remain usable. Sizes are snapshots in the presence of concurrent
-writes. Nothing runs automatically; active files and accumulated small files
-have no hard disk ceiling, and no archives are retained.
-→ `TestLogTrimPreservesInheritedAppendDescriptor`,
+P4. Guardian pipes feed the bounded owner logger. Log paths use a worktree hash,
+not user path components. Offline trim-logs retains its explicit bounded scan and
+in-place truncation behavior; it must not race the active owners managed files.
+→ `FuzzLogPath`, `TestLogTrimPreservesInheritedAppendDescriptor`,
 `TestLogTrimIgnoresUnrelatedFilesAndSymlinks`, `TestRunTrimLogs`
+
+P5. Managed gopls sidecar telemetry is suppressed through a pinned dependency
+contract. The selected per-worktree Go toolchain must report the exact private
+telemetry-off directory before startup and each delivery. Incompatible contracts
+fail explicitly without changing global telemetry, HOME or GOTOOLCHAIN.
 
 ## 10. Known limits
 
-- Roots planning, like path resolution, uses one filesystem worker per router.
-  Shutdown does not wait for an uncancellable filesystem call; its worker exits
-  when the in-progress operation returns. Session churn tests exercise
-  interruptible work.
+- Production roots planning and path resolution share one owner-wide filesystem
+  worker. Shutdown does not wait for an uncancellable filesystem call, and session
+  churn cannot create replacements. Direct test seams retain router-local workers.
 
 - Routing waits are bounded even if the OS stalls a filesystem syscall, but the
   single resolver worker can remain occupied until that syscall returns.
@@ -705,68 +688,45 @@ have no hard disk ceiling, and no archives are retained.
   `TestOutputSaturationStopsSessionWithBlockedWriter`
 - Periodic and final session metrics share one output worker. Final snapshots
   follow request cleanup and get up to 100 ms to flush before shutdown returns;
-  blocked stderr may retain that one worker, but cannot block this flush
-  indefinitely. HTTP fatal errors cancel the backend before diagnostic output.
-  Other synchronous CLI/maintenance diagnostics still depend on writable stderr.
+  direct test seams can retain one blocked stderr worker. Production owner
+  diagnostics use the bounded nonblocking logger; its failure fences delivery.
+  HTTP fatal errors cancel the backend before diagnostic output.
   → `TestHTTPErrorCancelsBeforeDiagnosticWrite`,
   `TestMetricsShutdownDoesNotWaitForStderr`, `TestMetricsFinalSnapshotFollowsCleanup`
 - With execution deadlines disabled, an accepted request can wait indefinitely;
   outstanding limits bound retained requests, not execution duration.
   Cancellation or timeout cannot prove that a gopls mutation stopped.
-- Cooperating recorded spawns are capped, but shared-process RAM is not.
-  The process evictions are the open-file budget (L6) and the restart of a
-  server that missed an uncovered change (S1b). Both spare servers
-  with pending calls under 30 s old. A call landing between its final check
-  and SIGTERM, or pending longer, fails as on a dying gopls. Lanes are
-  never evicted. Cross-client attachment and operation ownership would let
-  eviction spare busy servers; see LEASES.md.
+- Managed generations and FD reservations are capped, but shared-process RAM is
+  not. O2–O5 define production idle/stale retirement and active-work protection.
+  Retained lane counts compose beneath the owner session cap; see the resource ledger below.
 - Message and frame limits bound wire data, not total heap or decoded-object
   overhead. Queued decoded results and GC high-water allocations remain outside
-  the HTTP and SSE byte budgets. Roots plans and uncovered-directory snapshots
-  scale with tree size and have no independent entry/byte ceiling. Log retention
-  requires explicit maintenance and has no aggregate disk ceiling.
+  the HTTP and SSE byte budgets. Roots planning has separate entry/path/depth,
+  filter and metadata limits and fails on incomplete observations. Managed log
+  retention has aggregate file/byte limits; unrelated files are outside its scope.
 - A terminating process that ignores SIGTERM remains recorded and blocks ensure
   for its worktree. This preserves operator visibility. Owned failed children
-  have bounded escalation; a sweeper has no owned process handle.
-- PID identity checks still race signals on POSIX. Per-port action locks
-  serialize cooperating managers but cannot make OS PID reuse atomic.
+  have bounded escalation. Production signals delegate to guardian-owned handles.
 - Loopback endpoints are unauthenticated and assume trusted local clients and
   listeners. Bind-and-close port selection does not authenticate the eventual
-  listener to the recorded child. Command-line matching is a conservative
-  cleanup check, not protection against a local actor spoofing process arguments.
+  listener to the recorded child. Diagnostic command-line matching does not
+  protect against a local actor spoofing process arguments.
   Private per-user state directories and their existing ancestors are trusted.
 - Old manager binaries ignore Terminating. Upgrade all managers sharing the map
   before relying on termination retention; mixed-version safety is not promised.
-- Duplicate records for a worktree are preserved, and ensure uses the first.
 - Worktree paths must be valid UTF-8 to round-trip through JSON.
   → `FuzzMapRoundTrip`
-- A starter failing readiness can briefly cause another caller waiting on its
-  start-grace record to fail too. Once confirmed exit is forgotten, ensure can
-  start a fresh generation.
+- Callers sharing a failed start receive its failure. A later independent call
+  can start a fresh generation after confirmed exit and durable cleanup.
 
 ## 11. Configuration and observation
 
-Environment variables are parsed when constructing the manager:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| GOPLS_MANAGER_MAX_OUTSTANDING | 1024 | Session outstanding-request ceiling |
-| GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Per-worktree outstanding ceiling |
-| GOPLS_MANAGER_MAX_LANES | 64 | Retained worktree lanes per session |
-| GOPLS_MANAGER_MAX_SERVERS | 64 | Recorded shared servers before refusing a new spawn |
-| GOPLS_MANAGER_MAX_CACHE_ENTRIES | 4096 | Entries per memo; clear on capacity rollover |
-| GOPLS_MANAGER_CACHE_TTL | 5m | Positive duration; shared lazy expiry epoch for both memo levels |
-| GOPLS_MANAGER_MAX_MESSAGE_BYTES | 4194304 | Stdio value, HTTP body, upstream POST and complete SSE-event byte ceiling |
-| GOPLS_MANAGER_HTTP_BODY_BUDGET | 67108864 | HTTP body reservations; at least one maximum-size message |
-| GOPLS_MANAGER_SSE_BUFFER_BUDGET | 67108864 | Live SSE frame capacity including temporary growth buffers; at least one maximum-size message |
-| GOPLS_MANAGER_LOG_TRIM_BYTES | 67108864 | Files above this threshold are cleared by explicit `trim-logs` |
-| GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | Total lsof rows of recorded gopls before maintenance evicts (L6) |
-| GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional post-delivery timeout |
-| GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON observations on stderr |
-| GOPLS_MANAGER_DIRECTORY_FILTERS | unset | Comma-separated gopls `directoryFilters` rules (`-docs,-**/node_modules,+docs/go`) applied after go.mod `ignore` directives (S1a) |
+Environment variables are parsed when constructing the manager. The
+[configuration table](README.md#limits-and-measurements) lists their defaults and
+meanings; resource ownership and release conditions are in the ledger below.
 
 Counts must be positive integers. Execution timeout must be a nonnegative Go
-duration. Manager metrics report lock wait/hold and probe, readiness and ensure
+duration. Manager metrics report lock wait/hold and readiness and ensure
 durations. Session snapshots every 30 s and at shutdown report request counts,
 fixed rejection reasons, cancellation/expiry counts, retained lanes and memo
 sizes, path-memo hits/misses, expiry epochs and capacity rollovers, unresolved and
@@ -780,11 +740,15 @@ local termination and shutdown cleanup, not just successful upstream answers.
 The status command is read-only, emits JSON and never invokes a sweep. It reports
 recorded server count, registry integrity, termination state and RSS in KiB when
 one bounded ps snapshot matches the recorded gopls identity, and lsof rows
-(`OpenFiles`, with their total beside the budget) under the same match. Missing measurements are null. Active
-client count is always null until cross-client accounting exists.
+(`OpenFiles`, with their total beside the budget) under the same match. A failed
+ps snapshot is discarded in full; missing measurements are null. Active
+client count for legacy records remains null. The separate Owner snapshot gives
+exact bounded generation/attachment/operation state when the owner is reachable;
+an unavailable owner reports an error rather than an invented zero.
 Log observations include per-record sizes and aggregate managed-log bytes,
 file count, largest size and count above the trim threshold.
-→ `TestStatusMeasuresWithoutChangingRegistry`
+→ `TestStatusMeasuresWithoutChangingRegistry`,
+`TestStatusRejectsFailedProcessSnapshot`
 
 Stdio uses a direct, case-sensitive parser for complete scalar messages; the
 pinned SDK still handles writes, batch correlation and fallback validation.
@@ -835,7 +799,14 @@ move with their packages, while the root retains integration and lifecycle tests
 
 `http [address [path]]` exposes `/mcp` using the SDK's stateless Streamable HTTP
 handler with JSON responses. Defaults are `127.0.0.1:6099` and home `.`; only
-loopback listeners are accepted. Existing stdio behavior remains available.
+loopback listeners are accepted. The public listener validates the original Host
+as a numeric loopback address or `localhost` before any proxy rewriting. Go's
+cross-origin protection rejects unsafe browser requests using Origin and
+Sec-Fetch-Site before forwarding or allocating an HTTP backend; failures return
+403 with the normal bounded write deadline. Nonbrowser clients without those
+headers remain supported. These checks do not authenticate arbitrary local
+processes. Existing stdio behavior remains available.
+→ `TestSupervisorHTTPRejectsUntrustedBrowserRequests`, `TestLoopbackHTTPProtection`
 
 The HTTP frontend terminates protocol negotiation locally and exposes gopls
 tools through `tools/list` and `tools/call`. Home initialization supplies gopls's
@@ -908,3 +879,82 @@ field names; differently cased manual entries no longer match those fields.
 Zero-valued optional record fields use `omitzero`. Nil maps and slices use v2's
 empty-object/empty-array defaults. SDK encoding remains an upstream dependency;
 the HTTP adapter explicitly retains an empty tool arguments object.
+
+## Resource ownership and evidence ledger
+
+Audit baseline `0437e95`; implementation uses Go1.27.4/gopls0.23.0 on Darwin and
+Linux. This inventory records bounded resources and exercised failure paths. It
+does not prove absence of all bugs. Formal lifecycle invariants, runtime tests,
+fuzzing and long-session measurements are separate evidence layers.
+
+### Findings and response
+
+Audit findings R1–R9 concern socket admission, removed pending-file state,
+registry bounds, helper output, watch planning, log retention, FD reservations,
+persistent idle authority and guardian recovery, respectively. Their current
+contracts and residual limits are in the resource ledger below; normative
+invariants above and [formal runtime conformance](formal/README.md#runtime-conformance) name the runtime evidence.
+
+Cancellation rejects fractional/out-of-range decoded numeric IDs before SDK
+conversion; `testdata/fuzz/FuzzCancelTarget/` retains the minimized counterexample.
+Regressions cover both signs, zero and range boundaries. SDK float64 precision
+remains a compatibility boundary. Uncertain caller Writes never replay and keep
+credits until response/confirmed exit (F1); independent retries may still duplicate
+execution. Stale transports reconnect before the first fresh call.
+
+Managed log paths refuse symlinks, hardlinks and aliases; queue/storage failure
+fences owner delivery. Original counterexamples remain in Git history.
+
+### HTTP browser boundary
+
+The [HTTP contract](#stateless-http-frontend) requires original loopback Host and
+cross-origin checks before proxy rewriting/backend admission. Regressions verify
+403 with the normal write deadline, no backend allocation/completion-clock change,
+and supported IPv4/IPv6, localhost, same-origin and nonbrowser clients. Local
+process authentication and the trusted-project/OS boundaries remain unchanged.
+
+### Resource ledger
+
+All defaults are configurable as documented in README/SPEC. Input, wire-capacity
+and object-count limits are not byte-exact heap or RSS guarantees.
+
+| Resource | Owner/scope; admission cap | Release/evidence | Residual limit |
+| --- | --- | --- | --- |
+| Frontends/backend cache | One persistent owner;16 combined attachments and retained HTTP backends, including failed/closing entries until active handlers and actual teardown finish | Socket EOF/close; idle or failed-backend retirement independently of recent retries; one teardown owner rejects closing-entry reuse; protocol/config mismatch refuses before allocation; real backend-failure/reinit and blocked-teardown synctest regressions | Public frontend processes and their bounded sockets remain local OS processes; clients are trusted local callers |
+| Generations | Owner map;64 including starting/draining/uncertain/exited-but-storage-pending | Guardian child/group/actual guardian exit plus durable registry removal; never signal/EOF alone | Ignored TERM or uncertain cleanup intentionally consumes capacity; operator repair may be needed |
+| Global operations | Owner map;1024 combined queued, caller, private handshake and server-control identities | Definitive response or proven pre-delivery rejection; generation teardown clears unknown work | Long active work has no default execution deadline; abandoned grace permits whole-generation recovery, not a false completion |
+| Retained payloads | Shared64MiB maximum-message reservations covering ingress/delivery, output and cancellation advisories; string IDs≤1024bytes, retained initialize≤64KiB | Queue consumption/discard or actual Write return; cancellation does not refund queued objects; blocked-writer/churn synctest regressions | Reservation is conservative payload capacity, not decoded-object/GC/serialization heap. Transient readers remain bounded by session/lane/frame/socket products |
+| Router queues/lanes |≤16 retained owner frontend slots;64 ingress/delivery/control/output entries and64 lanes per router;128/worktree and1024 session request caps | Lane shutdown drains payloads, contexts close transports, unknown owner credits survive router teardown | Small queue/control structures and transient decoded objects compose beneath explicit count caps |
+| Memos | Router;4096 path and4096 directory entries, shared lazy5m epoch | Capacity rollover/expiry/router retirement | Path spelling bytes inherit bounded messages; idle heap may await GC |
+| Filesystem execution | One unbuffered owner-wide worker | Context cancels caller; one active uninterruptible syscall may remain | No replacement workers across session churn. Kernel filesystem calls are not universally cancellable |
+| Output/diagnostics | Socket writes bounded by context/deadlines/Close; owner diagnostics use bounded logger | Actual return/teardown; full terminal output fails session, never silent usable-session loss | One blocked synthetic/direct-test output can remain; its payload stays globally charged |
+| HTTP body/exchanges | Owner-global min(session,64MiB/4MiB)=16 before handler body decode | Exchange return, including slow response writes;16KiB headers,5s header/30s read/30s response-write ceilings | SDK/result decoded objects and framing scratch are additional bounded products, not exact byte accounting |
+| HTTP sockets |128 owner accepted connections plus one transient excess; frontend listener also bounded | Close/idle60s/header deadline; accepted excess closed before new reader goroutine | Local frontend process multiplication is outside owner process FD quota but active owner attachments remain capped |
+| SSE wire buffers | One owner-shared64MiB capacity budget;4MiB complete event/POST | Transport frame release/Close; SSE lifecycle/budget tests | Completed decoded results leave wire budget and enter retained-message budget; decoder/GC peaks are additional |
+| FD reservations | Owner transport/control formula plus per-generation watched-tree count+256 child headroom+64 guardian/observer | Only clean unstarted failure or confirmed retirement refunds; kernel RLIMIT_NOFILE enforced in owner/child | Does not constrain every arbitrary project descendant, RSS or kernel watch bytes. Budget exhaustion fails admission |
+| Watch plans | Owner manager;≤generation cap keys;100k entries/32MiB names+paths/depth128/4096roots/16384partials; metadata256files/16MiB; filters1024/1MiB | Replaced per generation and pruned on confirmed exit; incomplete plan never published | Worktree mutation can invalidate snapshot; uncertainty preserves generation until a complete verdict |
+| Registry | One read/temp descriptor per operation;4MiB/4001lines/64KiB scanner token | Close/unlink/atomic rename; failure preserves full prior contents, no probe/signal from uncertain rows | fsync/rename can block; crash can leave temp inode; private ancestor directories trusted |
+| Lifetime/action locks/manifests | Stable per-port namespaces over4001ports; bounded manifest recovery scan | Descriptors close; lock inodes intentionally retained; manifest removed only on proof | Historical pre-upgrade lock/temp files need explicit offline cleanup; no PID/age adoption fallback |
+| Logs | One process-global worker;128 jobs/≤1MiB allocated queued+active payload; owner64MiB disk and≤server cap+1 files | Bounded retention, serialized append, confirmed generation release, one terminal failure channel | Snapshot counters approximate active append; external mutation fails detection on touched files. Sole managed writer required |
+| Usage/pending mirrors | Removed | Owner operation accounting replaces advisory activity files and sampled LFU | Old writers must be stopped before migration |
+| Helper commands | Bounded stdout64KiB/4MiB, stderr64KiB, derived deadline and250ms pipe wait delay | Cancel/reap direct child on overflow/error; no partial snapshots | Arbitrary escaped helper grandchildren need OS containment; direct-child proof is not a universal process-tree proof |
+| Telemetry | Managed gopls pinned contract suppresses sidecar; shared private mode-off metadata | Checked selected Go reports off/exact directory before spawn and delivery; actual Go/gopls integration | Internal compatibility contracts are explicit and fail on mismatch; external caches/global user telemetry untouched |
+
+### Evidence and remaining work
+
+The registry churn suite observes `/dev/fd` across256 failed registry cycles,
+64 cancelled lock waits in private state. Pending-file churn coverage was retired
+with that unreachable subsystem; owner startup failure and lease-reconciliation
+regressions cover the remaining reservation lifecycle.
+The boundary/error suite covers FIFO/symlink/nonregular/corrupt input and verifies
+no eviction signal on uncertain activity. Supervisor pure concurrency/idle tests
+use testing/synctest with in-memory storage; real socket/process tests stay outside
+fake-time bubbles. Formal artifacts live in formal/ and are checked separately.
+
+Audit evidence is saved outside the repository under
+`~/.codex/artifacts/gopls-audit/` (resources, guardian, logging, reviews and owner
+logs). Native Linux/macOS evidence and owner runtime coverage must accompany the
+final audit report. Default-duration zero-client idle checks and24h/72h soaks are
+still pending this implementation checkpoint; no long-soak conclusion is claimed.
+Arbitrary trusted-project escaped subprocesses, external toolchain/cache growth
+and universal POSIX descendant containment remain explicit OS boundary assumptions.

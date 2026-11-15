@@ -44,12 +44,38 @@ Commands:
 | `gopls-mcp-manager http [address [path]]` | Serve stateless MCP at `/mcp`; defaults to `127.0.0.1:6099` and home `.` |
 | `gopls-mcp-manager [bridge [path]]` | Run the stdio bridge. Default; `path` defaults to `.` and needs the `bridge` word before it |
 | `gopls-mcp-manager ensure [path]` | Start (or find) the gopls for `path`'s worktree, print its port |
+| `gopls-mcp-manager supervisor` | Run the persistent owner in the foreground for startup diagnostics |
 | `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
 | `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS, termination state and log sizes |
 | `gopls-mcp-manager trim-logs` | Discard contents of managed log files above the configured threshold, preserving append descriptors |
 
 `path` is resolved to the root of the worktree containing it, with symlinks
 removed. The worktree the bridge starts in is its **home**.
+
+### Shared owner and reclamation
+
+Bridge, HTTP and `ensure` share one persistent owner and one gopls generation per
+worktree. It survives zero clients and checks retirement every 30 seconds, using
+`GOPLS_MANAGER_IDLE_TIMEOUT` (default `1h`) for idle and abandoned-work grace.
+Quiet connections do not pin gopls; a fresh call reconnects before delivery.
+Cancellation, timeout, disconnect and lost acknowledgements retain remote credits
+until response or confirmed exit. Ordinary retirement sends SIGTERM and waits ten
+seconds; ignored TERM, uncertain guardians and storage failures remain counted.
+See [SPEC](SPEC.md#persistent-owner-contract) for recovery and failed-start rules,
+the [limits table](#limits-and-measurements) for configuration and the
+[resource ledger](SPEC.md#resource-ledger) for remaining OS/memory limits.
+
+Stop legacy managers and gopls before migration; adoption is refused. Frontends
+must match owner limits/protocol. The private versioned socket lives under
+`/tmp/gopls-mcp-owner-<uid>-<registry-hash>`, independent of TMPDIR/HOME length;
+its singleton lock is beside the registry. Budgets do not cap total RSS or
+universally contain escaped project descendants.
+
+Managed gopls disables its telemetry sidecar with `GO_TELEMETRY_CHILD=2`. Delegated
+Go must report the exact private `TEST_TELEMETRY_DIR` and telemetry `off` before
+startup and each request; incompatible toolchains fail. Global telemetry, HOME
+and GOTOOLCHAIN are preserved. `status` reports generations, completion/idle
+deadlines, attachments, operation/FD reservations and log failures.
 
 ### Stateless HTTP
 
@@ -62,7 +88,10 @@ gopls-mcp-manager http 127.0.0.1:6099 /absolute/path/to/repo
 Configure your MCP client's Streamable HTTP server URL as
 `http://127.0.0.1:6099/mcp`. The endpoint accepts MCP POST requests and returns
 JSON responses. It issues no session ID and ignores supplied session IDs;
-GET and DELETE return 405. The listener is restricted to loopback. These stateless
+GET and DELETE return 405. The listener is restricted to loopback. Public HTTP
+requests require a numeric loopback or `localhost` Host; browser cross-origin
+POSTs are rejected before proxy rewriting or backend admission. Local MCP clients
+without browser headers remain supported. These stateless
 guarantees assume the SDK compatibility override
 `MCPGODEBUG=allowsessionsinstateless=1` is not enabled; that trusted environment
 setting restores the SDK's legacy session-header and DELETE behavior.
@@ -95,9 +124,15 @@ Each exchange reserves a maximum-size body allowance until its response finishes
 including chunked and slow requests; excess exchanges receive HTTP 503.
 Bodies are limited to 4 MiB by default, header/body reads
 to 5/30 seconds, and response writes to 30 seconds after the response starts.
-Long tool execution uses the existing optional execution timeout. Shutdown closes
-internal SSE connections and cancels calls, while shared gopls processes remain
-available to other managers. The default command still runs stdio.
+Long tool execution uses the optional execution timeout, with no separate proxy
+response-header deadline before a JSON tool result is ready. Ping, startup,
+attachment and management queries retain explicit bounded control budgets.
+A failed cached HTTP backend returns an explicit error and retires independently
+of idle age or repeated traffic. It remains charged until active handlers and
+teardown finish; a later independent request can initialize a fresh backend.
+Stopping an HTTP frontend
+closes its attachment; the persistent owner retains shared gopls until completion
+or retirement. The default command still runs stdio.
 
 ## Routing
 
@@ -138,13 +173,15 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
   `roots/list` itself. Any other server-initiated request is refused with
   `method not found`. Replies have a 30 s write ceiling (or the shorter remaining
   handshake deadline); a failed reply closes that connection and fails its calls.
-- **A dying gopls does not end the session**, not even home. The bridge redials,
-  replays the handshake and retries once; calls that were in flight when it died
-  come back as errors rather than hanging, since MCP clients have no timeout.
+- **A dying gopls does not end the session**, not even home. A known retired
+  connection is replaced before the next caller write. An actual write that
+  fails ambiguously returns an explicit "may have executed" error and is never
+  transparently replayed. In-flight calls fail rather than hang. Clients that
+  independently retry can still execute a mutation again.
 - **Each worktree gets its own lane**, so starting a cold worktree — a lock wait,
   a `gopls` spawn, a handshake — costs that worktree's calls and nobody else's.
 - **After routing, each message has a 30 s delivery budget**, including lane queue time,
-  lock acquisition, readiness, handshake and retry. An expired queued call
+  lock acquisition, readiness and handshake. An expired queued call
   cannot start a server. Filesystem syscalls cannot be interrupted by a Go
   context, and failed-child cleanup has a separate short budget. The budget
   is separate from the optional post-delivery execution timeout described below.
@@ -158,8 +195,8 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 - **Delivered operations retain a separate credit until an upstream response.**
   Local cancellation, execution timeout and connection failure release client
   tracking but retain that credit. Both sets use the outstanding limits above;
-  uncertain retries consume another operation credit. A cancellation-ignoring
-  server therefore cannot accept unlimited replacements through one router.
+  the owner also retains credits across frontend teardown. A cancellation-ignoring
+  server cannot accept unlimited replacements through session churn.
 - The bridge stops when the stdio client goes away, or on `^C` / `SIGTERM`.
   It waits for owned failed-child cleanup before exiting: SIGTERM, up to 2 s,
   then SIGKILL and up to 2 s to confirm exit. A failed child's record is removed
@@ -173,13 +210,19 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 | GOPLS_MANAGER_MAX_OUTSTANDING_PER_LANE | 128 | Outstanding calls per worktree |
 | GOPLS_MANAGER_MAX_LANES | 64 | Retained worktree lanes per session; existing lanes remain usable at capacity |
 | GOPLS_MANAGER_MAX_SERVERS | 64 | Recorded shared servers allowed before a new spawn; existing servers remain reusable |
+| GOPLS_MANAGER_MAX_HTTP_CONNECTIONS | 128 | Accepted HTTP sockets, capped before parsing headers |
+| GOPLS_MANAGER_MAX_OWNER_SESSIONS | 16 | Combined frontend attachments and cached HTTP backends |
+| GOPLS_MANAGER_MAX_OWNER_OPERATIONS | 1024 | Global queued/unconfirmed operations including handshakes and controls |
+| GOPLS_MANAGER_IDLE_TIMEOUT | 1h | Positive idle and abandoned-work grace duration |
+| GOPLS_MANAGER_MAX_LOG_BYTES | 67108864 | Aggregate managed log retention, including retired worktrees |
+| GOPLS_MANAGER_RETAINED_MESSAGE_BUDGET | 67108864 | Owner-wide retained-message reservations; at least one maximum-size message |
 | GOPLS_MANAGER_MAX_CACHE_ENTRIES | 4096 | Entries in each path/directory memo; a full memo clears before inserting |
 | GOPLS_MANAGER_CACHE_TTL | 5m | Positive duration; both memo levels expire together, lazily on access or metrics snapshots |
 | GOPLS_MANAGER_MAX_MESSAGE_BYTES | 4194304 | Maximum stdio JSON value (including preceding whitespace), HTTP body, upstream POST and complete SSE event |
 | GOPLS_MANAGER_HTTP_BODY_BUDGET | 67108864 | Maximum reserved HTTP request-body bytes; must hold at least one maximum-size message |
 | GOPLS_MANAGER_SSE_BUFFER_BUDGET | 67108864 | Shared live SSE frame capacity, including replacement buffers during growth; at least one maximum-size message |
-| GOPLS_MANAGER_LOG_TRIM_BYTES | 67108864 | `trim-logs` clears files larger than this; no automatic trimming |
-| GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | lsof rows of all recorded gopls together; maintenance evicts the least frequently used servers above it |
+| GOPLS_MANAGER_LOG_TRIM_BYTES | 67108864 | Offline `trim-logs` threshold |
+| GOPLS_MANAGER_MAX_OPEN_FILES | 30000 | Owner, guardian and child FD reservations enforced before spawn |
 | GOPLS_MANAGER_EXECUTION_TIMEOUT | 0s | Optional timeout after delivery; 0 disables it |
 | GOPLS_MANAGER_METRICS | unset | Set to 1 for JSON metrics on stderr |
 | GOPLS_MANAGER_DIRECTORY_FILTERS | unset | Comma-separated gopls `directoryFilters` rules, e.g. `-docs,-**/node_modules,+docs/go`; applied after each worktree's go.mod `ignore` directives to the roots gopls watches |
@@ -202,12 +245,12 @@ blocked readers after their operation credits have been released. Transient
 bursts can also reach this limit. Choose the execution timeout to accommodate
 long diagnostics and vulnerability scans.
 
-Late terminal results release abandoned-operation credits. A lost connection
-cannot supply such proof, so its credits remain charged until this router shuts
-down. Same-ID reuse on that connection is rejected while the old operation is
-unresolved. Restarting a manager resets its accounting; it does **not** prove old
-work stopped. These limits do not coordinate operations across multiple managers.
-An exhausted router may need operator recovery after establishing upstream state.
+Late terminal results release abandoned-operation credits. The persistent owner
+keeps those credits across router shutdown until a response or confirmed process
+exit. It enforces global and per-session/worktree limits in one ledger. Same-ID
+reuse on a connection is rejected while its old operation is unresolved. Local
+waiters, payload reservations and remote credits have separate lifetimes; owner
+restart uses guardian manifests and leases to preserve uncertain reservations.
 
 Metrics include registry lock wait/hold and manager probe, readiness and ensure
 durations. Session snapshots every 30 s and at exit report request counts,
@@ -222,13 +265,6 @@ require writable stderr. MCP stdout stays protocol-only. The status command repo
 only when the process identity matches; one bounded ps snapshot covers the
 recorded PIDs. Missing values and active-client counts are null rather than
 guessed. Status never signals a process or rewrites the map.
-
-New shared spawns are refused at the configured recorded-server ceiling under
-the registry lock. Terminating and stale unrelated records consume capacity;
-run `list` to reconcile dead records. All managers sharing the map must run this
-version with the same ceiling. Older binaries, unrecorded servers and differing
-settings can bypass the policy. The ceiling bounds cooperating recorded spawns,
-not RSS. Existing records remain reusable even above a lowered ceiling.
 
 ### Open-file budget
 
@@ -261,27 +297,13 @@ only where a `+` rule can reach, so a `+` rule with a `**` segment is the one
 that costs a full walk of the tree.
 
 
-Every maintenance sweep (startup, then every 30 s in each bridge/HTTP manager)
-counts the lsof rows of every recorded gopls. While the total exceeds
-GOPLS_MANAGER_MAX_OPEN_FILES, it terminates servers in least-frequently-used
-order through the usual identity-checked termination path. Each manager adds its
-delivered `tools/call` count to the shared record (`Uses`, `UsedAt`), and the count
-halves every hour, so every manager ranks servers the same way. Servers younger
-than five minutes, and terminating ones, are never chosen, though they still count
-toward the total. Neither is a server with a pending upstream call that started
-less than 30 s ago, in any manager. Each manager mirrors its pending operations
-into `~/.local/share/gopls-mcp-pending/<pid>`, and the sweep checks the set
-again just before the termination verdict. Older pending calls do not protect a
-server, since a lost connection never resolves its call. An evicted worktree
-restarts on its next call, which pays a cold index. A call that arrives between
-that final check and SIGTERM, or one pending for more than 30 s, fails like a
-call on a dying gopls. If lsof is missing or fails, the budget is skipped for that
-sweep. `status` reports per-server and total `OpenFiles`. The budget is checked
-between sweeps, not enforced on every spawn, and gopls' telemetry child is not counted.
-
-Lanes are not evicted. [LEASES.md](LEASES.md) describes cross-client attachment
-and operation ownership, which would let eviction spare servers with work in
-flight. SPEC.md contains the behavioral contract.
+The persistent owner checks stale watches and deleted worktrees every 30 seconds.
+Admission and retirement share a lock: queued or active work protects its
+generation, and a draining generation cannot accept a new write. A replacement
+waits for confirmed exit. FD reservations and kernel quotas enforce descriptor
+admission before spawn; lsof observations remain diagnostic. Legacy pending-file
+and popularity-based sweep helpers remain for explicit management/tests and do
+not authorize owner cleanup. [SPEC.md](SPEC.md#persistent-owner-contract) describes current ownership.
 
 ## State on disk
 
@@ -302,61 +324,33 @@ same tree tends to get the same port, then probed forward until one is free.
 
 `status` reports per-record log sizes and aggregate bytes, largest file, file
 count and oversized count, including logs left after a record disappears.
-`trim-logs` clears the **entire contents** of managed regular `.log` files above
+The owner automatically retains managed logs within its aggregate byte/file cap.
+Children write through guardian pipes into the bounded owner logger and do not
+inherit append file descriptors. Do not mutate managed logs while the owner runs:
+changed file identity/size fails the logger and fences delivery.
+Offline `trim-logs` clears the **entire contents** of managed regular `.log` files above
 64 MiB by default; save wanted diagnostics first. It scans in bounded batches,
 skips unrelated names and symlinks, and truncates in place without renaming or
-unlinking. Shared children keep their inherited `O_APPEND` descriptors and
-continue logging after the manager exits or a trim occurs. Output reports sizes
+unlinking. Output reports sizes
 observed before trimming and bytes observed in files cleared; concurrent writes
-make these snapshots approximate. There is no background log trimming or hard
-disk ceiling: arrange an operator-controlled trim cadence if needed. No archives
-are retained, and files below the threshold are left alone.
+make these snapshots approximate. No archives are retained.
 
 The file is meant to be readable and repairable by hand. A line that cannot be
-parsed, or whose fields are out of range, is skipped rather than fatal — every
-command reads this file, so one bad line must not lock you out of the tool. The
-next write drops it. The exception is a line over 64 KiB, which fails the read
-naming the file: skipping it would hide records the next write then drops
-without killing their processes, stranding the indexes below.
+parsed, or whose fields are out of range, fails the complete read without
+rewriting anything. Blank lines are harmless but consume input budget. Reads
+are capped at 4 MiB, 4001 lines and scanner's 64 KiB line limit; writers reject
+an encoded record above 65535 bytes. Symlinks/nonregular state are refused.
+Errors name the file, never its contents. Repair corrupt state explicitly:
+silently discarding uncertain reservations could orphan a live index.
 
-## Liveness and killing
+## Legacy migration
 
-A record is the only handle anyone has on its gopls, so dropping one without
-killing the process strands a full workspace index — routinely 1–2 GB resident —
-that no longer appears in `list`, still holds its port, and lives until reboot.
-
-A record is therefore checked on several counts before it is dropped, and the
-process is signalled when it is. Acquisition checks only records for the requested
-worktree; unrelated records continue reserving their ports. Startup performs a
-full sweep before admission, and running bridge/HTTP managers repeat it every
-30 seconds so deleted temporary worktrees do not strand indexes. Run `list` for
-immediate liveness reconciliation; open-file eviction, deleted-worktree cleanup,
-and stale-watch restarts run at startup and on the maintenance timer.
-Existing worktrees with healthy servers
-remain shared; this is not idle eviction. Probes run outside
-the global registry lock. Reconciliation applies verdicts only to unchanged
-record identities:
-
-1. `kill(pid, 0)` — is anything there at all?
-2. A record younger than 15 s is kept unprobed. A gopls between fork and bind
-   refuses every probe, and refusal is the one verdict that kills.
-3. An HTTP probe of the recorded port. **Connection refused is the only
-   conclusive verdict.** A timeout is not — that is also what a gopls indexing a
-   large tree looks like — nor is an answer we did not want, nor any other dial
-   failure, which says something about this process rather than the server.
-4. `ps` must still show that pid running a gopls with *our* listen address, since
-   the map survives reboots that recycle every pid in it.
-
-Probes report live, uncertain, terminate or gone without signalling. Termination
-is persisted as `Terminating: true` before an action lock and fresh identity check
-permit SIGTERM. A successful signal does not remove the record: later sweeps must
-confirm that the old process is gone. Ensure refuses terminating endpoints and
-does not spawn beside them. A process ignoring SIGTERM stays discoverable.
-
-Update all manager binaries sharing the registry before relying on this field;
-older versions ignore it. Shared-process sweep cleanup does not escalate to
-SIGKILL. The manager's own failed children retain their bounded escalation and
-reaping behavior. SPEC.md §8 describes reconciliation and identity safeguards.
+Production generations are owned and reaped through guardians. Stop old manager
+binaries and their gopls processes before migration. The new binary does not
+adopt or automatically signal legacy processes. Without a live owner, list
+refuses a nonempty registry and directs you to explicit offline cleanup; status
+remains read-only. Do not remove reservations until their processes and guardian
+state have been reconciled. See [SPEC.md](SPEC.md#persistent-owner-contract) for recovery rules.
 
 ## Development
 
@@ -384,17 +378,17 @@ Root files group related responsibilities:
 | File | Responsibility |
 | --- | --- |
 | `main.go` | CLI commands and startup |
+| `supervisor*.go`, `guardian*.go`, `ownerlog.go` | Persistent authority, private frontends, process/group ownership and bounded logs |
 | `bridge.go`, `http.go` | Router construction, stdio sessions/upstream replies, and HTTP frontend |
-| `routing.go`, `paths.go` | Admission, routing decisions, bounded resolution, and path memos |
+| `routing.go` | Admission, routing decisions and bounded resolution |
+| `paths.go` | Path/worktree resolution, canonicalization and memos |
 | `lane.go`, `requests.go` | Per-worktree delivery, cancellation, and request/operation accounting |
-| `manager.go`, `registry.go` | Shared server acquisition and durable registry reconciliation |
-| `process.go`, `probe.go` | Child lifetime and conservative process/endpoint identity checks |
-| `maintenance.go`, `pending.go` | Open-file eviction and cross-manager pending-operation protection |
+| `registry.go` | Configuration, port selection, bounded durable registry storage |
+| `process.go` | Readiness and read-only process/descriptor diagnostics |
 | `status.go` | Status snapshots and explicit log trimming |
 
-Transport scalar decoding stays with stdio framing; shared SSE frame accounting
-stays with SSE framing. Small test-only routing and registry helpers live in
-`main_test.go`. File consolidation does not change package or lifetime boundaries.
+Transport decoding and buffer accounting stay in `internal/transport`. Shared
+test fixtures live in `main_test.go` and `bridge_test.go`.
 
 Project JSON uses strict `encoding/json/v2` and `encoding/json/jsontext`:
 field names are case-sensitive, duplicate names and invalid UTF-8 are rejected,
@@ -450,17 +444,18 @@ go test -run '^$' -fuzz '^FuzzDirectoryFilterPrecedence$' -fuzztime=60s .
 go test -run '^$' -fuzz '^FuzzSSEFrameBudget$' -fuzztime=60s ./internal/transport
 ```
 
-Roots planning uses one worker per router, and callers share their reply deadline
-with planning. An uncancellable filesystem call can retain that single worker
-until it returns. Module metadata larger than 4 MiB or resolving to a nonregular
-file contributes no ignore filters; symlinks to regular files remain supported.
-Filter rules are limited to 4096 bytes. Invalid UTF-8 environment rules fail
-startup; invalid decoded module ignore paths are skipped safely.
+Production roots planning and resolution share one owner-wide filesystem worker,
+and callers share their reply deadline with planning. Uncancellable filesystem
+calls retain that worker without replacement. Planning fails explicitly on
+oversized/nonregular metadata, I/O errors or exhausted aggregate budgets; symlinks
+to regular metadata files remain supported. Defaults cap 100000 entries,
+32 MiB paths/names, depth 128, 4096 roots, 16384 partial snapshots, 256 metadata
+files/16 MiB aggregate, and 1024 filters/1 MiB aggregate. Individual filters are
+limited to 4096 bytes. Invalid UTF-8 rules fail startup.
 Upstream SSE uses direct HTTP loopback connections, same-origin endpoint events,
 and no redirects. Readiness probes likewise bypass proxies and refuse redirects.
-These limits do not bound decoded heap or shared gopls RSS. Roots plans and
-watch snapshots scale with tree size; logs have explicit trimming and no aggregate
-retention ceiling. Loopback listeners and existing private state directories are
+These limits do not bound total decoded heap or shared gopls RSS. Managed logs
+have aggregate retention. Loopback listeners and existing private state directories are
 trusted: the service does not authenticate a TCP listener to its recorded child.
 
 The bridge tests run under `testing/synctest`, whose clock only moves once every

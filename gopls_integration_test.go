@@ -4,13 +4,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json/jsontext"
+	"io"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,10 +26,11 @@ import (
 // Opt-in because this starts real gopls processes and requires gopls on PATH.
 // Every process uses a disposable repository and private registry, and is
 // explicitly reaped; integration runs never touch the user's shared servers.
-func realGoplsFixture(t testing.TB) (*manager, string, string) {
+func realGoplsFixture(t testing.TB) (*supervisor, string, string) {
 	t.Helper()
-	_, err := exec.LookPath(goplsBinary)
+	binary, err := exec.LookPath(goplsBinary)
 	require.NoError(t, err, "integration tests require gopls on PATH")
+	require.NoError(t, guardianCheckTelemetry(binary))
 	root, linked := newLinkedWorktree(t)
 	for dir, marker := range map[string]string{root: "RootMarker", linked: "LinkedMarker"} {
 		mustWriteFile(t, filepath.Join(dir, "go.mod"), "module example.com/fixture\n\ngo 1.27\n")
@@ -34,16 +38,35 @@ func realGoplsFixture(t testing.TB) (*manager, string, string) {
 		mustWriteFile(t, filepath.Join(dir, "fixture.go"), "package fixture\n\nvar _ = "+marker+"\n")
 	}
 	m := newTestManager(t)
-	m.start = func(ctx context.Context, worktree string, port int) (*childProcess, error) {
-		child, err := m.startGopls(ctx, worktree, port)
-		if err == nil {
-			t.Cleanup(func() {
-				assert.NoErrorf(t, child.stop(), "gopls cleanup")
-			})
+	m.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
+	logs, err := newOwnerLog(t.Context(), filepath.Dir(m.logPath("")), m.limits.SharedServers+1, int64(m.limits.OwnerLogBytes))
+	require.NoError(t, err)
+	m.ownerLogs = logs
+	t.Cleanup(logs.Close)
+	ctx, cancel := context.WithCancel(t.Context())
+	owner := newSupervisor(ctx, &m)
+	owner.start = func(ctx context.Context, worktree string, port, quota int) (*guardianChild, error) {
+		if err := m.validateManagedToolchain(ctx, worktree); err != nil {
+			return nil, err
 		}
-		return child, err
+		config := guardianConfig{Version: guardianProtocol, Worktree: worktree, Port: port, Token: rand.Text(), Command: binary,
+			Args: []string{"mcp", "-listen", mcpAddress(port)}, MaxOpenFiles: quota,
+			ExecArgs: []string{"-test.run=^TestGuardianHelperProcess$", "--", "guardian-child"}}
+		config.StatePath = filepath.Join(guardianStateDir(&m), "guardian-"+config.Token+".json")
+		command := exec.Command(os.Args[0], "-test.run=^TestGuardianHelperProcess$", "--", "guardian")
+		command.Env = append(os.Environ(), "GOPLS_GUARDIAN_TEST_HELPER=1")
+		sink, err := logs.Sink(m.logPath(worktree))
+		if err != nil {
+			return nil, err
+		}
+		return startGuardianCommand(ctx, config, sink, command)
 	}
-	return &m, root, linked
+	t.Cleanup(func() {
+		cancel()
+		owner.shutdown()
+		require.Eventually(t, func() bool { return len(owner.snapshot().Generations) == 0 }, 15*time.Second, 10*time.Millisecond, "owned real gopls/guardian cleanup did not finish")
+	})
+	return owner, root, linked
 }
 
 func TestEndToEndRealGopls(t *testing.T) {
@@ -85,7 +108,7 @@ func TestEndToEndRealGopls(t *testing.T) {
 			}
 		})
 	}
-	records, _, err := readMap(m.mapPath)
+	records, _, err := readMap(m.m.mapPath)
 	require.Truef(t, err == nil && len(records) == 2, "two frontends must share two worktree servers: records=%+v, error=%v", records, err)
 }
 
@@ -115,17 +138,16 @@ func BenchmarkRealGoplsRoundTrip(b *testing.B) {
 func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 	t.Parallel()
 	m, root, linked := realGoplsFixture(t)
-	m.pending = newPendingCalls()
-	m.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
-	m.limits.DirectoryFilters = []string{"-excluded"}
+
+	m.m.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
+	m.m.limits.DirectoryFilters = []string{"-excluded"}
 	require.NoError(t, os.Mkdir(filepath.Join(root, "excluded"), 0o700))
-	other := *m
-	other.pending = newPendingCalls()
-	other.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
+	other := m
+
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	first := newHTTPBackend(ctx, m, root)
-	second := newHTTPBackend(ctx, &other, root)
+	second := newHTTPBackend(ctx, other, root)
 	first.start()
 	second.start()
 	defer first.close()
@@ -136,7 +158,7 @@ func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 	}
 	require.NoError(t, <-initialized)
 	require.NoError(t, <-initialized)
-	records := mustReadMap(t, m.mapPath)
+	records := mustReadMap(t, m.m.mapPath)
 	require.Len(t, records, 1, "simultaneous clients must share one child")
 	old := records[0]
 	call := func(b *httpBackend, file, marker string) error {
@@ -151,22 +173,22 @@ func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 	}
 	require.NoError(t, call(first, filepath.Join(root, "fixture.go"), "RootMarker"))
 	require.NoError(t, call(second, filepath.Join(linked, "fixture.go"), "LinkedMarker"))
-	require.Len(t, mustReadMap(t, m.mapPath), 2, "linked worktree must get its own shared child")
+	require.Len(t, mustReadMap(t, m.m.mapPath), 2, "linked worktree must get its own shared child")
 	require.Eventually(t, func() bool {
-		m.watch.mu.Lock()
-		defer m.watch.mu.Unlock()
-		return len(m.watch.plans[root].partial) > 0
+		m.m.watch.mu.Lock()
+		defer m.m.watch.mu.Unlock()
+		return len(m.m.watch.plans[root].partial) > 0
 	}, time.Second, time.Millisecond)
 	// Exercise the real start-grace policy rather than rewriting process identity.
-	require.NoError(t, waitContext(ctx, time.Until(time.Unix(old.StartedAt, 0).Add(startGrace))))
+
 	mustWriteFile(t, filepath.Join(root, "added.go"), "package fixture\nvar _ = RootMarker\n")
-	_, err := m.sweepMaintenance(ctx)
+	_, err := m.maintenanceSweep(ctx)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		if _, err := m.withRecords(ctx, keepRecords); err != nil {
+		if _, err := m.maintenanceSweep(ctx); err != nil {
 			return false
 		}
-		records, _, err := readMap(m.mapPath)
+		records, _, err := readMap(m.m.mapPath)
 		if err != nil {
 			return false
 		}
@@ -178,19 +200,22 @@ func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 		return true
 	}, 5*time.Second, 20*time.Millisecond)
 	if err := call(first, filepath.Join(root, "added.go"), "RootMarker"); err != nil {
-		// The old stream's reader may win the first call's write race (SPEC F2).
-		// Accept only that terminal error before any replacement was started;
-		// the next independent call must reconnect and see the new file.
+		// Reader failure and an uncertain Write can race on the old stream
+		// (SPEC F2). Either terminal result must precede any replacement; the
+		// next independent call must reconnect and see the new file.
 		var remote *jsonrpc.Error
 		require.ErrorAs(t, err, &remote)
 		require.EqualValues(t, jsonrpc.CodeInternalError, remote.Code)
-		require.Contains(t, remote.Message, "gopls for "+root+" went away mid-call:")
-		for _, r := range mustReadMap(t, m.mapPath) {
+		require.True(t,
+			strings.HasPrefix(remote.Message, "gopls for "+root+" went away mid-call:") ||
+				strings.HasPrefix(remote.Message, "gopls for "+root+": upstream write failed; request may have executed:"),
+			"unexpected terminal failure: %s", remote.Message)
+		for _, r := range mustReadMap(t, m.m.mapPath) {
 			require.NotEqual(t, root, r.Worktree, "a replacement failed instead of the old stream")
 		}
 		require.NoError(t, call(first, filepath.Join(root, "added.go"), "RootMarker"))
 	}
-	for _, r := range mustReadMap(t, m.mapPath) {
+	for _, r := range mustReadMap(t, m.m.mapPath) {
 		if r.Worktree == root {
 			require.NotEqual(t, old.PID, r.PID)
 		}
@@ -200,23 +225,25 @@ func TestAuditRealGoplsSharedClientsAndWatcherRestart(t *testing.T) {
 func TestAuditRealGoplsFailedStartReapsChild(t *testing.T) {
 	t.Parallel()
 	m, root, _ := realGoplsFixture(t)
-	start := m.start
-	var child *childProcess
-	m.start = func(ctx context.Context, worktree string, port int) (*childProcess, error) {
+	owner := m
+	start := owner.start
+	var child *guardianChild
+	owner.start = func(ctx context.Context, worktree string, port, quota int) (*guardianChild, error) {
 		var err error
-		child, err = start(ctx, worktree, port)
+		child, err = start(ctx, worktree, port, quota)
 		return child, err
 	}
-	m.ready = func(context.Context, int) error { return context.DeadlineExceeded }
-	_, err := m.ensure(t.Context(), root)
+	owner.ready = func(context.Context, int) error { return context.DeadlineExceeded }
+	_, err := owner.ensureRecord(t.Context(), root)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.NotNil(t, child)
 	select {
-	case <-child.done:
+	case <-child.ConfirmedDone:
 	default:
-		require.FailNow(t, "failed child was not reaped")
+		t.Fatal("failed guardian/child was not reaped")
 	}
-	require.Empty(t, mustReadMap(t, m.mapPath))
+	require.Empty(t, mustReadMap(t, m.m.mapPath))
+	require.Empty(t, owner.snapshot().Generations)
 }
 
 // Hold one actual upstream result until local cancellation completes. This
@@ -256,8 +283,8 @@ func TestAuditRealGoplsCancellationAndWorktreeChurn(t *testing.T) {
 	dial := b.r.dial
 	received, release := make(chan struct{}, 1), make(chan struct{})
 	heldID := mustID(t, "2")
-	b.r.dial = func(ctx context.Context, worktree string) (mcp.Connection, error) {
-		conn, err := dial(ctx, worktree)
+	b.r.dial = func(ctx context.Context, worktree string, port int) (mcp.Connection, error) {
+		conn, err := dial(ctx, worktree, port)
 		if err != nil {
 			return nil, err
 		}
@@ -293,28 +320,92 @@ func TestAuditRealGoplsCancellationAndWorktreeChurn(t *testing.T) {
 		require.NoError(t, b.call(ctx, "tools/call", params(dir), &result))
 		require.NotContains(t, string(result), `"isError":true`)
 	}
-	records := mustReadMap(t, m.mapPath)
+	records := mustReadMap(t, m.m.mapPath)
 	require.Len(t, records, 3)
-	m.openFiles = countOpenFiles
+	m.m.openFiles = countOpenFiles
 	var status strings.Builder
-	require.NoError(t, m.status(ctx, &status))
+	require.NoError(t, m.m.status(ctx, &status))
 	t.Logf("owned real-gopls resources before removal: %s", &status)
-	latest := time.Time{}
-	for _, r := range records {
-		if start := time.Unix(r.StartedAt, 0); start.After(latest) {
-			latest = start
-		}
-	}
+
 	for _, dir := range []string{linked, churn} {
 		runGit(t, "-C", root, "worktree", "remove", "--force", dir)
 	}
-	require.NoError(t, waitContext(ctx, time.Until(latest.Add(startGrace))))
+
 	require.Eventually(t, func() bool {
-		_, err := m.sweepMaintenance(ctx)
+		_, err := m.maintenanceSweep(ctx)
 		if err != nil {
 			return false
 		}
-		records, _, err := readMap(m.mapPath)
+		records, _, err := readMap(m.m.mapPath)
 		return err == nil && len(records) == 1 && records[0].Worktree == root
 	}, 5*time.Second, 20*time.Millisecond, "removed worktree servers retained their records")
+}
+
+// This pins the actual installed gopls telemetry contract, including lack of
+// telemetry descriptors/sidecars. All managed state and filecache are private;
+// no user telemetry mode file is changed.
+func TestGuardianRealGoplsTelemetrySuppressed(t *testing.T) {
+	t.Parallel()
+	binary, err := exec.LookPath(goplsBinary)
+	require.NoError(t, err)
+	require.NoError(t, guardianCheckTelemetry(binary))
+	lsof, err := exec.LookPath("lsof")
+	require.NoError(t, err)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module guardian.test\n\ngo 1.27\n"), 0o600))
+	port, err := allocatePort(dir, nil, portUnavailable)
+	require.NoError(t, err)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	config := guardianConfig{Version: guardianProtocol, Worktree: dir, Port: port,
+		Token: rand.Text(), Command: binary, MaxOpenFiles: 512,
+		ExecArgs: []string{"-test.run=^TestGuardianHelperProcess$", "--", "guardian-child"}, Args: []string{"mcp", "-listen", mcpAddress(port)}}
+	config.StatePath = filepath.Join(dir, "guardians", "guardian-"+config.Token+".json")
+	command := exec.Command(executable, "-test.run=^TestGuardianHelperProcess$", "--", "guardian")
+	command.Env = append(os.Environ(), "GOPLS_GUARDIAN_TEST_HELPER=1", "GOPLSCACHE="+filepath.Join(dir, "cache"))
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	child, err := startGuardianCommand(ctx, config, io.Discard, command)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, child.CloseOwner())
+		select {
+		case <-child.ConfirmedDone:
+		case <-time.After(10 * time.Second):
+			assert.Fail(t, "real gopls group did not exit")
+		}
+	})
+	require.NoError(t, awaitReady(ctx, port))
+	out, err := exec.CommandContext(ctx, lsof, "-n", "-P", "-F", "n", "-p", strconv.Itoa(child.Process.Pid)).Output()
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "/telemetry/", "counter files must not be opened")
+	rows, err := guardianSnapshot()
+	require.NoError(t, err)
+	require.False(t, guardianEscaped(rows, child.Process.Pid, child.GuardianPID))
+	require.Equal(t, 1, guardianGroupMembers(rows, child.GuardianPID), "only the actual gopls belongs to the anchored group")
+	require.NoError(t, child.Signal(syscall.SIGTERM))
+	select {
+	case <-child.ConfirmedDone:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "real gopls TERM/Wait/group proof did not complete")
+	}
+	require.NoFileExists(t, child.StatePath)
+}
+
+func TestGuardianRealGoPrivateTelemetryMode(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	env, err := guardianTelemetryEnvironment(dir)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "-C", dir, "env", "GOTELEMETRY", "GOTELEMETRYDIR")
+	command.Env = env
+	out, err := command.Output()
+	require.NoError(t, err)
+	require.Equal(t, "off\n"+filepath.Join(dir, "telemetry-off")+"\n", string(out))
+	entries, err := os.ReadDir(filepath.Join(dir, "telemetry-off"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "off mode must create no weekly counters/upload files")
+	require.Equal(t, "mode", entries[0].Name())
 }

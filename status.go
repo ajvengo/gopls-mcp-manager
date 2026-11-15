@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json/jsontext"
@@ -9,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,7 +47,10 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 		query, cancel := context.WithTimeout(ctx, time.Second)
 		// Darwin rejects an entire -p list if one manually edited PID is above
 		// its platform limit. Snapshot once, then retain only requested rows.
-		out, _ := exec.CommandContext(query, "ps", "-ww", "-axo", "pid=,rss=,command=").Output()
+		out, err := boundedCommandOutput(query, 4<<20, "ps", "-ww", "-axo", "pid=,rss=,command=")
+		if err != nil {
+			out = nil
+		}
 		cancel()
 		// Missing or malformed rows remain unknown.
 		for line := range strings.SplitSeq(string(out), "\n") {
@@ -92,6 +95,23 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	var owner *supervisorSnapshot
+	var ownerError string
+	{
+		var raw bytes.Buffer
+		query, cancel := context.WithTimeout(ctx, time.Second)
+		if err := querySupervisor(query, m, "/status", "", &raw); err == nil {
+			var value supervisorSnapshot
+			if err := json.Unmarshal(raw.Bytes(), &value); err == nil {
+				owner = &value
+			} else {
+				ownerError = "invalid supervisor status"
+			}
+		} else {
+			ownerError = err.Error()
+		}
+		cancel()
+	}
 	return json.MarshalEncode(jsontext.NewEncoder(w), struct {
 		RecordedServers int
 		RegistryIntact  bool
@@ -99,7 +119,9 @@ func (m *manager) status(ctx context.Context, w io.Writer) error {
 		OpenFileBudget  int
 		Servers         []serverUsage
 		Logs            logUsage
-	}{len(servers), intact, openFiles, m.limits.OpenFiles, servers, logs})
+		Owner           *supervisorSnapshot
+		OwnerError      string
+	}{len(servers), intact, openFiles, m.limits.OpenFiles, servers, logs, owner, ownerError})
 }
 
 type logUsage struct {

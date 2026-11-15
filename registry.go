@@ -2,28 +2,149 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"encoding/json/jsontext"
+	"crypto/sha256"
+	"encoding/binary"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 )
 
+const (
+	firstPort = 61100
+	lastPort  = 65100
+	portCount = lastPort - firstPort + 1
+)
+
+type manager struct {
+	diagnostics io.Writer
+	ownerLogs   *ownerLog
+	mapPath     string
+	observe     func(lockTiming)
+	measure     func(string, time.Duration)
+	limits      config.Limits
+	openFiles   func(context.Context, []record) (map[int]int, error)
+	watch       *watchPlans
+}
+
+func (m *manager) diagnosticWriter() io.Writer {
+	if m != nil && m.diagnostics != nil {
+		return m.diagnostics
+	}
+	return os.Stderr
+}
+
+func newManager() (*manager, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	m := &manager{mapPath: filepath.Join(home, ".local", "share", "gopls-ports.map"), openFiles: countOpenFiles, watch: &watchPlans{plans: make(map[string]watchSnapshot)}}
+
+	m.limits, err = config.FromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if m.limits.Metrics {
+		m.measure = func(stage string, elapsed time.Duration) {
+			_, _ = fmt.Fprintf(m.diagnosticWriter(), "{\"event\":\"manager_operation\",\"stage\":%q,\"elapsed_ns\":%d}\n", stage, elapsed.Nanoseconds())
+		}
+		m.observe = func(t lockTiming) {
+			_, _ = fmt.Fprintf(m.diagnosticWriter(), "{\"event\":\"registry_lock\",\"wait_ns\":%d,\"held_ns\":%d}\n", t.Wait, t.Held)
+		}
+	}
+	return m, nil
+}
+
+func basePort(worktree string) int {
+	sum := sha256.Sum256([]byte(worktree))
+	return firstPort + int(binary.BigEndian.Uint64(sum[:8])%uint64(portCount))
+}
+
+func mcpAddress(port int) string {
+	return fmt.Sprintf("127.0.0.1:%d", port)
+}
+
+func mcpURL(port int) string {
+	return "http://" + mcpAddress(port)
+}
+
+func nextPort(port int) int {
+	return firstPort + (port-firstPort+1)%portCount
+}
+
+func allocatePort(worktree string, records []record, unavailable func(int) bool) (int, error) {
+	used := make(map[int]bool, len(records))
+	for _, r := range records {
+		used[r.Port] = true
+	}
+	port := basePort(worktree)
+	for range portCount {
+		if !used[port] && !unavailable(port) {
+			return port, nil
+		}
+		port = nextPort(port)
+	}
+	return 0, errors.New("no free gopls MCP port")
+}
+
+func portUnavailable(port int) bool {
+	listener, err := net.Listen("tcp", mcpAddress(port))
+	if err != nil {
+		return true
+	}
+	_ = listener.Close()
+	return false
+}
+
+func (m *manager) timed(stage string, start time.Time) {
+	if m.measure != nil {
+		m.measure(stage, time.Since(start))
+	}
+}
+
+func (m *manager) list(ctx context.Context, w io.Writer) error {
+	records, _, err := readMap(m.mapPath)
+	if err != nil {
+		return err
+	}
+	if len(records) != 0 {
+		return errors.New("process reservations require the owner or explicit offline legacy cleanup; status remains read-only")
+	}
+	return writeRecords(w, records)
+}
+
+func writeRecords(w io.Writer, records []record) error {
+	if _, err := fmt.Fprintln(w, "PORT\tPID\tWORKTREE"); err != nil {
+		return err
+	}
+	for _, r := range records {
+		if _, err := fmt.Fprintf(w, "%d\t%d\t%s\n", r.Port, r.PID, r.Worktree); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type record struct {
-	Worktree string
-	Port     int
-	PID      int
-	// StartedAt is when this tool spawned the gopls, in unix seconds, and marks
-	// the record unreapable until startGrace is up; see recordAlive. Zero in a
-	// map written before the field existed, which reads as "no grace" — the
-	// behaviour those records already had.
+	Worktree    string
+	Port        int
+	PID         int
+	OwnerBoot   string `json:",omitzero"`
+	Generation  string `json:",omitzero"`
+	GuardianPID int    `json:",omitzero"`
+	// Persist seconds and milliseconds together for watch snapshot comparison.
 	StartedAt int64
 	// StartedAtMilli is the same instant in unix milliseconds, for comparing
 	// the start with a file's mtime (see startedPrecisely). Zero in a map
@@ -31,9 +152,7 @@ type record struct {
 	// StartedAt.
 	StartedAtMilli int64 `json:",omitzero"`
 	Terminating    bool  `json:",omitzero"`
-	// Uses is the server's tools/call count, halved every useHalfLife, as of
-	// UsedAt in unix seconds; see frequency. Shared through the map so every
-	// manager evicts by the same ranking.
+	// Retain legacy JSON fields without using them for admission or eviction.
 	Uses   float64 `json:",omitzero"`
 	UsedAt int64   `json:",omitzero"`
 }
@@ -75,16 +194,16 @@ func (r record) server() serverID {
 	return serverID{pid: r.PID, started: r.StartedAt}
 }
 
-// keepRecords is the body that changes nothing: withRecords sweeps whatever the
-// caller asks it to, and both callers that only want the sweep say so with this.
-func keepRecords(records []record) ([]record, error) { return records, nil }
+const (
+	maxRegistryBytes = 4 << 20
+	maxProcessID     = 1<<31 - 1 // POSIX pid_t is signed; never allow integer truncation into a group signal.
+)
 
-// readMap returns the records the file holds, and whether it holds nothing
-// else. A file that is not intact has lines the read dropped, so it needs
-// rewriting whatever the caller then does with the records — see withRecords.
+// Blank formatting may be normalised; malformed nonblank state is never
+// exposed as a partial mutable snapshot.
 // A file that is not there yet is intact: it already says what no records say.
 func readMap(path string) (records []record, intact bool, err error) {
-	f, err := os.Open(path)
+	f, err := openStateFile(path, maxRegistryBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, true, nil
 	}
@@ -93,10 +212,9 @@ func readMap(path string) (records []record, intact bool, err error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	// A line we cannot parse names a gopls we cannot manage anyway, so it is
-	// dropped rather than failed on: every entry point reads this file, so failing
-	// on one bad line would leave no way to inspect or repair it from the tool
-	// itself. The next write rewrites the file without it.
+	// Unknown/corrupt nonblank records may still reserve a live process. Refuse
+	// the whole observation rather than silently rewrite away its only identity.
+	// Explicit operator repair is required; blank formatting is harmless.
 	//
 	// The fields are checked, not just decoded, because this file is meant to be
 	// editable by hand and every one of them is an argument to kill(2) or to a
@@ -104,25 +222,41 @@ func readMap(path string) (records []record, intact bool, err error) {
 	// negative pid signals every process the user owns, and a port outside the
 	// range we allocate from can only refuse a probe and condemn a live server.
 	var lines int
-	scanner := bufio.NewScanner(f)
+	// Include invalid/blank lines in the count: skipped lines must not bypass
+	// the aggregate work bound. Keep a byte ceiling too, including concurrent
+	// growth after Stat. A failed read returns no partial registry to mutate.
+	limited := &io.LimitedReader{R: f, N: maxRegistryBytes + 1}
+	scanner := bufio.NewScanner(limited)
 	for scanner.Scan() {
 		lines++
-		var r record
-		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
+		if lines > portCount {
+			return nil, false, fmt.Errorf("read %s: registry exceeds %d lines", path, portCount)
+		}
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
 			continue
 		}
-		if r.Worktree == "" || r.PID <= 0 || r.Port < firstPort || r.Port > lastPort {
-			continue
+		var r record
+		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
+			return nil, false, fmt.Errorf("read %s: invalid registry record on line %d; explicit repair required", path, lines)
+		}
+		if r.Worktree == "" || r.PID <= 0 || r.PID > maxProcessID || r.Port < firstPort || r.Port > lastPort {
+			return nil, false, fmt.Errorf("read %s: invalid registry fields on line %d; explicit repair required", path, lines)
 		}
 		records = append(records, r)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, false, fmt.Errorf("read %s: %w", path, err)
 	}
+	if limited.N == 0 {
+		return nil, false, fmt.Errorf("read %s: registry exceeds %d bytes", path, maxRegistryBytes)
+	}
 	return records, len(records) == lines, nil
 }
 
 func writeMap(path string, records []record) error {
+	if len(records) > portCount {
+		return fmt.Errorf("write %s: registry exceeds %d records", path, portCount)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -142,9 +276,11 @@ func writeMap(path string, records []record) error {
 	}
 	// bufio.Writer latches its first write error and returns it from Flush, so
 	// that one check covers every line below.
-	w := bufio.NewWriter(tmp)
-	enc := jsontext.NewEncoder(w)
+	w := bufio.NewWriter(&stateBudgetWriter{Writer: tmp, remaining: maxRegistryBytes})
 	for _, r := range records {
+		if r.Worktree == "" || r.PID <= 0 || r.PID > maxProcessID || r.Port < firstPort || r.Port > lastPort {
+			return fmt.Errorf("write %s: invalid registry fields", path)
+		}
 		// A Unix path is arbitrary bytes, but JSON strings require UTF-8.
 		// Refuse an unrepresentable path with a worktree-specific error:
 		// read back, it would never match its own worktree, so every ensure
@@ -153,7 +289,19 @@ func writeMap(path string, records []record) error {
 		if !utf8.ValidString(r.Worktree) {
 			return fmt.Errorf("worktree path is not valid UTF-8: %q", r.Worktree)
 		}
-		if err := json.MarshalEncode(enc, r); err != nil {
+		data, err := json.Marshal(r)
+		if err != nil {
+			return err
+		}
+		// Scanner must hold the full value and its newline simultaneously.
+		// Enforce its token boundary before committing a replacement, too.
+		if len(data) >= bufio.MaxScanTokenSize {
+			return fmt.Errorf("write %s: registry record exceeds %d bytes", path, bufio.MaxScanTokenSize-1)
+		}
+		if _, err := w.Write(data); err != nil {
+			return err
+		}
+		if err := w.WriteByte('\n'); err != nil {
 			return err
 		}
 	}
@@ -203,92 +351,6 @@ func withFileLock(ctx context.Context, path string, fn func() error) error {
 	return fn()
 }
 
-// withRecords probes an atomic snapshot outside the lock and reconciles only
-// unchanged records under it. Ordinary updates share one commit with the body.
-// Termination is committed separately so a failed body cannot erase the evidence
-// required before a signal. The caller must not return a terminating endpoint.
-func (m *manager) withRecords(ctx context.Context, body func([]record) ([]record, error)) ([]record, error) {
-	return m.withSelectedRecords(ctx, "", body)
-}
-
-// An empty worktree requests explicit whole-registry maintenance. Acquisition
-// observes only its own worktree; unrelated records still reserve their ports.
-func (m *manager) withSelectedRecords(ctx context.Context, worktree string, body func([]record) ([]record, error)) ([]record, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	// Atomic rename makes an unlocked snapshot coherent. Probe it without
-	// making another process's unrelated ensure wait for network timeouts.
-	snapshot, _, err := readMap(m.mapPath)
-	if err != nil {
-		return nil, err
-	}
-	verdicts := make([]probeVerdict, len(snapshot))
-	probeStart := time.Now()
-	var probes sync.WaitGroup
-	// Acquire before starting a goroutine: a large maintenance snapshot must
-	// not allocate a goroutine (and potentially a ps process) for every record.
-	permits := make(chan struct{}, 8)
-probeLoop:
-	for i, r := range snapshot {
-		if worktree != "" && r.Worktree != worktree {
-			continue
-		}
-		select {
-		case permits <- struct{}{}:
-		case <-ctx.Done():
-			break probeLoop
-		}
-		probes.Go(func() {
-			defer func() { <-permits }()
-			if ctx.Err() == nil {
-				verdicts[i] = m.alive(ctx, r)
-			}
-		})
-	}
-	probes.Wait()
-	m.timed("probes", probeStart)
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	byRecord := make(map[record]probeVerdict, len(snapshot))
-	for i, r := range snapshot {
-		byRecord[r] = verdicts[i]
-	}
-	var terminating []record
-	// Commit cleanup independently of the caller's mutation. A failed spawn
-	// must not undo the durable evidence required before a signal.
-	updated, err := m.withMap(ctx, func(current []record) ([]record, error) {
-		kept := current[:0]
-		for _, r := range current {
-			switch byRecord[r] { // absent/replaced records are uncertain
-			case probeGone:
-				continue
-			case probeTerminate:
-				r.Terminating = true
-				terminating = append(terminating, r)
-			}
-			kept = append(kept, r)
-		}
-		if len(terminating) != 0 {
-			return kept, nil
-		}
-		return body(kept)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(terminating) == 0 {
-		return updated, nil
-	}
-	for _, r := range terminating {
-		if err := m.signalTerminating(ctx, r); err != nil {
-			return nil, err
-		}
-	}
-	return m.withMap(ctx, body)
-}
-
 type lockTiming struct{ Wait, Held time.Duration }
 
 func (m *manager) locked(ctx context.Context, fn func() error) error {
@@ -308,24 +370,8 @@ func (m *manager) locked(ctx context.Context, fn func() error) error {
 	return err
 }
 
-// withMap runs body under the map's flock, over what the file holds, and writes
-// back what it returns. The sweep is withRecords' addition, not this one's:
-// forget goes through here to drop one record without probing every other
-// worktree under the lock.
-//
-// Skipped entirely when body hands back what it was given, which is the steady
-// state: the write is a temp file, an fsync and a rename inside a lock every
-// process on the machine shares — some forty times the rest of this function
-// and up, the ratio moving with how busy the disk is (BenchmarkWithRecords).
-// The intact flag is the other half of the question: the lines readMap refused
-// are gone from stored already, so equal records do not mean an equal file, and
-// only readMap can say whether the repair is still owed.
-//
-// body is handed its own copy, because what it is given is also what its result
-// is compared against: a body editing in place — slices.DeleteFunc does — would
-// otherwise compare its result against itself, find no change, and leave the map
-// saying what it said before. Cloning here rather than asking every body to is
-// what keeps that from being a rule each caller has to know and none can test.
+// Clone transaction input so in-place edits cannot hide a required write.
+// Unchanged records skip replacement only when the source file was intact.
 func (m *manager) withMap(ctx context.Context, body func([]record) ([]record, error)) ([]record, error) {
 	var updated []record
 	err := m.locked(ctx, func() error {
@@ -348,4 +394,40 @@ func (m *manager) withMap(ctx context.Context, body func([]record) ([]record, er
 		return nil, err
 	}
 	return updated, nil
+}
+
+// Open before inspecting the descriptor: Lstat followed by Open would permit a
+// file replacement to turn the read into a FIFO/device open. Nonblocking open
+// and O_NOFOLLOW refuse that race, including a symlink to an otherwise regular
+// file. Private state is writable by cooperating managers, never a symlink API.
+func openStateFile(path string, maxBytes int64) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && (!info.Mode().IsRegular() || info.Size() > maxBytes) {
+		err = fmt.Errorf("state file must be regular and at most %d bytes", maxBytes)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return f, nil
+}
+
+// Reject an oversized replacement before it reaches the atomic rename. A
+// buffered encoder may otherwise produce state the bounded reader cannot read.
+type stateBudgetWriter struct {
+	io.Writer
+	remaining int
+}
+
+func (w *stateBudgetWriter) Write(p []byte) (int, error) {
+	if len(p) > w.remaining {
+		return 0, fmt.Errorf("state replacement exceeds byte limit")
+	}
+	n, err := w.Writer.Write(p)
+	w.remaining -= n
+	return n, err
 }
