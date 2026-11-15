@@ -36,6 +36,7 @@ type manager struct {
 	limits      config.Limits
 	openFiles   func(context.Context, []record) (map[int]int, error)
 	watch       *watchPlans
+	restart     restartOwner
 }
 
 func (m *manager) diagnosticWriter() io.Writer {

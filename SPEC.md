@@ -98,6 +98,44 @@ worktree counters; disconnect abandons remote work without refunding credits.
 `TestConfirmedExitRestoresLongSessionCapacity`,
 `TestUnconfirmedExitRetainsRouterOperationCredits`
 
+O8. **Coordinated restart.** One operator restart drains queued, active and
+buffered work with cancellation and frontend admission live, closes admission
+once quiet, then pauses private frontend traffic at
+message boundaries. Work racing that pause aborts the restart safely. Unconfirmed
+abandonment, uncertain generations and failed durable retirement prevent transfer;
+no tool request is replayed. `restart` replaces all retained gopls generations.
+`restart --hot`/`reload` additionally fork/exec a compatible binary, inheriting
+the listener, singleton lock and frontend sockets. A transferred or inherited
+lock is released by close only, preserving the shared open file description;
+other owners also unlock explicitly. The old owner must not unlink
+the successor's socket. The successor marks inherited descriptors close-on-exec
+so its gopls and guardian children never hold the singleton lock.
+
+The checkpoint is bounded to 8 MiB. Public stdio framing, partial input and batch
+correlation remain in persistent frontend relays; home, initialization and sticky
+routing are restored in the successor. HTTP frontend listeners remain open, and
+their idle private HTTP connections are discarded before transfer. New calls
+can wait through the pause under their original deadlines.
+
+A hot restart reserves both owner footprints and descriptor-transfer headroom.
+An inherited pipe whose write descriptor remains live until old-process exit
+provides release proof; elapsed time, PID probes and the commit message do not.
+Until EOF, the successor retains that reservation, keeps clients paused,
+admission closed and HTTP blocked, and starts no gopls. No EOF by the checkpoint
+deadline, unexpected pipe data or cancellation fails the handoff: the successor
+exits with an error and never resumes its clients.
+Process, filesystem or binary failures cannot promise uninterrupted service.
+The private protocol/configuration must remain compatible. The initial upgrade
+from a binary without handoff support requires a one-time reconnect.
+The existing TLA+ models do not model this fork/exec handoff.
+→ `TestRestartPeerPreservesMessagesAcrossRepeatedPauses`,
+`TestRestartRestoresInitializedStickySession`,
+`TestRestartRefusesUnconfirmedWorkAndResumesClients`,
+`TestRestartNativeForkExecPreservesAttachmentAndLock`,
+`TestRestartHandoffFailsWithoutPreviousOwnerExit`,
+`TestSupervisorSingletonReleasesLockHeldByForkedDescendant`,
+`TestAuditRealGoplsHotRestart`
+
 ## 2. Routing
 
 R1. Only absolute `file`, `dir` and `files` arguments are routing evidence.

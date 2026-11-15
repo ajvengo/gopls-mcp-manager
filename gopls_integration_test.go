@@ -3,16 +3,22 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"io"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -408,4 +414,171 @@ func TestGuardianRealGoPrivateTelemetryMode(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "off mode must create no weekly counters/upload files")
 	require.Equal(t, "mode", entries[0].Name())
+}
+
+func TestAuditRealGoplsHotRestart(t *testing.T) {
+	binary, err := exec.LookPath(goplsBinary)
+	require.NoError(t, err)
+	require.NoError(t, guardianCheckTelemetry(binary))
+	root, linked := newLinkedWorktree(t)
+	for dir, marker := range map[string]string{root: "RootMarker", linked: "LinkedMarker"} {
+		mustWriteFile(t, filepath.Join(dir, "go.mod"), "module example.com/restart\n\ngo 1.27\n")
+		mustWriteFile(t, filepath.Join(dir, "marker.go"), "package fixture\nconst "+marker+" = 1\n")
+		mustWriteFile(t, filepath.Join(dir, "fixture.go"), "package fixture\nvar _ = "+marker+"\n")
+	}
+	home, binDir := t.TempDir(), t.TempDir()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	original, updated := filepath.Join(binDir, "old"), filepath.Join(binDir, "new")
+	mainPath, err := filepath.Abs("main.go")
+	require.NoError(t, err)
+	mainSource, err := os.ReadFile(mainPath)
+	require.NoError(t, err)
+	// A killed test runner cannot run Cleanup. Bound the disposable binaries,
+	// including forked successors, without adding a production watchdog.
+	watchdogSource := "\nfunc init() { go func() { ctx, cancel := context.WithTimeout(context.Background(), 300_000_000_000); defer cancel(); <-ctx.Done(); os.Exit(124) }() }\n"
+	overlayMain := filepath.Join(binDir, "watchdog-main.go")
+	require.NoError(t, os.WriteFile(overlayMain, append(mainSource, watchdogSource...), 0o600))
+	overlay, err := json.Marshal(map[string]any{"Replace": map[string]string{mainPath: overlayMain}})
+	require.NoError(t, err)
+	overlayPath := filepath.Join(binDir, "overlay.json")
+	require.NoError(t, os.WriteFile(overlayPath, overlay, 0o600))
+	for _, build := range []struct {
+		path  string
+		flags []string
+	}{{original, nil}, {updated, []string{"-ldflags=-s -w"}}} {
+		args := append([]string{"build", "-overlay=" + overlayPath, "-o", build.path}, build.flags...)
+		out, err := exec.CommandContext(ctx, "go", append(args, ".")...).CombinedOutput()
+		require.NoError(t, err, "%s", out)
+	}
+	cacheJSON, err := exec.CommandContext(ctx, "go", "env", "-json", "GOCACHE", "GOMODCACHE", "GOPATH").Output()
+	require.NoError(t, err)
+	var cacheEnvironment map[string]string
+	require.NoError(t, json.Unmarshal(cacheJSON, &cacheEnvironment))
+	for name, value := range cacheEnvironment {
+		t.Setenv(name, value)
+	}
+	t.Setenv("HOME", home)
+	m, err := newManager()
+	require.NoError(t, err)
+	owner := exec.CommandContext(ctx, original, "supervisor")
+	require.NoError(t, owner.Start())
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- owner.Wait() }()
+	t.Cleanup(func() {
+		currentPID := owner.Process.Pid
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cleanupCancel()
+		// The handoff may commit even if the CLI fails to receive its receipt.
+		var status bytes.Buffer
+		if querySupervisor(cleanupCtx, m, "/status", "", &status) == nil {
+			var snapshot supervisorSnapshot
+			if json.Unmarshal(status.Bytes(), &snapshot) == nil && snapshot.PID > 0 {
+				currentPID = snapshot.PID
+			}
+		}
+		process, err := os.FindProcess(currentPID)
+		if assert.NoError(t, err) {
+			_ = process.Signal(syscall.SIGTERM)
+		}
+		assert.Eventually(t, func() bool {
+			count, err := guardianManifestCount(guardianStateDir(m))
+			return err == nil && count == 0 && supervisorPing(cleanupCtx, m) != nil
+		}, 15*time.Second, 10*time.Millisecond, "integration left an owner or guardian")
+	})
+	require.Eventually(t, func() bool { return supervisorPing(ctx, m) == nil }, 10*time.Second, 10*time.Millisecond)
+	start := func(args ...string) (io.WriteCloser, io.ReadCloser) {
+		command := exec.CommandContext(ctx, original, args...)
+		input, err := command.StdinPipe()
+		require.NoError(t, err)
+		output, err := command.StdoutPipe()
+		require.NoError(t, err)
+		require.NoError(t, command.Start())
+		t.Cleanup(func() { _ = input.Close(); _ = output.Close(); _ = command.Process.Kill(); _ = command.Wait() })
+		return input, output
+	}
+	connect := func() (mcp.Connection, io.Writer) {
+		input, output := start("bridge", root)
+		client, err := (&mcp.IOTransport{Reader: output, Writer: input}).Connect(ctx)
+		require.NoError(t, err)
+		response := stdioRoundTrip(t, ctx, client, &jsonrpc.Request{ID: mustID(t, "init"), Method: "initialize", Params: jsontext.Value(
+			`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"restart-test","version":"1"}}`)})
+		require.Nil(t, response.Error)
+		require.NoError(t, client.Write(ctx, &jsonrpc.Request{Method: "notifications/initialized"}))
+		return client, input
+	}
+	first, input := connect()
+	second, _ := connect()
+	call := func(client mcp.Connection, params, want string) {
+		response := stdioRoundTrip(t, ctx, client, &jsonrpc.Request{ID: mustID(t, "call"), Method: "tools/call", Params: jsontext.Value(params)})
+		require.Nil(t, response.Error)
+		require.NotContains(t, string(response.Result), `"isError":true`)
+		require.Contains(t, string(response.Result), want)
+	}
+	call(first, `{"name":"go_file_context","arguments":{"file":`+strconv.Quote(filepath.Join(linked, "fixture.go"))+`}}`, "LinkedMarker")
+	call(second, `{"name":"go_workspace","arguments":{}}`, root)
+	_, httpOutput := start("http", "127.0.0.1:0", root)
+	line, err := bufio.NewReader(httpOutput).ReadString('\n')
+	require.NoError(t, err)
+	endpoint := strings.TrimSpace(strings.TrimPrefix(line, "MCP endpoint: "))
+	var dials atomic.Int32
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}}
+	defer transport.CloseIdleConnections()
+	httpClient := &http.Client{Transport: transport, Timeout: 20 * time.Second}
+	httpCall := func() {
+		req := mcpRequest(t, ctx, endpoint, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"go_workspace","arguments":{}}}`)
+		response, err := httpClient.Do(req)
+		require.NoError(t, err)
+		data, err := io.ReadAll(response.Body)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+		require.Equal(t, http.StatusOK, response.StatusCode, "%s", data)
+		require.Contains(t, string(data), root)
+	}
+	httpCall()
+	before := mustReadMap(t, m.mapPath)
+	require.Len(t, before, 2)
+	split := &jsonrpc.Request{ID: mustID(t, "split"), Method: "tools/call", Params: jsontext.Value(`{"name":"go_workspace","arguments":{}}`)}
+	data, err := jsonrpc.EncodeMessage(split)
+	require.NoError(t, err)
+	_, err = input.Write(data[:len(data)/2])
+	require.NoError(t, err)
+	out, err := exec.CommandContext(ctx, updated, "reload", "--timeout=60s").CombinedOutput()
+	require.NoError(t, err, "%s", out)
+	var receipt restartReceipt
+	require.NoError(t, json.Unmarshal(out, &receipt))
+	require.NotEqual(t, owner.Process.Pid, receipt.PID)
+	require.NoError(t, <-ownerDone)
+	_, err = input.Write(append(data[len(data)/2:], '\n'))
+	require.NoError(t, err)
+	message, err := first.Read(ctx)
+	require.NoError(t, err)
+	response := message.(*jsonrpc.Response)
+	require.Equal(t, split.ID, response.ID)
+	require.Nil(t, response.Error)
+	require.Contains(t, string(response.Result), linked, "partial input and sticky state must survive replacement")
+	call(first, `{"name":"go_workspace","arguments":{}}`, linked)
+	call(second, `{"name":"go_workspace","arguments":{}}`, root)
+	httpCall()
+	require.Equal(t, int32(1), dials.Load(), "public HTTP connection was replaced")
+	after := mustReadMap(t, m.mapPath)
+	require.Len(t, after, 2)
+	for _, prior := range before {
+		for _, next := range after {
+			if prior.Worktree == next.Worktree {
+				require.NotEqual(t, prior.PID, next.PID)
+				require.NotEqual(t, prior.Generation, next.Generation)
+				descriptors, err := exec.CommandContext(ctx, "lsof", "-p", strconv.Itoa(next.PID), "-Fn").Output()
+				require.NoError(t, err)
+				require.NotContains(t, string(descriptors), ".owner.lock", "replacement gopls inherited the owner singleton lock")
+			}
+		}
+	}
+	identity, err := exec.CommandContext(ctx, "ps", "-ww", "-p", strconv.Itoa(receipt.PID), "-o", "command=").Output()
+	require.NoError(t, err)
+	require.Contains(t, string(identity), updated+" internal-restart-child")
 }

@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/ajvengo/gopls-mcp-manager/internal/config"
-	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -308,7 +307,7 @@ func TestSupervisorConfigurationEncodingErrorNeverProducesFingerprintOrTraffic(t
 // Real Unix/HTTP/SSE transports and SDK sessions, with a synthetic owned child
 // whose TERM closes its SDK listener. No OS signal targets a test/developer PID.
 // The guardian integration suite separately proves actual process/group exit.
-func supervisorTransportFixture(t testing.TB, m *manager) (*supervisor, *atomic.Int32) {
+func supervisorTransportFixture(t testing.TB, m *manager, configure ...func(*mcp.Server)) (*supervisor, *atomic.Int32) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	var starts atomic.Int32
@@ -327,6 +326,9 @@ func supervisorTransportFixture(t testing.TB, m *manager) (*supervisor, *atomic.
 			func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: worktree}}}, nil
 			})
+		for _, configureServer := range configure {
+			configureServer(sdk)
+		}
 		server := &http.Server{Handler: mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return sdk }, nil)}
 		done := make(chan struct{})
 		var once sync.Once
@@ -349,7 +351,8 @@ func supervisorTransportFixture(t testing.TB, m *manager) (*supervisor, *atomic.
 	require.NoError(t, err)
 	require.NoError(t, os.Chmod(path, 0o600))
 	done := make(chan error, 1)
-	go func() { done <- owner.serve(listener) }()
+	owner.bindListener(listener)
+	go func() { done <- owner.serve() }()
 	t.Cleanup(func() {
 		cancel()
 		require.NoError(t, <-done)
@@ -375,7 +378,8 @@ func supervisorStdioClient(t *testing.T, m *manager, home string) mcp.Connection
 	t.Helper()
 	conn, reader, err := openSupervisorAttachment(t.Context(), m, home, "/bridge")
 	require.NoError(t, err)
-	client := transport.NewStdio(&bufferedOwnerConn{Reader: reader, Conn: conn}, conn, m.limits.MessageBytes)
+	client := newRestartPeer(t.Context(), conn, reader, m.limits.MessageBytes, true)
+	client.start()
 	t.Cleanup(func() { _ = client.Close() })
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -1006,4 +1010,19 @@ func supervisorHTTPFrontend(t testing.TB, m *manager, home string) (string, func
 		require.FailNow(t, "HTTP proxy did not announce loopback address")
 		return "", stop
 	}
+}
+
+func TestSupervisorSingletonReleasesLockHeldByForkedDescendant(t *testing.T) {
+	t.Parallel()
+	m := newTestManager(t)
+	var child *exec.Cmd
+	require.NoError(t, withSupervisorSingleton(t.Context(), &m, func() error {
+		// A descendant between fork and exec shares the lock's open file
+		// description; closing the owner's descriptor alone keeps the lock.
+		child = exec.Command("sleep", "30")
+		child.ExtraFiles = []*os.File{m.restart.lock}
+		return child.Start()
+	}))
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	require.NoError(t, withSupervisorSingleton(t.Context(), &m, func() error { return nil }))
 }

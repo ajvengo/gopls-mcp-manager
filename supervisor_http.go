@@ -21,8 +21,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/ajvengo/gopls-mcp-manager/internal/transport"
 )
 
 func guardianStateDir(m *manager) string {
@@ -57,15 +55,36 @@ func withSupervisorSingleton(ctx context.Context, m *manager, run func() error) 
 	if err := os.MkdirAll(filepath.Dir(m.mapPath), 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(m.mapPath+".owner.lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
+	var f *os.File
+	var err error
+	if m.restart.inherited != nil {
+		f = m.restart.inherited.lock
+		actual, statErr := f.Stat()
+		expected, pathErr := os.Stat(m.mapPath + ".owner.lock")
+		if statErr != nil || pathErr != nil || !os.SameFile(actual, expected) {
+			_ = f.Close()
+			return fmt.Errorf("invalid inherited singleton lock")
+		}
+	} else {
+		f, err = os.OpenFile(m.mapPath+".owner.lock", os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return err
+		}
 	}
 	defer func() { _ = f.Close() }()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return fmt.Errorf("another supervisor already owns this registry: %w", err)
 	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	m.restart.lock = f
+	// A transferred or inherited open file description is shared with the other
+	// owner, so only close releases it; LOCK_UN would unlock that owner too.
+	// Otherwise unlock explicitly: a forked, not yet exec'd descendant shares
+	// the description and would keep the lock past close.
+	defer func() {
+		if !m.restart.isTransferred() && m.restart.inherited == nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -111,14 +130,11 @@ func runSupervisor(ctx context.Context, m *manager) error {
 		if err != nil {
 			return err
 		}
-		if err := prepareSupervisorRuntime(path); err != nil {
-			return err
-		}
-		listener, err := net.Listen("unix", path)
+		listener, err := m.restartListener(path)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = listener.Close(); _ = os.Remove(path) }()
+		defer m.closeRestartListener(listener, path)
 		if err := os.Chmod(path, 0o600); err != nil {
 			return err
 		}
@@ -192,7 +208,7 @@ func querySupervisor(ctx context.Context, m *manager, endpoint, home string, out
 	return err
 }
 
-const supervisorProtocol = "1"
+const supervisorProtocol = "2"
 
 const supervisorVersionHeader = "Gopls-Manager-Owner-Version"
 
@@ -407,21 +423,42 @@ func serveSupervisor(ctx context.Context, m *manager, listener net.Listener) err
 	defer cancel()
 	s := newSupervisor(ctx, m)
 	s.initializeFrontends()
-	return s.serve(listener)
+	s.bindListener(listener)
+	if err := s.restoreRestartSessions(); err != nil {
+		return err
+	}
+	return s.serve()
 }
 
-func (s *supervisor) serve(listener net.Listener) error {
+// Restored sessions consume connection slots before serve starts accepting.
+func (s *supervisor) bindListener(listener net.Listener) {
+	s.restart.listener = listener
+	s.restart.slots = make(chan struct{}, s.m.limits.HTTPConnections)
+}
+
+func (s *supervisor) serve() error {
 	ctx, m := s.ctx, s.m
 	defer s.shutdown()
 	server := &http.Server{Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 30 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10,
 		ErrorLog:    log.New(m.diagnosticWriter(), "supervisor HTTP: ", 0),
 		BaseContext: func(net.Listener) context.Context { return ctx }}
+	defer func() { _ = server.Close(); s.closeFrontends() }()
 	stop := context.AfterFunc(ctx, func() { _ = server.Close(); s.closeFrontends() })
 	defer stop()
 	go s.maintenance()
-	err := server.Serve(&httpConnectionListener{Listener: listener, slots: make(chan struct{}, m.limits.HTTPConnections)})
-	if errors.Is(err, http.ErrServerClosed) {
+	err := server.Serve(&httpConnectionListener{Listener: s.restart.listener, slots: s.restart.slots})
+	s.restart.mu.Lock()
+	committed := s.restart.committed
+	s.restart.mu.Unlock()
+	// Only a committed hot restart closes the listener under a running server.
+	if errors.Is(err, http.ErrServerClosed) || committed != nil && errors.Is(err, net.ErrClosed) {
+		if committed != nil {
+			<-committed
+		}
+		if cause := context.Cause(ctx); !errors.Is(cause, context.Canceled) {
+			return cause
+		}
 		return nil
 	}
 	return err
@@ -454,6 +491,18 @@ func (s *supervisor) handler() http.Handler {
 			}
 			return
 		}
+		if req.Method == http.MethodPost && req.URL.Path == "/restart" {
+			s.handleRestart(w, req)
+			return
+		}
+		if req.URL.Path == "/ensure" {
+			done, ok := s.frontendAdmission()
+			if !ok {
+				http.Error(w, "owner is restarting", http.StatusServiceUnavailable)
+				return
+			}
+			defer done()
+		}
 		home := req.Header.Get(supervisorHomeHeader)
 		if !filepath.IsAbs(home) || len(home) > 4096 {
 			http.Error(w, "absolute home worktree required", http.StatusBadRequest)
@@ -468,6 +517,10 @@ func (s *supervisor) handler() http.Handler {
 				defer func() { <-s.frontends.http }()
 			default:
 				http.Error(w, "global supervisor HTTP body capacity reached", http.StatusServiceUnavailable)
+				return
+			}
+			if s.restartHTTPBlocked() {
+				http.Error(w, "owner is restarting", http.StatusServiceUnavailable)
 				return
 			}
 			s.http(w, req, home)
@@ -512,6 +565,13 @@ func (s *supervisor) validateHome(ctx context.Context, home string) error {
 }
 
 func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, home string) {
+	done, ok := s.frontendAdmission()
+	if !ok {
+		http.Error(w, "owner is restarting", http.StatusServiceUnavailable)
+		return
+	}
+	release := sync.OnceFunc(done)
+	defer release()
 	s.frontends.mu.Lock()
 	full := len(s.frontends.sessions)+len(s.frontends.backends) >= s.m.limits.OwnerSessions
 	if full {
@@ -557,13 +617,14 @@ func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, ho
 		delete(s.frontends.sessions, conn)
 		s.frontends.mu.Unlock()
 	}()
-	if req.URL.Path == "/http-frontend" {
-		// The attachment tracks frontend lifetime; MCP requests use /mcp.
-		_, _ = buffered.ReadByte()
-		return
+	session := &restartSession{peer: newRestartPeer(s.ctx, conn, buffered.Reader, s.m.limits.MessageBytes, false), home: home}
+	if req.URL.Path != "/http-frontend" {
+		session.router = newRouter(s.ctx, s, home)
 	}
-	stdio := transport.NewStdio(&bufferedOwnerConn{Reader: buffered.Reader, Conn: conn}, conn, s.m.limits.MessageBytes)
-	_ = serve(s.ctx, s, home, stdio)
+	unregister := s.registerRestartSession(session)
+	defer unregister()
+	release()
+	s.runRestartSession(session)
 }
 
 // Unique comparable identity for an admission in progress, without allocating
@@ -571,13 +632,6 @@ func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, ho
 type sessionReservationConn struct{ net.Conn }
 
 func (*sessionReservationConn) Close() error { return nil }
-
-type bufferedOwnerConn struct {
-	*bufio.Reader
-	net.Conn
-}
-
-func (c *bufferedOwnerConn) Read(p []byte) (int, error) { return c.Reader.Read(p) }
 
 func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string) {
 	s.frontends.mu.Lock()
@@ -758,16 +812,18 @@ type supervisorGenerationSnapshot struct {
 
 type supervisorSnapshot struct {
 	Boot                         string
+	PID                          int
 	Queued, Operations, Sessions int
 	Generations                  []supervisorGenerationSnapshot
 	FDReserved                   int
 	RetainedMessageBytes         int
 	Logs                         *ownerLogSnapshot
+	Restart                      restartStatus
 }
 
 func (s *supervisor) snapshot() supervisorSnapshot {
 	s.mu.Lock()
-	result := supervisorSnapshot{Boot: s.boot, Queued: len(s.queued), Operations: len(s.operations) + len(s.controls), FDReserved: s.fdReserved, RetainedMessageBytes: s.retainedBytes}
+	result := supervisorSnapshot{Boot: s.boot, PID: os.Getpid(), Queued: len(s.queued), Operations: len(s.operations) + len(s.controls), FDReserved: s.fdReserved, RetainedMessageBytes: s.retainedBytes, Restart: s.restartStatus()}
 	for _, g := range s.generations {
 		item := supervisorGenerationSnapshot{Worktree: g.worktree, Generation: g.id, State: string(g.state),
 			TerminationReason: g.reason, PID: g.record.PID, GuardianPID: g.record.GuardianPID,
@@ -836,27 +892,6 @@ func openSupervisorAttachment(ctx context.Context, m *manager, home, endpoint st
 	return conn, reader, nil
 }
 
-func bridgeViaSupervisor(ctx context.Context, m *manager, home string, input io.Reader, output io.Writer) error {
-	conn, reader, err := openSupervisorAttachment(ctx, m, home, "/bridge")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	go func() {
-		_, _ = io.Copy(conn, input)
-		if unix, ok := conn.(*net.UnixConn); ok {
-			_ = unix.CloseWrite()
-		}
-	}()
-	_, err = io.Copy(output, reader)
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return err
-}
-
 func proxyHTTPViaSupervisor(ctx context.Context, m *manager, home, address string, output io.Writer) error {
 	fingerprint, err := supervisorConfig(m)
 	if err != nil {
@@ -868,8 +903,15 @@ func proxyHTTPViaSupervisor(ctx context.Context, m *manager, home, address strin
 	if err != nil {
 		return err
 	}
-	defer func() { _ = control.Close() }()
-	go func() { _, _ = reader.ReadByte(); cancel() }()
+	peer := newRestartPeer(ctx, control, reader, m.limits.MessageBytes, true)
+	gate := &restartHTTPGate{}
+	peer.onPause, peer.onResume = gate.pause, gate.resume
+	client := supervisorHTTPClient(m)
+	defer client.CloseIdleConnections()
+	peer.onDrained = client.CloseIdleConnections
+	peer.start()
+	defer func() { _ = peer.Close() }()
+	go func() { _, _ = peer.Read(ctx); cancel() }()
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
@@ -878,8 +920,6 @@ func proxyHTTPViaSupervisor(ctx context.Context, m *manager, home, address strin
 	if !listener.Addr().(*net.TCPAddr).IP.IsLoopback() {
 		return fmt.Errorf("HTTP MCP must listen on a loopback address")
 	}
-	client := supervisorHTTPClient(m)
-	defer client.CloseIdleConnections()
 	proxy := &httputil.ReverseProxy{Transport: client.Transport, Rewrite: func(proxy *httputil.ProxyRequest) {
 		req := proxy.Out
 		req.URL.Scheme, req.URL.Host, req.URL.Path = "http", "127.0.0.1", "/mcp"
@@ -888,7 +928,14 @@ func proxyHTTPViaSupervisor(ctx context.Context, m *manager, home, address strin
 		req.Header.Set(supervisorConfigHeader, fingerprint)
 		req.Header.Set(supervisorHomeHeader, home)
 	}}
-	server := &http.Server{Handler: protectLoopbackHTTP(proxy), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+	handler := protectLoopbackHTTP(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if err := gate.enter(req.Context()); err != nil {
+			return
+		}
+		defer gate.leave()
+		proxy.ServeHTTP(w, req)
+	}))
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
 		IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10, BaseContext: func(net.Listener) context.Context { return ctx }}
 	stop := context.AfterFunc(ctx, func() { _ = server.Close() })
 	defer stop()

@@ -72,6 +72,8 @@ type router struct {
 	initialize atomic.Pointer[jsonrpc.Request]
 	sticky     string // worktree of the last path-bearing call
 	stateless  bool   // HTTP calls must not inherit another client's worktree
+
+	upstreamReaders atomic.Int64
 }
 
 func newRouter(ctx context.Context, owner *supervisor, home string) *router {
@@ -115,10 +117,14 @@ func newRouter(ctx context.Context, owner *supervisor, home string) *router {
 // context, which every Read and Write below runs under, and Close, which ends
 // the connection itself. Both happen here, in that order.
 func serve(ctx context.Context, owner *supervisor, home string, stdio mcp.Connection) error {
-	m := owner.m
-	ctx, cancel := context.WithCancel(ctx)
+	return serveRouter(newRouter(ctx, owner, home), stdio)
+}
+
+func serveRouter(r *router, stdio mcp.Connection) error {
+	m := r.owner.m
+	ctx, cancel := context.WithCancel(r.ctx)
+	r.ctx = ctx
 	defer cancel()
-	r := newRouter(ctx, owner, home)
 	if r.limits.Metrics {
 		defer r.finishUsage()
 		go r.reportUsage(m.diagnosticWriter())
@@ -240,6 +246,10 @@ func (r *router) readFromClient(stdio mcp.Connection) {
 		r.readIngress(stdio, incoming)
 	}()
 	for call := range incoming {
+		if call.barrier != nil {
+			close(call.barrier)
+			continue
+		}
 		r.routePrepared(call)
 	}
 }
@@ -250,6 +260,16 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 		if err != nil {
 			r.reportError(err)
 			return
+		}
+		if peer, ok := stdio.(*restartPeer); ok {
+			if barrier := peer.barrier(msg); barrier != nil {
+				select {
+				case incoming <- delivery{barrier: barrier}:
+				case <-r.ctx.Done():
+					return
+				}
+				continue
+			}
 		}
 		req, ok := msg.(*jsonrpc.Request)
 		if !ok {

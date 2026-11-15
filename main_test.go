@@ -252,7 +252,7 @@ func TestRunRefusesCommandLinesItHasNoMeaningFor(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "unknown command", args: []string{"gopls-mcp-manager", "restart"}},
+		{name: "unknown command", args: []string{"gopls-mcp-manager", "unknown"}},
 		{name: "list takes no worktree", args: []string{"gopls-mcp-manager", "list", "/repo"}},
 		{name: "bridge takes at most one", args: []string{"gopls-mcp-manager", "bridge", "/repo", "/other"}},
 		{name: "ensure takes at most one", args: []string{"gopls-mcp-manager", "ensure", "/repo", "/other"}},
