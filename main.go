@@ -23,14 +23,23 @@ func main() {
 // it forks a gopls or shells out to git, and the grammar is the part that
 // decides which.
 func run(args []string, stdout io.Writer) error {
-	if len(args) > 1 && args[1] == "internal-guardian" {
-		return runGuardian(args[2:])
+	if len(args) > 1 {
+		switch args[1] {
+		case "internal-guardian":
+			return runGuardian(args[2:])
+		case "internal-restart-check":
+			return runRestartCheck(stdout)
+		case "internal-restart-child":
+			return runRestartChild()
+		case "restart", "reload":
+			return restartCommand(args[2:], args[1] == "reload", stdout)
+		}
 	}
 	command := "bridge"
 	if len(args) > 1 {
 		command = args[1]
 	}
-	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | supervisor | list | status | trim-logs", args[0])
+	usage := fmt.Errorf("usage: %s [bridge|ensure] [worktree-path] | http [listen-address [worktree-path]] | supervisor | list | status | trim-logs | restart [--hot] [--binary path] [--timeout duration] | reload [--binary path] [--timeout duration]", args[0])
 	switch command {
 	case "http":
 		if len(args) > 4 {
@@ -102,7 +111,7 @@ func run(args []string, stdout io.Writer) error {
 		return proxyHTTPViaSupervisor(ctx, m, worktree, address, stdout)
 	}
 
-	return bridgeViaSupervisor(ctx, m, worktree, os.Stdin, os.Stdout)
+	return restartBridge(ctx, m, worktree, os.Stdin, os.Stdout)
 }
 
 // Acquisition probes only the requested worktree. Sweep independently of

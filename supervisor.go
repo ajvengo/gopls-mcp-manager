@@ -338,6 +338,7 @@ type supervisor struct {
 	ready             func(context.Context, int) error
 	updateRecords     func(context.Context, func([]record) ([]record, error)) ([]record, error)
 	portBusy          func(int) bool
+	restart           restartState
 }
 
 type ownerFilesystemJob struct {
@@ -352,9 +353,11 @@ func ownerNonce() string {
 }
 
 func newSupervisor(ctx context.Context, m *manager) *supervisor {
+	ctx, abort := context.WithCancelCause(ctx)
 	s := &supervisor{ctx: ctx, m: m, boot: ownerNonce(), now: time.Now,
 		generations: make(map[string]*ownedGeneration), queued: make(map[*callState]ownerReservation),
 		operations: make(map[remoteKey]ownerOperation), controls: make(map[remoteKey]ownerOperation), filesystem: make(chan ownerFilesystemJob)}
+	s.restart.abort = abort
 	s.sseBudget = transport.NewBudget(m.limits.SSEBytes)
 	s.fdReserved, _ = supervisorFDAllowance(m.limits) // Production validates before constructing the owner.
 	s.estimateQuota = estimateWatchFDQuota

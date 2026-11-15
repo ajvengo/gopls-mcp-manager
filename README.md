@@ -48,6 +48,9 @@ Commands:
 | `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
 | `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS, termination state and log sizes |
 | `gopls-mcp-manager trim-logs` | Discard contents of managed log files above the configured threshold, preserving append descriptors |
+| `gopls-mcp-manager restart` | Drain calls and restart all managed gopls generations, preserving client connections |
+| `gopls-mcp-manager restart --hot [--binary path]` | Fork/exec the selected manager binary and restart all managed gopls generations |
+| `gopls-mcp-manager reload [--binary path]` | Alias for `restart --hot`; defaults to the invoking binary |
 
 `path` is resolved to the root of the worktree containing it, with symlinks
 removed. The worktree the bridge starts in is its **home**.
@@ -76,6 +79,40 @@ Go must report the exact private `TEST_TELEMETRY_DIR` and telemetry `off` before
 startup and each request; incompatible toolchains fail. Global telemetry, HOME
 and GOTOOLCHAIN are preserved. `status` reports generations, completion/idle
 deadlines, attachments, operation/FD reservations and log failures.
+
+### Restart and binary reload
+
+```sh
+gopls-mcp-manager restart
+gopls-mcp-manager reload --binary /absolute/path/to/new/gopls-mcp-manager
+```
+
+Both commands drain admitted calls while keeping cancellation and new client
+attachments live, then refuse new attachments and pause frontend traffic. New
+work racing that pause refuses the restart; retry when clients are quiet.
+Requests already sent upstream are never replayed. Unconfirmed abandoned work,
+uncertain process exit or durable cleanup failures refuse the restart and
+retain their reservations. New calls may wait through the pause; normal client,
+request and idle deadlines still apply.
+`--timeout` bounds the command's wait (default `5m`, positive and at most `1h`).
+
+A hot restart checks the replacement's private protocol and complete resource
+configuration before pausing clients, then hands it the Unix listener, singleton
+lock, frontend sockets and a bounded checkpoint of session state. Both owners'
+FDs are reserved during handoff; the restart refuses before pausing if they
+cannot fit. Contract details: SPEC.md O8.
+
+Thin stdio and HTTP frontends stay attached to clients, keeping partial input and
+public HTTP connections; routing and gopls ownership move to the updated binary.
+The selected binary must support the same private protocol and limits. Changing
+those limits requires a normal service restart. Once handoff commits, startup
+errors are reported by the new owner in `status`; the old executable is not
+relaunched.
+
+**First installation:** older binaries cannot hand off sessions. Stop the old
+owner and reconnect clients once to install this private-protocol upgrade.
+Later compatible upgrades can use `reload`. The existing guardian recovery and
+legacy-record reconciliation rules still apply.
 
 ### Stateless HTTP
 

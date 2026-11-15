@@ -116,6 +116,8 @@ type delivery struct {
 	req    *jsonrpc.Request
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	barrier chan struct{}
 }
 
 // A control carries the exact connection that owes its id. It cannot dial or
@@ -314,7 +316,7 @@ func (l *lane) cache(conn mcp.Connection) {
 		return
 	}
 	l.conn = conn
-	go l.r.readFromUpstream(conn, l.worktree)
+	l.r.startUpstreamReader(conn, l.worktree)
 }
 
 // upstream returns this lane's connection, dialling and handshaking one if it
