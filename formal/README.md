@@ -359,8 +359,8 @@ independent runtime evidence.
 ## Tool pins and observed verification
 
 The official `tlaplus/tlaplus` v1.8.0 asset used here reports TLC
-`2026.11.06.222357` and SHA-256
-`e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f`.
+`2026.11.15.002146` and SHA-256
+`7e53aa636dac8a3cb0533f343115c0548e03fc0ce5edc7739becf58d3d0fb84f`.
 The official `tlaplus/tlapm` 1.6.0-pre assets report commit `ff40755`.
 Their archive digests are pinned in `check.ts`; release asset replacement is
 rejected. Sources: [TLC](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0),

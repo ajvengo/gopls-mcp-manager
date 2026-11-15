@@ -23,8 +23,8 @@ await mkdir(toolDir, { recursive: true });
 await mkdir(evidenceDir, { recursive: true });
 const sha256 = (bytes: Uint8Array | string): string =>
   createHash('sha256').update(bytes).digest('hex');
-const jarHash = 'e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f';
-const jar = join(toolDir, 'tla2tools-1.8.0.jar');
+const jarHash = '7e53aa636dac8a3cb0533f343115c0548e03fc0ce5edc7739becf58d3d0fb84f';
+const jar = join(toolDir, `tla2tools-${jarHash}.jar`);
 const tlapsAssets: Record<string, { name: string; hash: string }> = {
   'darwin-arm64': {
     name: 'tlapm-1.6.0-pre-arm64-darwin.tar.gz',
