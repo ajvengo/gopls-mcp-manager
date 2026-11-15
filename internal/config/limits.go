@@ -18,10 +18,17 @@ type Limits struct {
 	Execution                         time.Duration
 	CacheTTL                          time.Duration
 	MessageBytes, HTTPBytes, SSEBytes int
-	SharedServers                     int
-	LogBytes                          int
-	// OpenFiles caps the lsof rows of every recorded gopls together; the
-	// command's maintenance.go says why that count grows with the worktree.
+	// HTTPConnections bounds admitted client sockets before HTTP header parsing.
+	HTTPConnections int
+	// OwnerSessions bounds stdio sessions and retained HTTP backends together.
+	// OwnerOperations bounds queued and unconfirmed upstream work globally.
+	OwnerSessions, OwnerOperations int
+	OwnerLogBytes                  int
+	OwnerRetainedBytes             int
+	Idle                           time.Duration
+	SharedServers                  int
+	LogBytes                       int
+	// OpenFiles bounds owner, guardian and watched-tree descriptor reservations.
 	OpenFiles int
 	// Metrics is GOPLS_MANAGER_METRICS, kept here so the one env var that is
 	// not a limit is still read in the one place that reads the environment.
@@ -32,17 +39,8 @@ type Limits struct {
 	DirectoryFilters []string
 }
 
-// WithDefaults fills every unset field from Default, so that nothing downstream
-// has to ask whether the value it was handed is populated: a zero field there
-// would otherwise mean a cache of no entries, a message limit of no bytes, or a
-// server cap of none.
-//
-// FromEnv needs none of this — it starts from Default and refuses every
-// non-positive override. newRouter is the caller that does: the manager it is
-// handed may be one a test built field by field, or no manager at all.
-//
-// Execution is deliberately absent: zero is its shipped value and means no
-// execution deadline at all, so there is nothing to fill in.
+// WithDefaults fills nonpositive limits for policy values built by hand.
+// Execution is unchanged; FromEnv validates overrides against Default instead.
 func (l Limits) WithDefaults() Limits {
 	d := Default()
 	for _, field := range []struct{ target, fallback *int }{
@@ -51,6 +49,10 @@ func (l Limits) WithDefaults() Limits {
 		{&l.MessageBytes, &d.MessageBytes}, {&l.HTTPBytes, &d.HTTPBytes},
 		{&l.SSEBytes, &d.SSEBytes}, {&l.SharedServers, &d.SharedServers},
 		{&l.LogBytes, &d.LogBytes}, {&l.OpenFiles, &d.OpenFiles},
+		{&l.HTTPConnections, &d.HTTPConnections},
+		{&l.OwnerSessions, &d.OwnerSessions}, {&l.OwnerOperations, &d.OwnerOperations},
+		{&l.OwnerLogBytes, &d.OwnerLogBytes},
+		{&l.OwnerRetainedBytes, &d.OwnerRetainedBytes},
 	} {
 		if *field.target <= 0 {
 			*field.target = *field.fallback
@@ -59,6 +61,9 @@ func (l Limits) WithDefaults() Limits {
 	if l.CacheTTL <= 0 {
 		l.CacheTTL = d.CacheTTL
 	}
+	if l.Idle <= 0 {
+		l.Idle = d.Idle
+	}
 	return l
 }
 
@@ -66,7 +71,7 @@ func (l Limits) WithDefaults() Limits {
 func Default() Limits {
 	return Limits{PerLane: 128, Session: 1024, Lanes: 64, CacheEntries: 4096, CacheTTL: 5 * time.Minute,
 		MessageBytes: 4 << 20, HTTPBytes: 64 << 20, SSEBytes: 64 << 20, SharedServers: 64, LogBytes: 64 << 20,
-		OpenFiles: 30000}
+		OpenFiles: 30000, HTTPConnections: 128, OwnerSessions: 16, OwnerOperations: 1024, OwnerLogBytes: 64 << 20, OwnerRetainedBytes: 64 << 20, Idle: time.Hour}
 }
 
 // FromEnv applies and validates GOPLS_MANAGER_* overrides to Default.
@@ -82,6 +87,11 @@ func FromEnv() (Limits, error) {
 		{"GOPLS_MANAGER_MAX_CACHE_ENTRIES", &limits.CacheEntries},
 		{"GOPLS_MANAGER_MAX_MESSAGE_BYTES", &limits.MessageBytes},
 		{"GOPLS_MANAGER_HTTP_BODY_BUDGET", &limits.HTTPBytes},
+		{"GOPLS_MANAGER_MAX_HTTP_CONNECTIONS", &limits.HTTPConnections},
+		{"GOPLS_MANAGER_MAX_OWNER_SESSIONS", &limits.OwnerSessions},
+		{"GOPLS_MANAGER_MAX_OWNER_OPERATIONS", &limits.OwnerOperations},
+		{"GOPLS_MANAGER_MAX_LOG_BYTES", &limits.OwnerLogBytes},
+		{"GOPLS_MANAGER_RETAINED_MESSAGE_BUDGET", &limits.OwnerRetainedBytes},
 		{"GOPLS_MANAGER_SSE_BUFFER_BUDGET", &limits.SSEBytes},
 		{"GOPLS_MANAGER_MAX_SERVERS", &limits.SharedServers},
 		{"GOPLS_MANAGER_LOG_TRIM_BYTES", &limits.LogBytes},
@@ -109,11 +119,21 @@ func FromEnv() (Limits, error) {
 		}
 		limits.CacheTTL = value
 	}
+	if raw := os.Getenv("GOPLS_MANAGER_IDLE_TIMEOUT"); raw != "" {
+		value, err := time.ParseDuration(raw)
+		if err != nil || value <= 0 {
+			return limits, fmt.Errorf("GOPLS_MANAGER_IDLE_TIMEOUT must be a positive duration")
+		}
+		limits.Idle = value
+	}
 	if limits.HTTPBytes < limits.MessageBytes {
 		return limits, fmt.Errorf("GOPLS_MANAGER_HTTP_BODY_BUDGET must hold at least one maximum-size message")
 	}
 	if limits.SSEBytes < limits.MessageBytes {
 		return limits, fmt.Errorf("GOPLS_MANAGER_SSE_BUFFER_BUDGET must hold at least one maximum-size message")
+	}
+	if limits.OwnerRetainedBytes < limits.MessageBytes {
+		return limits, fmt.Errorf("GOPLS_MANAGER_RETAINED_MESSAGE_BUDGET must hold at least one maximum-size message")
 	}
 	limits.Metrics = os.Getenv("GOPLS_MANAGER_METRICS") == "1"
 	filters, err := ParseDirectoryFilters(os.Getenv("GOPLS_MANAGER_DIRECTORY_FILTERS"))

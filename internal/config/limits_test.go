@@ -16,6 +16,10 @@ func TestFromEnvRejectsInvalidSettings(t *testing.T) {
 		"GOPLS_MANAGER_SSE_BUFFER_BUDGET", "GOPLS_MANAGER_MAX_SERVERS",
 		"GOPLS_MANAGER_LOG_TRIM_BYTES", "GOPLS_MANAGER_CACHE_TTL",
 		"GOPLS_MANAGER_MAX_OPEN_FILES",
+		"GOPLS_MANAGER_MAX_HTTP_CONNECTIONS",
+		"GOPLS_MANAGER_MAX_OWNER_SESSIONS", "GOPLS_MANAGER_MAX_OWNER_OPERATIONS", "GOPLS_MANAGER_IDLE_TIMEOUT",
+		"GOPLS_MANAGER_MAX_LOG_BYTES",
+		"GOPLS_MANAGER_RETAINED_MESSAGE_BUDGET",
 	} {
 		for _, value := range []string{"0", "-1", "invalid"} {
 			t.Run(name+"/"+value, func(t *testing.T) {
@@ -32,7 +36,7 @@ func TestFromEnvRejectsInvalidSettings(t *testing.T) {
 			require.Error(t, err, "invalid execution timeout accepted")
 		})
 	}
-	for _, name := range []string{"GOPLS_MANAGER_HTTP_BODY_BUDGET", "GOPLS_MANAGER_SSE_BUFFER_BUDGET"} {
+	for _, name := range []string{"GOPLS_MANAGER_HTTP_BODY_BUDGET", "GOPLS_MANAGER_SSE_BUFFER_BUDGET", "GOPLS_MANAGER_RETAINED_MESSAGE_BUDGET"} {
 		t.Run(name+"/smaller than message", func(t *testing.T) {
 			t.Setenv("GOPLS_MANAGER_MAX_MESSAGE_BYTES", "100")
 			t.Setenv(name, "99")
@@ -48,10 +52,16 @@ func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv("GOPLS_MANAGER_MAX_CACHE_ENTRIES", "3")
 	t.Setenv("GOPLS_MANAGER_CACHE_TTL", "1m")
 	t.Setenv("GOPLS_MANAGER_EXECUTION_TIMEOUT", "2m")
+	t.Setenv("GOPLS_MANAGER_MAX_HTTP_CONNECTIONS", "32")
+	t.Setenv("GOPLS_MANAGER_MAX_OWNER_SESSIONS", "4")
+	t.Setenv("GOPLS_MANAGER_MAX_OWNER_OPERATIONS", "20")
+	t.Setenv("GOPLS_MANAGER_IDLE_TIMEOUT", "90m")
 	t.Setenv("GOPLS_MANAGER_METRICS", "1")
 	want := Default()
 	want.PerLane, want.Lanes, want.CacheEntries = 12, 2, 3
 	want.CacheTTL, want.Execution, want.Metrics = time.Minute, 2*time.Minute, true
+	want.HTTPConnections = 32
+	want.OwnerSessions, want.OwnerOperations, want.Idle = 4, 20, 90*time.Minute
 	got, err := FromEnv()
 	require.NoError(t, err)
 	require.Equal(t, want, got, "overrides")
@@ -67,7 +77,8 @@ func TestWithDefaults(t *testing.T) {
 	t.Parallel()
 	configured := Limits{PerLane: 1, Session: 2, Lanes: 3, CacheEntries: 4,
 		MessageBytes: 5, HTTPBytes: 6, SSEBytes: 7, SharedServers: 8, LogBytes: 9, OpenFiles: 10,
-		CacheTTL: time.Minute, Execution: time.Second, Metrics: true}
+		CacheTTL: time.Minute, Execution: time.Second, Metrics: true, HTTPConnections: 11,
+		OwnerSessions: 12, OwnerOperations: 13, Idle: 14 * time.Minute, OwnerLogBytes: 15, OwnerRetainedBytes: 16}
 	partial := Default()
 	partial.Execution, partial.Metrics = time.Second, true
 	for _, tc := range []struct {
