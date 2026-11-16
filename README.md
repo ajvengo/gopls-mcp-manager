@@ -74,11 +74,14 @@ must match owner limits/protocol. The private versioned socket lives under
 its singleton lock is beside the registry. Budgets do not cap total RSS or
 universally contain escaped project descendants.
 
-Managed gopls disables its telemetry sidecar with `GO_TELEMETRY_CHILD=2`. Delegated
-Go must report the exact private `TEST_TELEMETRY_DIR` and telemetry `off` before
-startup and each request; incompatible toolchains fail. Global telemetry, HOME
-and GOTOOLCHAIN are preserved. `status` reports generations, completion/idle
-deadlines, attachments, operation/FD reservations and log failures.
+Managed gopls must report version v0.23.0 or newer; dependency hashes do not gate
+startup. Normal MCP initialization validates the connection. The guardian sets
+`GO_TELEMETRY_CHILD=2` to suppress telemetry sidecars in tested releases; future
+versions may change this internal convention and launch processes outside the
+owned group. Delegated Go must report the exact private `TEST_TELEMETRY_DIR` and
+telemetry `off` before startup and each request; incompatible toolchains fail.
+Global telemetry, HOME and GOTOOLCHAIN are preserved. `status` reports generations,
+completion/idle deadlines, attachments, operation/FD reservations and log failures.
 
 ### Restart and binary reload
 
@@ -445,7 +448,7 @@ CI uses the latest patch release matching `go.mod` (Go 1.27), builds for
 `linux/amd64` and `darwin/arm64`, and requires 85% statement coverage in every
 package and overall. Tests use real HTTP/stdio/SSE transports with SDK upstreams.
 The optional real-gopls suite starts and reaps children in disposable worktrees
-with a private registry; CI installs gopls v0.23.0 and runs it too:
+with a private registry; CI runs it against gopls v0.23.0 and v0.24.0:
 
 ```sh
 go test -race -tags=integration -run '^TestEndToEndRealGopls$' -timeout=3m .

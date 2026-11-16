@@ -56,8 +56,12 @@ jobs:
       - run: go test -race -coverprofile="${{ runner.temp }}/coverage.out" ./...
       - run: python3 -m unittest discover -s scripts
       - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
-      - run: go install golang.org/x/tools/gopls@v0.23.0
-      - run: go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
+      - name: Verify supported gopls releases
+        run: |
+          for version in v0.23.0 v0.24.0; do
+            go install "golang.org/x/tools/gopls@$version"
+            go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
+          done
 
   lint:
     runs-on: ubuntu-latest
@@ -89,8 +93,12 @@ jobs:
           "$HOME/.local/bin/but" --version
       - run: go test -race -count=1 -coverprofile="${{ runner.temp }}/coverage.out" . ./internal/config ./internal/transport ./internal/protocol
       - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
-      - run: go install golang.org/x/tools/gopls@v0.23.0
-      - run: go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
+      - name: Verify supported gopls releases
+        run: |
+          for version in v0.23.0 v0.24.0; do
+            go install "golang.org/x/tools/gopls@$version"
+            go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
+          done
 
   formal:
     strategy:
@@ -110,9 +118,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
+      - uses: actions/cache@v5.0.4
+        with:
+          path: ${{ runner.temp }}/formal-tools
+          key: formal-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('formal/check.ts') }}
       - run: bun --install=force run formal/check.ts all
         # runner context is unavailable in job-level env.
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           GOPLS_FORMAL_TOOLS: ${{ runner.temp }}/formal-tools
           GOPLS_FORMAL_OUT: ${{ runner.temp }}/formal-evidence
       - uses: actions/upload-artifact@v7

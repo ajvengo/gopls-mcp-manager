@@ -36,7 +36,7 @@ func realGoplsFixture(t testing.TB) (*supervisor, string, string) {
 	t.Helper()
 	binary, err := exec.LookPath(goplsBinary)
 	require.NoError(t, err, "integration tests require gopls on PATH")
-	require.NoError(t, guardianCheckTelemetry(binary))
+	require.NoError(t, guardianCheckGopls(binary))
 	root, linked := newLinkedWorktree(t)
 	for dir, marker := range map[string]string{root: "RootMarker", linked: "LinkedMarker"} {
 		mustWriteFile(t, filepath.Join(dir, "go.mod"), "module example.com/fixture\n\ngo 1.27\n")
@@ -354,7 +354,7 @@ func TestGuardianRealGoplsTelemetrySuppressed(t *testing.T) {
 	t.Parallel()
 	binary, err := exec.LookPath(goplsBinary)
 	require.NoError(t, err)
-	require.NoError(t, guardianCheckTelemetry(binary))
+	require.NoError(t, guardianCheckGopls(binary))
 	lsof, err := exec.LookPath("lsof")
 	require.NoError(t, err)
 	dir := t.TempDir()
@@ -419,7 +419,7 @@ func TestGuardianRealGoPrivateTelemetryMode(t *testing.T) {
 func TestAuditRealGoplsHotRestart(t *testing.T) {
 	binary, err := exec.LookPath(goplsBinary)
 	require.NoError(t, err)
-	require.NoError(t, guardianCheckTelemetry(binary))
+	require.NoError(t, guardianCheckGopls(binary))
 	root, linked := newLinkedWorktree(t)
 	for dir, marker := range map[string]string{root: "RootMarker", linked: "LinkedMarker"} {
 		mustWriteFile(t, filepath.Join(dir, "go.mod"), "module example.com/restart\n\ngo 1.27\n")

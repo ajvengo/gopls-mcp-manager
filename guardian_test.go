@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"testing"
@@ -416,13 +417,51 @@ func TestGuardianConfigAndTelemetryPolicy(t *testing.T) {
 	t.Parallel()
 	env := guardianEnvironment([]string{"UNRELATED=value", "GO_TELEMETRY_CHILD=1", "GO_TELEMETRY_CHILD_UPLOAD=1", "TEST_TELEMETRY_DIR=foreign"}, "/private/telemetry")
 	require.Equal(t, []string{"UNRELATED=value", "GO_TELEMETRY_CHILD=2", "TEST_TELEMETRY_DIR=/private/telemetry"}, env)
-	require.Error(t, guardianCheckTelemetry(os.Args[0]), "a test binary is not the supported gopls executable")
-	require.Error(t, guardianCheckTelemetry(filepath.Join(t.TempDir(), "missing")))
+	require.Error(t, guardianCheckGopls(os.Args[0]), "a test binary is not the supported gopls executable")
+	require.Error(t, guardianCheckGopls(filepath.Join(t.TempDir(), "missing")))
 	require.Error(t, runGuardian([]string{"unexpected"}))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err := startGuardian(ctx, t.TempDir(), firstPort, t.TempDir(), io.Discard, 512)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestGuardianGoplsVersionCompatibility(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		version string
+		allowed bool
+	}{
+		{"v0.22.9", false},
+		{"v0.23.0-rc.1", false},
+		{"v0.23.0", true},
+		{"v0.23.1", true},
+		{"v0.24.0", true},
+		{"v1.0.0", true},
+		{"v99.0.0", true},
+		{"(devel)", false},
+		{"invalid", false},
+		{"", false},
+	} {
+		t.Run(test.version, func(t *testing.T) {
+			t.Parallel()
+			build := &debug.BuildInfo{
+				Path: "golang.org/x/tools/gopls", Main: debug.Module{Version: test.version},
+				Deps: []*debug.Module{{Path: "golang.org/x/telemetry", Version: "unknown", Sum: "unrecognised", Replace: &debug.Module{Path: "example.com/telemetry"}}},
+			}
+			err := guardianValidateGopls(build)
+			if test.allowed {
+				require.NoError(t, err, "dependency metadata must not gate supported versions")
+			} else {
+				require.ErrorContains(t, err, "requires gopls v0.23.0 or newer")
+			}
+		})
+	}
+	t.Run("wrong binary", func(t *testing.T) {
+		t.Parallel()
+		build := &debug.BuildInfo{Path: "example.com/gopls", Main: debug.Module{Version: "v0.24.0"}}
+		require.ErrorContains(t, guardianValidateGopls(build), "requires gopls")
+	})
 }
 
 func TestGuardianSnapshotAndDetection(t *testing.T) {

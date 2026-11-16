@@ -4,8 +4,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 // Run with: bun --install=force run formal/check.ts [all|models|mutations|proofs]
-// Tools and generated evidence stay outside the checkout. A changed upstream
-// rolling asset fails its pinned hash; it is never silently accepted.
+// Tools and evidence stay outside the checkout. Asset IDs and hashes pin the
+// downloaded bytes; cached archives are verified on every run.
 const sourceDir = dirname(import.meta.path);
 const mode = process.argv[2] ?? 'all';
 if (!['all', 'models', 'mutations', 'proofs'].includes(mode)) {
@@ -25,14 +25,15 @@ const sha256 = (bytes: Uint8Array | string): string =>
   createHash('sha256').update(bytes).digest('hex');
 const jarHash = '7e53aa636dac8a3cb0533f343115c0548e03fc0ce5edc7739becf58d3d0fb84f';
 const jar = join(toolDir, `tla2tools-${jarHash}.jar`);
-const tlapsAssets: Record<string, { name: string; hash: string }> = {
+const tlapsCommit = 'bf665f4d162c1ae5010ca878578cd50a810ec205';
+const tlapsAssets: Record<string, { id: number; hash: string }> = {
   'darwin-arm64': {
-    name: 'tlapm-1.6.0-pre-arm64-darwin.tar.gz',
-    hash: '76c2b7871fce30f26543e432d0e2cff506450fc90f70d18f7a032cf05a614a16',
+    id: 753937802,
+    hash: '05945a4e2c72d96a60b180fdb89403b36f9ef7a16d2f247c49667cafffb20318',
   },
   'linux-x64': {
-    name: 'tlapm-1.6.0-pre-x86_64-linux-gnu.tar.gz',
-    hash: '99db29f119cb6f43ffed653b212ba2d005e5bf8e242c53468876cb0d08da6bcc',
+    id: 753940334,
+    hash: '1fcb037a300929d4bed8539511f65073fc19762abd9cea5260fe91d0f2d617df',
   },
 };
 const modelSources: Record<string, string> = {
@@ -73,7 +74,11 @@ for (const [name, text] of Object.entries(modelSources)) {
 
 async function pinnedDownload(path: string, url: string, hash: string): Promise<void> {
   if (!await Bun.file(path).exists()) {
-    const response = await fetch(url);
+    const headers: Record<string, string> = { Accept: 'application/octet-stream' };
+    if (process.env.GITHUB_TOKEN && new URL(url).origin === 'https://api.github.com') {
+      headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+    }
+    const response = await fetch(url, { headers });
     if (!response.ok) throw new Error(`Download failed: ${response.status} ${url}`);
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (sha256(bytes) !== hash) throw new Error(`SHA-256 mismatch: ${url}`);
@@ -134,7 +139,7 @@ async function run(name: string, command: string[], expected: string): Promise<R
   const { output: _output, ...summary } = result;
   results.push(summary);
   await Bun.write(join(evidenceDir, 'results.json'), JSON.stringify({
-    tools: { tlcSHA256: jarHash, tlapsCommit: 'ff40755' },
+    tools: { tlcSHA256: jarHash, tlapsCommit },
     environment: { platform: process.platform, arch: process.arch,
       bun: Bun.version, revision: process.env.GOPLS_FORMAL_REVISION ?? null },
     sourceHashes, results,
@@ -230,12 +235,18 @@ if (mode === 'all' || mode === 'mutations') {
 if (mode === 'all' || mode === 'proofs') {
   const asset = tlapsAssets[`${process.platform}-${process.arch}`];
   if (!asset) throw new Error('No pinned TLAPS binary for this platform; proof run is incomplete');
-  const archive = join(toolDir, asset.name);
+  const archive = join(toolDir, `tlapm-${asset.hash}.tar.gz`);
   await pinnedDownload(archive,
-    `https://github.com/tlaplus/tlapm/releases/download/1.6.0-pre/${asset.name}`, asset.hash);
-  const extract = await run('extract-tlaps', ['tar', '-xzf', archive, '-C', toolDir], 'pass');
+    `https://api.github.com/repos/tlaplus/tlapm/releases/assets/${asset.id}`, asset.hash);
+  const installation = join(toolDir, `tlaps-${asset.hash}`);
+  await mkdir(installation, { recursive: true });
+  const extract = await run('extract-tlaps', ['tar', '-xzf', archive, '-C', installation], 'pass');
   if (extract.exitCode !== 0) throw new Error('TLAPS extraction failed');
-  const prover = join(toolDir, 'tlapm', 'bin', 'tlapm');
+  const prover = join(installation, 'tlapm', 'bin', 'tlapm');
+  const version = await run('tlaps-version', [prover, '--version'], 'pass');
+  if (version.exitCode !== 0 || version.output.trim() !== tlapsCommit.slice(0, 7)) {
+    throw new Error(`Unexpected TLAPS revision; expected ${tlapsCommit}`);
+  }
   for (const model of ['AdmissionCore', 'ReservationCore', 'LifecycleCore']) {
     const result = await run(`proof-${model}`, [prover, '--strict', '--nofp', '--threads', '2',
       '--cache-dir', join(evidenceDir, `${model}-proof-cache`), `${model}.tla`], 'proved');
