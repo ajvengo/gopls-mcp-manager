@@ -8,13 +8,14 @@ This Go module provides one MCP endpoint backed by a gopls process per Git workt
 
 ## Build, Test, and Development Commands
 
-Use Go 1.27 as specified in `go.mod`. Git and a gopls binary supporting `gopls mcp` must be on `PATH` for local operation.
+Use Go 1.27 as specified in `go.mod`. Runtime requires Git, Go and a Go-built gopls v0.23.0 or newer on `PATH`; CI exercises gopls v0.23.0 and v0.24.0 on Linux and macOS. Dependency hashes do not gate gopls startup; selected Go toolchains must pass the private telemetry-off checks in SPEC P5.
 
 - `go build .` builds the local command.
 - `go run . http 127.0.0.1:6099 /absolute/path/to/repo` starts the loopback HTTP MCP endpoint at `/mcp`.
 - `go run . bridge /absolute/path/to/repo` starts the stdio bridge.
 - `go test -race .` checks root integration and lifecycle behavior; test changed internal packages explicitly. See `README.md` for coverage, real-gopls integration, and pprof commands.
 - `golangci-lint fmt` formats Go code; `golangci-lint run ./...` must pass before committing. CI uses v2.14.0 and builds Linux/amd64 and Darwin/arm64.
+- `bun --install=force run formal/check.ts all` runs lifecycle models, proofs and mutation checks; CI uses Java 25 and Bun 1.4.4 on Linux and macOS. See `formal/README.md` for pinned tools, evidence and proof scope.
 
 ## Coding Style & Naming Conventions
 

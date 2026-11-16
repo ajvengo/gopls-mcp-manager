@@ -7,7 +7,7 @@ against the transition obligations below before these results support a release.
 
 ## Reproduce
 
-Install Java 17 or newer and Bun, then run from the repository root:
+Use Java 25 on `PATH` and Bun 1.4.4 to match CI, then run from the repository root:
 
 ```sh
 bun --install=force run formal/check.ts all
@@ -30,7 +30,8 @@ and SHA-256 digests; archives and installations are named by digest. CI uses its
 read-only GitHub token for API downloads, caches tools with an exact
 OS/architecture/runner-source key, and rechecks archive hashes before extraction.
 A deleted upstream asset with no retained cache fails; review and update the pin
-explicitly. There is no alternate verifier or silently
+explicitly. Local API downloads use `GITHUB_TOKEN` when supplied; only requests
+to `api.github.com` receive it. There is no alternate verifier or silently
 accepted partial result.
 
 The `models`, `mutations`, and `proofs` subcommands run individual groups. The
@@ -42,7 +43,7 @@ a generic nonzero exit is not sufficient. It copies proof sources into the
 evidence directory before mutating guards, leaving repository sources intact.
 
 The pinned TLAPS release provides Darwin/arm64 and Linux/amd64 binaries. Model
-checks work wherever the pinned Java toolchain runs. Proof runs on other
+checks can run on other platforms with Java and Bun. Proof runs on other
 platforms fail explicitly. The native binary is extracted outside the repo.
 
 ## What is modeled
@@ -338,9 +339,12 @@ coverage of local ID reuse, boot fencing and bounded liveness.
   not TLA+/TLAPS theorems. Arbitrary escaped/reparented descendant sessions on
   Darwin cannot be proven contained by group TERM. Detected escapes retain
   uncertainty; no claim of universal descendant cleanup follows.
-- Pinned gopls/x/telemetry and selected Go private-telemetry-off compatibility
-  checks constrain supported subprocess behavior. Formal models do not prove
-  telemetry containment, dependency validation, or third-party code resource use.
+- The [runtime compatibility policy](../SPEC.md#9-spawning) requires gopls
+  v0.23.0 or newer and checks the selected Go toolchain's private telemetry-off
+  state. Telemetry dependencies are not pinned. Formal models do not verify
+  sidecar suppression, subprocess containment or third-party resource use.
+- [Hot restart](../SPEC.md#persistent-owner-contract), including descriptor and
+  session transfer, is covered by runtime tests rather than these formal models.
 - No automated trace-to-model replay or complete runtime suite for every formal
   mutation is supplied. In particular, the retirement active-work/grace/credit
   traces have corresponding assertions, but early-slot replacement while TERM
