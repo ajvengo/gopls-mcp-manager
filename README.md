@@ -74,11 +74,14 @@ must match owner limits/protocol. The private versioned socket lives under
 its singleton lock is beside the registry. Budgets do not cap total RSS or
 universally contain escaped project descendants.
 
-Managed gopls disables its telemetry sidecar with `GO_TELEMETRY_CHILD=2`. Delegated
-Go must report the exact private `TEST_TELEMETRY_DIR` and telemetry `off` before
-startup and each request; incompatible toolchains fail. Global telemetry, HOME
-and GOTOOLCHAIN are preserved. `status` reports generations, completion/idle
-deadlines, attachments, operation/FD reservations and log failures.
+Managed gopls must report version v0.23.0 or newer; dependency hashes do not gate
+startup. Normal MCP initialization validates the connection. The guardian sets
+`GO_TELEMETRY_CHILD=2` to suppress telemetry sidecars in tested releases; future
+versions may change this internal convention and launch processes outside the
+owned group. Delegated Go must report the exact private `TEST_TELEMETRY_DIR` and
+telemetry `off` before startup and each request; incompatible toolchains fail.
+Global telemetry, HOME and GOTOOLCHAIN are preserved. `status` reports generations,
+completion/idle deadlines, attachments, operation/FD reservations and log failures.
 
 ### Restart and binary reload
 

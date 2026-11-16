@@ -74,8 +74,8 @@ fit the original child quota before publication or Write. Expansion fails and
 requires a new generation, preserving the prior snapshot and active/unknown-work
 protection. These limits do not bound RSS, arbitrary project subprocess fanout,
 external caches or all kernel watcher memory. Darwin process groups cannot prove
-containment of arbitrary escaped descendants. Unsupported selected Go/gopls
-telemetry contracts fail explicitly (P5).
+containment of arbitrary escaped descendants. Old or unversioned gopls builds
+and incompatible selected Go telemetry settings fail explicitly (P5).
 → `TestSupervisorExpandedRootsRefuseBeforePublicationAndPreserveRetirement`,
 `TestSupervisorSameAndSmallerRootsFitImmutableQuota`
 
@@ -552,11 +552,17 @@ the active owner's files.
 → `FuzzLogPath`, `TestLogTrimPreservesInheritedAppendDescriptor`,
 `TestLogTrimIgnoresUnrelatedFilesAndSymlinks`, `TestRunTrimLogs`
 
-P5. Verified dependency version/checksum pairs suppress managed gopls telemetry
-sidecars for gopls v0.23.0 and v0.24.0; unknown or replaced dependencies fail.
+P5. A Go-built gopls must report a semantic version of at least v0.23.0. Missing,
+invalid, `(devel)` and older version strings fail; telemetry dependency versions,
+checksums and replacements do not gate startup. Normal MCP initialization still validates
+the connection. The guardian sets the internal `GO_TELEMETRY_CHILD=2` switch,
+which suppresses telemetry sidecars in tested releases. Newer versions may change
+that convention; escaped telemetry descendants then lie outside strict process
+and FD accounting. The version floor is a support policy, not containment proof.
 Before startup and every delivery, the selected Go toolchain must report the
 exact private telemetry-off directory. Mismatch fails without changing global
 telemetry, HOME or GOTOOLCHAIN.
+→ `TestGuardianGoplsVersionCompatibility`, `TestGuardianConfigAndTelemetryPolicy`
 
 ## 10. Known limits
 
@@ -771,7 +777,7 @@ not merely the caller stopping its wait.
 | Logs | One global worker; 128 jobs/≤1 MiB allocated queued+active payload; owner 64 MiB disk/≤server-cap+1 files | Bounded retention, serialized append, confirmed release; one terminal failure channel | Active-append counters approximate; mutation checks cover touched files; sole managed writer required |
 | Usage/pending mirrors | Removed; owner operations replace advisory files/sampled LFU | Not applicable | Stop old writers before migration |
 | Helpers | Stdout 64 KiB/4 MiB, stderr 64 KiB, derived deadline, 250 ms pipe-wait delay | Cancel/reap direct child on error/overflow; reject partial snapshots | Escaped grandchildren need OS containment |
-| Telemetry | Pinned managed-sidecar suppression; shared private mode-off state | Check selected Go's exact off directory before spawn/delivery | Compatibility mismatch fails; external caches/global telemetry unchanged |
+| Telemetry | Internal sidecar-suppression request; private Go mode-off state | Check selected Go's exact off directory before spawn/delivery | Future sidecars may escape accounting; external caches/global telemetry unchanged |
 
 ### Evidence and remaining work
 

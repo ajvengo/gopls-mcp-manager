@@ -19,17 +19,14 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 // Keep the lease descriptor reachable until OS process exit, including main's
 // final diagnostic/exit path. Closing it when runGuardian returns would expose
 // an inert reservation while a still-resident guardian consumes resources.
 var guardianLifetimeLease *os.File
-
-var guardianTelemetryContracts = [...]struct{ version, sum string }{
-	{"v0.0.0-20260625142307-59b4966ccb57", "h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc="},
-	{"v0.0.0-20260924152758-ed294f943157", "h1:DftxASHKl6JolFPqoN+2WrFO53JvkHwRXvFqf8gsivA="},
-}
 
 func runGuardian(args []string) error {
 	if len(args) > 0 && args[0] == "child" {
@@ -129,7 +126,7 @@ func guardianServe(config guardianConfig, control io.Reader, status io.Writer) e
 	}()
 	record := guardianRecord{Version: guardianProtocol, Token: config.Token,
 		GuardianPID: os.Getpid(), Worktree: config.Worktree, Port: config.Port,
-		CreatedAt: time.Now().UnixMilli(), Scope: "process-group; telemetry suppressed", MaxOpenFiles: config.MaxOpenFiles}
+		CreatedAt: time.Now().UnixMilli(), Scope: "process-group; telemetry suppression requested", MaxOpenFiles: config.MaxOpenFiles}
 	if err := guardianWriteRecord(config.StatePath, record); err != nil {
 		return guardianUnstartedFailure(status, config.StatePath, err)
 	}
@@ -754,7 +751,7 @@ func startGuardian(ctx context.Context, worktree string, port int, stateDir stri
 	if err != nil {
 		return nil, err
 	}
-	if err := guardianCheckTelemetry(binary); err != nil {
+	if err := guardianCheckGopls(binary); err != nil {
 		return nil, err
 	}
 	executable, err := os.Executable()
@@ -768,10 +765,7 @@ func startGuardian(ctx context.Context, worktree string, port int, stateDir stri
 	return startGuardianCommand(ctx, config, output, exec.Command(executable, "internal-guardian"))
 }
 
-// The internal telemetry switch is a tested dependency contract, not a public
-// gopls option. Refuse unknown/replaced implementations rather than leave a
-// daemonized telemetry child outside the guardian's process group.
-func guardianCheckTelemetry(binary string) error {
+func guardianCheckGopls(binary string) error {
 	info, err := os.Stat(binary)
 	if err != nil {
 		return err
@@ -781,26 +775,16 @@ func guardianCheckTelemetry(binary string) error {
 	}
 	build, err := buildinfo.ReadFile(binary)
 	if err != nil {
-		return fmt.Errorf("guardian cannot verify gopls telemetry contract: %w", err)
+		return fmt.Errorf("guardian cannot read gopls version: %w", err)
 	}
-	return guardianValidateTelemetry(build)
+	return guardianValidateGopls(build)
 }
 
-func guardianValidateTelemetry(build *buildinfo.BuildInfo) error {
-	if build.Path != "golang.org/x/tools/gopls" {
-		return fmt.Errorf("guardian requires a Go gopls binary with a verified telemetry contract")
+func guardianValidateGopls(build *buildinfo.BuildInfo) error {
+	if build.Path != "golang.org/x/tools/gopls" || semver.Compare(build.Main.Version, "v0.23.0") < 0 {
+		return fmt.Errorf("guardian requires gopls v0.23.0 or newer (found %s %q)", build.Path, build.Main.Version)
 	}
-	for _, dep := range build.Deps {
-		if dep.Path != "golang.org/x/telemetry" || dep.Replace != nil {
-			continue
-		}
-		for _, contract := range guardianTelemetryContracts {
-			if dep.Version == contract.version && dep.Sum == contract.sum {
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("unsupported gopls telemetry dependency: require a verified unreplaced golang.org/x/telemetry version/checksum pair; managed telemetry must not fork an unowned session")
+	return nil
 }
 
 func guardianEnvironment(env []string, telemetryDir string) []string {
@@ -905,7 +889,7 @@ func startGuardianCommand(ctx context.Context, config guardianConfig, output io.
 	// helper between fork and its first durable child identity update.
 	initial := guardianRecord{Version: guardianProtocol, Token: config.Token,
 		Worktree: config.Worktree, Port: config.Port, CreatedAt: time.Now().UnixMilli(),
-		Scope: "process-group; telemetry suppressed", MaxOpenFiles: config.MaxOpenFiles}
+		Scope: "process-group; telemetry suppression requested", MaxOpenFiles: config.MaxOpenFiles}
 	if err := guardianWriteRecord(config.StatePath, initial); err != nil {
 		return unstarted(err)
 	}

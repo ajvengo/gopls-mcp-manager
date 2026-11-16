@@ -417,8 +417,8 @@ func TestGuardianConfigAndTelemetryPolicy(t *testing.T) {
 	t.Parallel()
 	env := guardianEnvironment([]string{"UNRELATED=value", "GO_TELEMETRY_CHILD=1", "GO_TELEMETRY_CHILD_UPLOAD=1", "TEST_TELEMETRY_DIR=foreign"}, "/private/telemetry")
 	require.Equal(t, []string{"UNRELATED=value", "GO_TELEMETRY_CHILD=2", "TEST_TELEMETRY_DIR=/private/telemetry"}, env)
-	require.Error(t, guardianCheckTelemetry(os.Args[0]), "a test binary is not the supported gopls executable")
-	require.Error(t, guardianCheckTelemetry(filepath.Join(t.TempDir(), "missing")))
+	require.Error(t, guardianCheckGopls(os.Args[0]), "a test binary is not the supported gopls executable")
+	require.Error(t, guardianCheckGopls(filepath.Join(t.TempDir(), "missing")))
 	require.Error(t, runGuardian([]string{"unexpected"}))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -426,50 +426,42 @@ func TestGuardianConfigAndTelemetryPolicy(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-func TestGuardianTelemetryCompatibility(t *testing.T) {
+func TestGuardianGoplsVersionCompatibility(t *testing.T) {
 	t.Parallel()
-	for _, release := range []struct{ name, version, sum string }{
-		{"gopls v0.23.0", "v0.0.0-20260625142307-59b4966ccb57", "h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc="},
-		{"gopls v0.24.0", "v0.0.0-20260924152758-ed294f943157", "h1:DftxASHKl6JolFPqoN+2WrFO53JvkHwRXvFqf8gsivA="},
+	for _, test := range []struct {
+		version string
+		allowed bool
+	}{
+		{"v0.22.9", false},
+		{"v0.23.0-rc.1", false},
+		{"v0.23.0", true},
+		{"v0.23.1", true},
+		{"v0.24.0", true},
+		{"v1.0.0", true},
+		{"v99.0.0", true},
+		{"(devel)", false},
+		{"invalid", false},
+		{"", false},
 	} {
-		t.Run(release.name, func(t *testing.T) {
+		t.Run(test.version, func(t *testing.T) {
 			t.Parallel()
-			for _, scenario := range []string{"supported", "unknown version", "wrong checksum", "crossed pair", "replacement", "wrong module", "wrong binary", "missing dependency"} {
-				t.Run(scenario, func(t *testing.T) {
-					t.Parallel()
-					dep := &debug.Module{Path: "golang.org/x/telemetry", Version: release.version, Sum: release.sum}
-					build := &debug.BuildInfo{Path: "golang.org/x/tools/gopls", Deps: []*debug.Module{dep}}
-					switch scenario {
-					case "unknown version":
-						dep.Version = "v0.0.0-unknown"
-					case "wrong checksum":
-						dep.Sum = "h1:unknown"
-					case "crossed pair":
-						if release.name == "gopls v0.23.0" {
-							dep.Version = "v0.0.0-20260924152758-ed294f943157"
-						} else {
-							dep.Version = "v0.0.0-20260625142307-59b4966ccb57"
-						}
-					case "replacement":
-						copy := *dep
-						dep.Replace = &copy
-					case "wrong module":
-						dep.Path = "example.com/telemetry"
-					case "wrong binary":
-						build.Path = "example.com/gopls"
-					case "missing dependency":
-						build.Deps = nil
-					}
-					err := guardianValidateTelemetry(build)
-					if scenario == "supported" {
-						require.NoError(t, err)
-					} else {
-						require.Error(t, err)
-					}
-				})
+			build := &debug.BuildInfo{
+				Path: "golang.org/x/tools/gopls", Main: debug.Module{Version: test.version},
+				Deps: []*debug.Module{{Path: "golang.org/x/telemetry", Version: "unknown", Sum: "unrecognised", Replace: &debug.Module{Path: "example.com/telemetry"}}},
+			}
+			err := guardianValidateGopls(build)
+			if test.allowed {
+				require.NoError(t, err, "dependency metadata must not gate supported versions")
+			} else {
+				require.ErrorContains(t, err, "requires gopls v0.23.0 or newer")
 			}
 		})
 	}
+	t.Run("wrong binary", func(t *testing.T) {
+		t.Parallel()
+		build := &debug.BuildInfo{Path: "example.com/gopls", Main: debug.Module{Version: "v0.24.0"}}
+		require.ErrorContains(t, guardianValidateGopls(build), "requires gopls")
+	})
 }
 
 func TestGuardianSnapshotAndDetection(t *testing.T) {
