@@ -12,9 +12,9 @@ workspace. So a single gopls cannot serve an agent that works across linked
 worktrees — which is exactly what worktree isolation produces.
 
 `gopls-mcp-manager` sits between the MCP client and gopls. It speaks stateless
-Streamable HTTP or stdio MCP to the client, and routes each tool call to the gopls that owns the file the
-call names, starting that gopls on demand. The client sees one server and
-performs one handshake.
+Streamable HTTP or stdio MCP to the client, and routes each tool call to the
+gopls that owns the named file, starting it on demand. The client sees one server
+and performs one handshake.
 
 ## Install
 
@@ -22,8 +22,11 @@ performs one handshake.
 go install github.com/ajvengo/gopls-mcp-manager@latest
 ```
 
-`gopls` must be on `PATH` to start a server. `list` does not need it, so a
-stranded server can still be found and reaped after gopls has moved.
+Building requires Go 1.27 or newer. Runtime requires Git, Go, and a Go-built
+`gopls` v0.23.0 or newer on `PATH`; CI exercises v0.23.0 and v0.24.0 on Linux and
+macOS. The manager checks gopls' package identity and declared module version,
+without a dependency allowlist. Missing, invalid and `(devel)` versions fail.
+`list` and `status` do not need gopls to inspect retained state.
 
 ## Use
 
@@ -47,7 +50,7 @@ Commands:
 | `gopls-mcp-manager supervisor` | Run the persistent owner in the foreground for startup diagnostics |
 | `gopls-mcp-manager list` | Sweep records and list retained servers, including terminating ones |
 | `gopls-mcp-manager status` | Read-only JSON with recorded server count, identity-checked RSS, termination state and log sizes |
-| `gopls-mcp-manager trim-logs` | Discard contents of managed log files above the configured threshold, preserving append descriptors |
+| `gopls-mcp-manager trim-logs` | Offline: truncate managed logs above the configured threshold in place |
 | `gopls-mcp-manager restart` | Drain calls and restart all managed gopls generations, preserving client connections |
 | `gopls-mcp-manager restart --hot [--binary path]` | Fork/exec the selected manager binary and restart all managed gopls generations |
 | `gopls-mcp-manager reload [--binary path]` | Alias for `restart --hot`; defaults to the invoking binary |
@@ -74,48 +77,79 @@ must match owner limits/protocol. The private versioned socket lives under
 its singleton lock is beside the registry. Budgets do not cap total RSS or
 universally contain escaped project descendants.
 
-Managed gopls must report version v0.23.0 or newer; dependency hashes do not gate
-startup. Normal MCP initialization validates the connection. The guardian sets
-`GO_TELEMETRY_CHILD=2` to suppress telemetry sidecars in tested releases; future
-versions may change this internal convention and launch processes outside the
-owned group. Delegated Go must report the exact private `TEST_TELEMETRY_DIR` and
-telemetry `off` before startup and each request; incompatible toolchains fail.
-Global telemetry, HOME and GOTOOLCHAIN are preserved. `status` reports generations,
-completion/idle deadlines, attachments, operation/FD reservations and log failures.
+Normal MCP initialization validates each upstream connection. The guardian sets
+`GO_TELEMETRY_CHILD=2`, an internal Go telemetry convention that suppresses
+sidecars in the tested gopls releases. It does not prove containment of future
+versions. The selected Go toolchain must report the exact private
+`TEST_TELEMETRY_DIR` and telemetry `off` before startup and each request; a
+mismatch fails. Global telemetry, HOME and GOTOOLCHAIN are preserved. See
+[SPEC P5](SPEC.md#9-spawning) for the compatibility contract.
 
 ### Restart and binary reload
 
+Use these commands to replace gopls indexes or upgrade the shared manager while
+keeping editors and agents connected:
+
+| Command | What changes | When to use it |
+| --- | --- | --- |
+| `restart` | All retained gopls generations; the owner stays running | After updating gopls or when a fresh index is needed |
+| `restart --hot` | The shared owner binary and all retained gopls generations | Install an updated manager without reconnecting clients |
+| `reload` | Same fork/exec handoff as `restart --hot` | Short form for a manager binary upgrade |
+
+To restart gopls, run this as the same OS user with the same manager configuration
+as the running owner:
+
 ```sh
-gopls-mcp-manager restart
-gopls-mcp-manager reload --binary /absolute/path/to/new/gopls-mcp-manager
+gopls-mcp-manager restart --timeout 5m
 ```
 
-Both commands drain admitted calls while keeping cancellation and new client
-attachments live, then refuse new attachments and pause frontend traffic. New
-work racing that pause refuses the restart; retry when clients are quiet.
-Requests already sent upstream are never replayed. Unconfirmed abandoned work,
-uncertain process exit or durable cleanup failures refuse the restart and
-retain their reservations. New calls may wait through the pause; normal client,
-request and idle deadlines still apply.
-`--timeout` bounds the command's wait (default `5m`, positive and at most `1h`).
+To build and activate an updated manager from its checkout:
 
-A hot restart checks the replacement's private protocol and complete resource
-configuration before pausing clients, then hands it the Unix listener, singleton
-lock, frontend sockets and a bounded checkpoint of session state. Both owners'
-FDs are reserved during handoff; the restart refuses before pausing if they
-cannot fit. Contract details: SPEC.md O8.
+```sh
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/gopls-mcp-manager-next" .
+gopls-mcp-manager reload --binary "$HOME/.local/bin/gopls-mcp-manager-next" --timeout 5m
+gopls-mcp-manager status
+```
 
-Thin stdio and HTTP frontends stay attached to clients, keeping partial input and
-public HTTP connections; routing and gopls ownership move to the updated binary.
-The selected binary must support the same private protocol and limits. Changing
-those limits requires a normal service restart. Once handoff commits, startup
-errors are reported by the new owner in `status`; the old executable is not
-relaunched.
+`restart --hot` accepts the same `--binary` and `--timeout` options as `reload`.
+Without `--binary`, either hot command selects the **invoking** executable:
+`"$HOME/.local/bin/gopls-mcp-manager-next" reload` activates that binary.
+Plain `restart` does not accept `--binary`. Keep the replacement at its selected
+path for later child launches, and update client/service launch commands to use
+it for future starts. A successful reload waits for the successor's restart to
+finish and prints a JSON receipt. These commands require a running owner.
 
-**First installation:** older binaries cannot hand off sessions. Stop the old
-owner and reconnect clients once to install this private-protocol upgrade.
-Later compatible upgrades can use `reload`. The existing guardian recovery and
-legacy-record reconciliation rules still apply.
+During either restart, admitted calls drain while cancellation and new client
+attachments remain live. Once quiet, the owner closes admission and pauses
+frontend traffic at message boundaries. Work racing that pause refuses the
+restart; retry when clients are quiet. Tool requests already sent upstream are
+never replayed. New calls may wait through the pause under their original
+deadlines; a long pause can still cause client timeouts. `--timeout` bounds the
+command's wait (default `5m`, positive and at most `1h`).
+
+Hot restart checks the replacement's private protocol and complete resource
+configuration before pausing clients. It forks/execs the new owner and transfers
+the Unix listener, singleton lock, frontend sockets and bounded session
+checkpoint. The successor waits for confirmed old-owner exit before resuming
+traffic. Both owners' FD footprints must fit the budget during handoff.
+
+Client-facing stdio and HTTP frontend processes keep running their existing
+binaries. They retain partial input and public connections; the successor restores
+home, initialization and sticky routing state. gopls indexes are rebuilt. Restart
+those frontends normally when they also need a binary update.
+
+The replacement must support the same private protocol, limits and directory
+filters; configuration changes require a normal service restart. Unconfirmed
+abandoned work, uncertain exit, durable cleanup failure or insufficient FD
+capacity refuses restart. After handoff commits, the old executable is not
+relaunched on failure; generation startup errors appear in `status`. Process,
+filesystem or binary failure can still interrupt service. See
+[SPEC O8](SPEC.md#persistent-owner-contract) for the full contract.
+
+**Upgrading a pre-handoff binary:** stop the old owner and reconnect clients once.
+Subsequent compatible upgrades can use `reload`. Guardian recovery and
+[legacy reconciliation](#legacy-migration) still apply.
 
 ### Stateless HTTP
 
@@ -237,10 +271,10 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
   tracking but retain that credit. Both sets use the outstanding limits above;
   the owner also retains credits across frontend teardown. A cancellation-ignoring
   server cannot accept unlimited replacements through session churn.
-- The bridge stops when the stdio client goes away, or on `^C` / `SIGTERM`.
-  It waits for owned failed-child cleanup before exiting: SIGTERM, up to 2 s,
-  then SIGKILL and up to 2 s to confirm exit. A failed child's record is removed
-  only after exit is confirmed, with up to 2 s to acquire the cleanup lock.
+- Client EOF, `^C` or `SIGTERM` closes the stdio frontend's attachment without
+  waiting for outstanding responses. EOF exits successfully; signal cancellation
+  exits with an error. The shared owner keeps remote credits and manages
+  failed-start cleanup; other clients stay attached. See [SPEC F6](SPEC.md#5-failure-semantics).
 
 ## Limits and measurements
 
@@ -327,9 +361,10 @@ directly inside a directory with an excluded descendant (the worktree root among
 them) are not watched. gopls still sees edits to Go files there, but a manager
 restarts the server when such a directory gains or loses a Go-relevant file or
 subdirectory, or its `go.mod`/`go.sum`/`go.work` changes, and the next call pays
-a cold index. A gopls never unwatches a root, so after changing the filters,
-servers started before pick them up only when they restart (`list`, then kill,
-or let eviction do it).
+a cold index. A gopls never unwatches a root: changed module rules require a new
+generation, through `restart` or stale/idle retirement. Changing
+`GOPLS_MANAGER_DIRECTORY_FILTERS` changes shared-owner configuration and requires
+a normal service restart of the owner and frontends; `reload` preserves it.
 
 A bare `-` excludes everything and later `+` rules re-include, so the allowlist
 idiom `-,+cmd,+internal` works. The manager looks into an excluded directory
@@ -354,9 +389,11 @@ sharing managers and stop them before manually removing historical lock files.
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/gopls-ports.map` | One JSON object per line: `{"Worktree":…,"Port":…,"PID":…,"StartedAt":…,"StartedAtMilli":…}` |
+| `~/.local/share/gopls-ports.map` | Generation records: worktree, port, child/guardian PIDs, owner boot, generation, start times and termination state; [format](SPEC.md#6-port-map-file) |
 | `~/.local/share/gopls-ports.map.lock` | flock held around every read-modify-write |
-| `~/.local/share/gopls-mcp-logs/<hash>.log` | stdout+stderr of the gopls for that worktree |
+| `~/.local/share/gopls-ports.map.owner.lock` | Singleton lock held for the owner's lifetime and transferred during hot restart |
+| `~/.local/share/gopls-mcp-guardians/` | Guardian manifests, stable lifetime leases and private `telemetry-off/` state |
+| `~/.local/share/gopls-mcp-logs/<hash>.log` | Bounded stdout+stderr log for that worktree |
 
 The map is written atomically (temp file, `fsync`, rename) with mode `0600`.
 Ports are picked from 61100–65100, seeded by a hash of the worktree path so the
@@ -419,7 +456,8 @@ Root files group related responsibilities:
 | --- | --- |
 | `main.go` | CLI commands and startup |
 | `supervisor*.go`, `guardian*.go`, `ownerlog.go` | Persistent authority, private frontends, process/group ownership and bounded logs |
-| `bridge.go`, `http.go` | Router construction, stdio sessions/upstream replies, and HTTP frontend |
+| `bridge.go`, `http.go` | Router construction, upstream replies, and HTTP frontend |
+| `restart.go`, `restart_wire.go` | Restart coordination, fork/exec handoff and persistent frontend relays |
 | `routing.go` | Admission, routing decisions and bounded resolution |
 | `paths.go` | Path/worktree resolution, canonicalization and memos |
 | `lane.go`, `requests.go` | Per-worktree delivery, cancellation, and request/operation accounting |
@@ -451,8 +489,17 @@ The optional real-gopls suite starts and reaps children in disposable worktrees
 with a private registry; CI runs it against gopls v0.23.0 and v0.24.0:
 
 ```sh
-go test -race -tags=integration -run '^TestEndToEndRealGopls$' -timeout=3m .
+go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
 GOMAXPROCS=4 go test -tags=integration -run '^$' -bench '^BenchmarkRealGoplsRoundTrip$' -benchmem .
+```
+
+CI also runs [formal lifecycle verification](formal/README.md) natively on Linux
+and macOS with Java 25 and Bun 1.4.4. Its pinned verifier downloads and cached
+archives are checksum-verified; model proofs do not prove the Go implementation.
+To reproduce:
+
+```sh
+bun --install=force run formal/check.ts all
 ```
 
 For warm frontend overhead, `BenchmarkHTTPRoundTrip` and `BenchmarkStdioRoundTrip`

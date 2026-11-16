@@ -127,6 +127,9 @@ exits with an error and never resumes its clients.
 Process, filesystem or binary failures cannot promise uninterrupted service.
 The private protocol/configuration must remain compatible. The initial upgrade
 from a binary without handoff support requires a one-time reconnect.
+Frontend relays keep their existing executables until restarted separately;
+the handoff replaces the owner and gopls processes. See the
+[operator commands and upgrade steps](README.md#restart-and-binary-reload).
 The existing TLA+ models do not model this fork/exec handoff.
 → `TestRestartPeerPreservesMessagesAcrossRepeatedPauses`,
 `TestRestartRestoresInitializedStickySession`,
@@ -431,17 +434,26 @@ step, after a successful Write. A failed first caller Write is handled by the
 lane without replay. Failure may clear lane.conn before its reader finishes.
 → `TestSendDoesNotReplayAnUncertainInitialize`
 
-F6. Client EOF or session cancellation stops stdio. `io.EOF`, `context.Canceled`
-and `ErrConnectionClosed` exit zero. Shutdown cancels delivery, closes lane
-queues and waits for owned failed-child cleanup (P2a).
+F6. Client EOF or session cancellation closes the stdio frontend's attachment
+without waiting for outstanding responses. EOF returns success; cancellation
+returns `context.Canceled` and the CLI exits nonzero. The owner abandons unresolved
+remote operations without refunding their credits (O7) and owns failed-start
+cleanup (P2a); frontend exit does not stop the shared owner or other clients.
+→ `TestRestartBridgeReportsCancellation`
 
 ## 6. Port map file
 
 `~/.local/share/gopls-ports.map` is mode `0600`, one JSON object per line:
 
 ```json
-{"Worktree":"/Users/x/src/repo","Port":62001,"PID":4242,"StartedAt":1754218800,"StartedAtMilli":1754218800417}
+{"Worktree":"/Users/x/src/repo","Port":62001,"PID":4242,"OwnerBoot":"boot-token","Generation":"generation-token","GuardianPID":4241,"StartedAt":1754218800,"StartedAtMilli":1754218800417}
 ```
+
+Current generations carry `OwnerBoot`, `Generation` and `GuardianPID`;
+`Terminating: true` retains a generation during teardown. Legacy rows without
+owner metadata parse but require offline reconciliation (O6); they are not
+adopted. `Uses` and `UsedAt` are retained legacy fields, unused for admission or
+retirement.
 
 M1. Write a same-directory temporary file, fsync, then rename atomically. Set mode
 explicitly so even an exotic umask cannot leave the writer unable to read it.
@@ -553,9 +565,10 @@ the active owner's files.
 `TestLogTrimIgnoresUnrelatedFilesAndSymlinks`, `TestRunTrimLogs`
 
 P5. A Go-built gopls must report a semantic version of at least v0.23.0. Missing,
-invalid, `(devel)` and older version strings fail; telemetry dependency versions,
-checksums and replacements do not gate startup. Normal MCP initialization still validates
-the connection. The guardian sets the internal `GO_TELEMETRY_CHILD=2` switch,
+invalid, `(devel)` and older version strings fail. The Go build package path must
+be `golang.org/x/tools/gopls`; telemetry dependency versions, checksums and
+replacements do not gate startup. Normal MCP initialization validates the
+connection. The guardian sets the internal `GO_TELEMETRY_CHILD=2` switch,
 which suppresses telemetry sidecars in tested releases. Newer versions may change
 that convention; escaped telemetry descendants then lie outside strict process
 and FD accounting. The version floor is a support policy, not containment proof.
@@ -734,8 +747,10 @@ testdata/fuzz/FuzzCancelTarget/ (both signs, zero and range boundaries covered).
 
 ## Resource ownership and evidence ledger
 
-Audit baseline: `0437e95`, Go 1.27.4/gopls 0.23.0 on Darwin/Linux. These are
-bounded resources and exercised failure paths, not proof that all bugs are absent.
+Historical audit baseline: `0437e95`, Go 1.27.4/gopls v0.23.0 on Darwin/Linux.
+Current CI also exercises gopls v0.24.0 on both platforms; exact toolchains and
+results belong to each source revision's CI evidence. These are bounded resources
+and exercised failure paths, not proof that all bugs are absent.
 
 ### Findings and response
 
