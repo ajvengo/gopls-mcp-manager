@@ -25,9 +25,12 @@ identifiers; all six `.tla` specifications stay checked in.
 
 Use `GOPLS_FORMAL_TOOLS` and `GOPLS_FORMAL_OUT` to select absolute external tool
 and evidence directories. `GOPLS_FORMAL_REVISION` can record the implementation
-revision alongside the source hashes. A changed rolling-release asset fails
-its checksum: update pins only after explicitly reviewing that new toolchain.
-There is no alternate verifier or silently accepted partial result.
+revision alongside the source hashes. TLAPS downloads use fixed GitHub asset IDs
+and SHA-256 digests; archives and installations are named by digest. CI caches
+these tools with an exact OS/architecture/runner-source key and rechecks archive
+hashes before extraction. A deleted upstream asset with no retained cache fails;
+review and update the pin explicitly. There is no alternate verifier or silently
+accepted partial result.
 
 The `models`, `mutations`, and `proofs` subcommands run individual groups. The
 runner uses one TLC worker, a deterministic seed/fingerprint polynomial, a
@@ -361,10 +364,14 @@ independent runtime evidence.
 The official `tlaplus/tlaplus` v1.8.0 asset used here reports TLC
 `2026.11.15.002146` and SHA-256
 `7e53aa636dac8a3cb0533f343115c0548e03fc0ce5edc7739becf58d3d0fb84f`.
-The official `tlaplus/tlapm` 1.6.0-pre assets report commit `ff40755`.
-Their archive digests are pinned in `check.ts`; release asset replacement is
-rejected. Sources: [TLC](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0),
-[TLAPS](https://github.com/tlaplus/tlapm/releases/tag/1.6.0-pre).
+The official `tlaplus/tlapm` assets pinned here report commit `bf665f4`.
+Darwin/arm64 asset `753937802` and Linux/amd64 asset `753940334` have their
+GitHub-published SHA-256 digests pinned in `check.ts`. The runner verifies the
+prover's reported revision before proofs. The rolling `1.6.0-pre` download URLs
+are not used because upstream replaces their contents. Sources:
+[TLC](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0),
+[TLAPS](https://github.com/tlaplus/tlapm/releases/tag/1.6.0-pre),
+[reviewed TLAPS changes](https://github.com/tlaplus/tlapm/compare/ff40755...bf665f4).
 
 The runner's source-hashed `results.json` and per-check logs are authoritative
 for their recorded platform. Native runtime conformance is checked independently.

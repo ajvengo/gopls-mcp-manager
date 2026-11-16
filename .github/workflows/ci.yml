@@ -118,6 +118,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
+      - uses: actions/cache@v5.0.4
+        with:
+          path: ${{ runner.temp }}/formal-tools
+          key: formal-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('formal/check.ts') }}
       - run: bun --install=force run formal/check.ts all
         # runner context is unavailable in job-level env.
         env:
