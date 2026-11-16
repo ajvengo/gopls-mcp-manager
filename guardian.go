@@ -26,6 +26,11 @@ import (
 // an inert reservation while a still-resident guardian consumes resources.
 var guardianLifetimeLease *os.File
 
+var guardianTelemetryContracts = [...]struct{ version, sum string }{
+	{"v0.0.0-20260625142307-59b4966ccb57", "h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc="},
+	{"v0.0.0-20260924152758-ed294f943157", "h1:DftxASHKl6JolFPqoN+2WrFO53JvkHwRXvFqf8gsivA="},
+}
+
 func runGuardian(args []string) error {
 	if len(args) > 0 && args[0] == "child" {
 		return guardianExecChild(args[1:])
@@ -634,9 +639,7 @@ const (
 	guardianMaxOpenFiles   = 32
 	// One resident guardian plus at most one concurrent ps observer, each
 	// bounded by the inherited 32-descriptor soft limit.
-	guardianFDReservation    = 2 * guardianMaxOpenFiles
-	guardianTelemetryVersion = "v0.0.0-20260625142307-59b4966ccb57"
-	guardianTelemetrySum     = "h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc="
+	guardianFDReservation = 2 * guardianMaxOpenFiles
 )
 
 // Process is metadata only; signals must use Signal. ConfirmedDone requires
@@ -780,16 +783,24 @@ func guardianCheckTelemetry(binary string) error {
 	if err != nil {
 		return fmt.Errorf("guardian cannot verify gopls telemetry contract: %w", err)
 	}
+	return guardianValidateTelemetry(build)
+}
+
+func guardianValidateTelemetry(build *buildinfo.BuildInfo) error {
 	if build.Path != "golang.org/x/tools/gopls" {
-		return fmt.Errorf("guardian requires a Go gopls binary with the pinned telemetry contract")
+		return fmt.Errorf("guardian requires a Go gopls binary with a verified telemetry contract")
 	}
 	for _, dep := range build.Deps {
-		if dep.Path == "golang.org/x/telemetry" && dep.Version == guardianTelemetryVersion &&
-			dep.Sum == guardianTelemetrySum && dep.Replace == nil {
-			return nil
+		if dep.Path != "golang.org/x/telemetry" || dep.Replace != nil {
+			continue
+		}
+		for _, contract := range guardianTelemetryContracts {
+			if dep.Version == contract.version && dep.Sum == contract.sum {
+				return nil
+			}
 		}
 	}
-	return fmt.Errorf("unsupported gopls telemetry dependency: require unreplaced golang.org/x/telemetry %s; managed telemetry must not fork an unowned session", guardianTelemetryVersion)
+	return fmt.Errorf("unsupported gopls telemetry dependency: require a verified unreplaced golang.org/x/telemetry version/checksum pair; managed telemetry must not fork an unowned session")
 }
 
 func guardianEnvironment(env []string, telemetryDir string) []string {

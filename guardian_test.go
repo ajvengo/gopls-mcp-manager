@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"testing"
@@ -423,6 +424,52 @@ func TestGuardianConfigAndTelemetryPolicy(t *testing.T) {
 	cancel()
 	_, err := startGuardian(ctx, t.TempDir(), firstPort, t.TempDir(), io.Discard, 512)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestGuardianTelemetryCompatibility(t *testing.T) {
+	t.Parallel()
+	for _, release := range []struct{ name, version, sum string }{
+		{"gopls v0.23.0", "v0.0.0-20260625142307-59b4966ccb57", "h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc="},
+		{"gopls v0.24.0", "v0.0.0-20260924152758-ed294f943157", "h1:DftxASHKl6JolFPqoN+2WrFO53JvkHwRXvFqf8gsivA="},
+	} {
+		t.Run(release.name, func(t *testing.T) {
+			t.Parallel()
+			for _, scenario := range []string{"supported", "unknown version", "wrong checksum", "crossed pair", "replacement", "wrong module", "wrong binary", "missing dependency"} {
+				t.Run(scenario, func(t *testing.T) {
+					t.Parallel()
+					dep := &debug.Module{Path: "golang.org/x/telemetry", Version: release.version, Sum: release.sum}
+					build := &debug.BuildInfo{Path: "golang.org/x/tools/gopls", Deps: []*debug.Module{dep}}
+					switch scenario {
+					case "unknown version":
+						dep.Version = "v0.0.0-unknown"
+					case "wrong checksum":
+						dep.Sum = "h1:unknown"
+					case "crossed pair":
+						if release.name == "gopls v0.23.0" {
+							dep.Version = "v0.0.0-20260924152758-ed294f943157"
+						} else {
+							dep.Version = "v0.0.0-20260625142307-59b4966ccb57"
+						}
+					case "replacement":
+						copy := *dep
+						dep.Replace = &copy
+					case "wrong module":
+						dep.Path = "example.com/telemetry"
+					case "wrong binary":
+						build.Path = "example.com/gopls"
+					case "missing dependency":
+						build.Deps = nil
+					}
+					err := guardianValidateTelemetry(build)
+					if scenario == "supported" {
+						require.NoError(t, err)
+					} else {
+						require.Error(t, err)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestGuardianSnapshotAndDetection(t *testing.T) {

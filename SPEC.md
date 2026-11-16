@@ -552,7 +552,8 @@ the active owner's files.
 → `FuzzLogPath`, `TestLogTrimPreservesInheritedAppendDescriptor`,
 `TestLogTrimIgnoresUnrelatedFilesAndSymlinks`, `TestRunTrimLogs`
 
-P5. A pinned dependency contract suppresses managed gopls telemetry sidecars.
+P5. Verified dependency version/checksum pairs suppress managed gopls telemetry
+sidecars for gopls v0.23.0 and v0.24.0; unknown or replaced dependencies fail.
 Before startup and every delivery, the selected Go toolchain must report the
 exact private telemetry-off directory. Mismatch fails without changing global
 telemetry, HOME or GOTOOLCHAIN.

@@ -445,7 +445,7 @@ CI uses the latest patch release matching `go.mod` (Go 1.27), builds for
 `linux/amd64` and `darwin/arm64`, and requires 85% statement coverage in every
 package and overall. Tests use real HTTP/stdio/SSE transports with SDK upstreams.
 The optional real-gopls suite starts and reaps children in disposable worktrees
-with a private registry; CI installs gopls v0.23.0 and runs it too:
+with a private registry; CI runs it against gopls v0.23.0 and v0.24.0:
 
 ```sh
 go test -race -tags=integration -run '^TestEndToEndRealGopls$' -timeout=3m .
