@@ -125,6 +125,7 @@ jobs:
       - run: bun --install=force run formal/check.ts all
         # runner context is unavailable in job-level env.
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           GOPLS_FORMAL_TOOLS: ${{ runner.temp }}/formal-tools
           GOPLS_FORMAL_OUT: ${{ runner.temp }}/formal-evidence
       - uses: actions/upload-artifact@v7

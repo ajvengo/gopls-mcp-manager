@@ -26,10 +26,11 @@ identifiers; all six `.tla` specifications stay checked in.
 Use `GOPLS_FORMAL_TOOLS` and `GOPLS_FORMAL_OUT` to select absolute external tool
 and evidence directories. `GOPLS_FORMAL_REVISION` can record the implementation
 revision alongside the source hashes. TLAPS downloads use fixed GitHub asset IDs
-and SHA-256 digests; archives and installations are named by digest. CI caches
-these tools with an exact OS/architecture/runner-source key and rechecks archive
-hashes before extraction. A deleted upstream asset with no retained cache fails;
-review and update the pin explicitly. There is no alternate verifier or silently
+and SHA-256 digests; archives and installations are named by digest. CI uses its
+read-only GitHub token for API downloads, caches tools with an exact
+OS/architecture/runner-source key, and rechecks archive hashes before extraction.
+A deleted upstream asset with no retained cache fails; review and update the pin
+explicitly. There is no alternate verifier or silently
 accepted partial result.
 
 The `models`, `mutations`, and `proofs` subcommands run individual groups. The

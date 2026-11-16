@@ -74,7 +74,11 @@ for (const [name, text] of Object.entries(modelSources)) {
 
 async function pinnedDownload(path: string, url: string, hash: string): Promise<void> {
   if (!await Bun.file(path).exists()) {
-    const response = await fetch(url, { headers: { Accept: 'application/octet-stream' } });
+    const headers: Record<string, string> = { Accept: 'application/octet-stream' };
+    if (process.env.GITHUB_TOKEN && new URL(url).origin === 'https://api.github.com') {
+      headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+    }
+    const response = await fetch(url, { headers });
     if (!response.ok) throw new Error(`Download failed: ${response.status} ${url}`);
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (sha256(bytes) !== hash) throw new Error(`SHA-256 mismatch: ${url}`);
