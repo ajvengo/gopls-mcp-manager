@@ -1,109 +1,45 @@
 # Formal verification
 
-These specifications check shared-process ownership, retained payloads and hot
-restart handoff.
-They do not verify the Go binary, gopls, the MCP SDK, or the operating system.
-The supervisor implementation and its conformance tests must be reviewed
-against the transition obligations below before these results support a release.
+Models and proofs cover shared-process ownership, retained payloads and hot
+restart handoff. The [conformance ledger](#runtime-conformance) maps model
+obligations to Go code and runtime tests.
 
 ## Reproduce
 
-Use Java 25 on `PATH` and Bun 1.4.4 to match CI, then run from the repository root:
+Use Java 25 on `PATH` and Bun 1.4.4. Run from the repository root.
 
 ```sh
 bun --install=force run formal/check.ts all
 ```
 
-The runner downloads official TLC/TLAPS releases, checks pinned SHA-256 digests,
-and keeps tools under `~/.cache/gopls-mcp-formal`. It writes copied specifications,
-checker logs, generated configurations, state directories, proof caches and
-`results.json` outside the checkout, under
-`~/.codex/artifacts/gopls-audit/formal/<timestamp>/`. CI publishes the copied
-models, generated configurations, checker logs, and results as workflow artifacts.
+Use `models`, `mutations` or `proofs` to run one group. TLAPS binaries support
+Darwin/arm64 and Linux/amd64. TLC needs Java and Bun.
 
-`check.ts` declares each TLC case with its model, configuration and expected
-result. It writes each configuration into the evidence directory before
-checking. The `.cfg` names identify cases in the results. The TLA+ sources
-stay checked in.
+| Setting | Default or effect |
+| --- | --- |
+| `GOPLS_FORMAL_TOOLS` | Absolute tool cache path. Defaults to `~/.cache/gopls-mcp-formal` |
+| `GOPLS_FORMAL_OUT` | Absolute evidence path outside the checkout. Defaults to `~/.codex/artifacts/gopls-audit/formal/<timestamp>/` |
+| `GOPLS_FORMAL_REVISION` | Record the implementation revision alongside source hashes |
+| `GITHUB_TOKEN` | Optional token sent only to `api.github.com` |
 
-Use `GOPLS_FORMAL_TOOLS` and `GOPLS_FORMAL_OUT` to select absolute external tool
-and evidence directories. `GOPLS_FORMAL_REVISION` can record the implementation
-revision alongside the source hashes. TLAPS downloads use fixed GitHub asset IDs
-and SHA-256 digests; archives and installations are named by digest. CI uses its
-read-only GitHub token for API downloads, caches tools with an exact
-OS/architecture/runner-source key, and rechecks archive hashes before extraction.
-A deleted upstream asset with no retained cache fails; review and update the pin
-explicitly. Local API downloads use `GITHUB_TOKEN` when supplied; only requests
-to `api.github.com` receive it. There is no alternate verifier or silently
-accepted partial result.
-
-The `models`, `mutations`, and `proofs` subcommands run individual groups. The
-runner uses one TLC worker, a deterministic seed/fingerprint polynomial, a
-512 MiB Java heap and a 180-second deadline per checker invocation. Timeouts,
-syntax errors, unsupported proof platforms and unproved obligations fail the
-run. Negative checks require the specific safety/liveness/proof failure class;
-a generic nonzero exit is not sufficient. It copies proof sources into the
-evidence directory before mutating guards, leaving repository sources intact.
-
-The pinned TLAPS release provides Darwin/arm64 and Linux/amd64 binaries. Model
-checks can run on other platforms with Java and Bun. Proof runs on other
-platforms fail explicitly. The native binary is extracted outside the repo.
+The runner verifies pinned SHA-256 digests and writes model copies, generated
+configs, checker logs and `results.json` to the evidence directory. CI uploads
+these files. Mutations edit model copies. TLC uses one worker, fixed seed and
+fingerprint polynomial, a 512 MiB heap and a 180 s deadline per invocation.
+Each negative check requires its expected safety, liveness or proof failure.
+Timeouts and syntax errors fail the run.
 
 ## What is modeled
 
-`SupervisorLifecycle.tla` models a serialized owner with shared server
-instances `(worktree, generation)`, attached clients carrying boot tokens,
-protected operations, monotonic idle age, live physical processes, and states
-Starting, Ready, Draining, Terminating and Exited.
+| Model | Transition coverage |
+| --- | --- |
+| `SupervisorLifecycle.tla` | Admission and pure idle drain serialize. Definitive completion resets idle age. Termination requires ownership and confirmed exit before refund. Recovery preserves reservations, fences old transports and changes the boot token before admission. Failed storage commits stutter. |
+| `OperationAccounting.tla` | Reserve before possible execution. Match responses by request generation and connection. Cancellation, timeout and disconnect keep credit. Uncertain retries need additional credits. Confirmed exit releases remaining credits. |
+| `AbandonedRetirement.tla` | Same-boot retirement waits for the idle interval and each abandoned operation's grace. Active work protects indefinitely. Draining fences admission. Responses or confirmed exit release credits. Only confirmed exit releases the slot. |
 
-- Admission and idle drain compete in the same state transition domain.
-  Admission protects work before delivery. Passive attachments and renewals do
-  not reset idle age or prevent draining. Definitive completion resets idle age.
-- Idle drain requires no protected operation and an elapsed idle interval.
-  Draining and terminating generations still consume capacity. New generations
-  cannot overlap a retained generation for the same worktree.
-- Termination requires owned identity. Loss of identity models a child exit/PID
-  reuse before registry reconciliation. A successful signal alone cannot free
-  the reservation; exit must be observed.
-- A crash preserves operation ownership and server reservations. Recovery fences
-  old delivery transports, increments the boot token and drains old generations
-  before new admission. This is explicit recovery and can interrupt abandoned
-  work; it is not classified as idle eviction.
-- A stale attachment cannot authorize delivery to a replacement generation or
-  new owner boot. Storage failure is a stuttering transition: no mutation may
-  become visible without a successful atomic commit.
-
-`OperationAccounting.tla` separately explores clients reusing a wire ID across
-local request generations and multiple upstream connections. Operations are
-keyed by request generation and exact connection. Reservation precedes a
-possibly executing write. Cancellation/timeout and disconnect leave global
-credits charged. Definitive responses release only their own credit and can
-complete only the matching local request/connection. An uncertain retry requires
-an additional credit. Confirmed server exit releases remaining credits.
-
-`AbandonedRetirement.tla` separately checks same-boot controlled retirement for
-one worktree with two successive generations. Admission reserves a credit before
-delivery. Cancellation, local timeout, or disconnect marks that operation
-abandoned without releasing its credit. Active operations protect indefinitely;
-each abandoned operation independently protects until a full grace interval has
-elapsed. Retirement also requires the generation's last definitive completion
-to be at least one idle interval old. A late definitive result resets that idle
-age. Passive attachments do not appear in the protection predicate.
-
-Retirement fences admission atomically and preserves every unresolved credit
-through Draining and Terminating. Only a definitive result or confirmed child
-and owned-group exit releases it. Draining generations keep the worktree/slot
-reservation. This is controlled interruption of uncertain abandoned work, not
-evidence that it finished. It covers the runtime's abandoned-operation grace
-policy, which is distinct from `SupervisorLifecycle.IdleDrain` requiring an empty
-operation set. The model omits startup, queued requests, boot changes, storage
-steps and per-connection wire IDs; those remain separate model obligations.
-
-The accounting model permits results delayed across disconnects and retries,
-and multiple unresolved local generations. It is deliberately more permissive
-about retry scheduling than the runtime; implementation retries must still
-respect its own tool-execution/replay contract. Notifications and handshakes
-are not operations in this model and need separate bounded-lifetime tests.
+The accounting model permits retry schedules beyond the Go replay contract.
+It omits notifications and handshakes. The retirement model omits startup,
+queued requests, boot changes, storage and wire IDs.
 
 ## Composed startup and cleanup core
 
@@ -114,10 +50,10 @@ credits; grace expiry only removes protection. Confirmed exit can release remote
 credits while the worktree and process-slot reservations remain charged until
 durable cleanup succeeds.
 
-Its 104 checked obligations establish safety over arbitrary sets:
+Its 104 obligations establish these properties over arbitrary sets.
 
-- Unique retained reservation per worktree and slot; every possible process is
-  covered by a reservation. Finite slots therefore bound possible processes.
+- Each worktree and slot has at most one reservation. Every possible process
+  has a reservation, so finite slots bound possible processes.
 - Uncertainty fences readiness without removing process or operation ownership.
   Final refund requires both confirmed exit and durable cleanup.
 - Finish preserves every other operation token and its protection.
@@ -128,22 +64,17 @@ Two checked refinement theorems connect this model to `ReservationCore` and
 `AdmissionCore`. Reservation refinement conservatively maps every retained,
 unconfirmed reservation to an abstract possible process, including before fork.
 Admission refinement maps current protected tokens to held operations and the
-history of idle retirement to draining generations. Grace expiry maps to abstract
-completion of protection; it does not claim that remote execution completed.
-Ghost retirement/exit histories never recycle identities and are not runtime
-containers. This composition proves neither actual Go execution nor long-run
-metadata bounds.
+history of idle retirement to draining generations. Grace expiry ends abstract
+protection while remote execution may continue. Model-only histories retain
+fresh generation identities indefinitely.
 
-Eight additional proof mutations must be rejected: overlapping reservation,
-unreserved start, publication after fencing, busy idle drain, unconfirmed refund,
-uncommitted refund, wrong-token completion and uncertainty releasing credits.
-The checker uses the existing pinned tools and rejects syntax errors/timeouts as
-negative-check successes. Runtime mapping and deterministic regression anchors
-are in [Runtime conformance](#runtime-conformance).
+Eight proof mutations remove guards for overlapping reservations, unreserved
+starts, publication after fencing, busy idle drain, unconfirmed or uncommitted
+refund, wrong-token completion and credit release under uncertainty.
 
 ## Safety proofs over arbitrary sets
 
-The original two TLAPS proof cores do not depend on finite TLC configurations:
+Both proof cores quantify over arbitrary sets.
 
 - `AdmissionCore.tla` proves that an operation cannot be held by a draining
   generation when acquire excludes draining generations and drain excludes held
@@ -155,16 +86,10 @@ The original two TLAPS proof cores do not depend on finite TLC configurations:
   changes no reservation; forgetting is permitted only after physical exit.
   Unique slots give a process bound when the chosen slot set is finite.
 
-Each module proves initialization, all next-state cases including stuttering,
-and temporal invariance. The current proofs have 34 accepted obligations each.
-They use TLAPS's SMT and propositional temporal backends. Those tools and their
-translations are trusted; this is not an independently checked Isabelle proof
-certificate, and no Go-to-model refinement theorem is supplied.
-
-Proof mutation checks remove the acquire/drain exclusion and the exit-before-
-forget guard. Both must produce an unproved obligation. The proofs do not
-establish arbitrary program termination, scheduler fairness, OS signal identity,
-process-tree cleanup, or implementation memory safety.
+Each module has 34 obligations covering initialization, all next-state cases
+including stuttering, and temporal invariance. The proofs trust TLAPS's SMT
+and temporal backends. Removing acquire/drain exclusion or the
+exit-before-forget guard must leave an unproved obligation.
 
 ## Liveness assumptions
 
@@ -221,9 +146,8 @@ The checked configurations deliberately use small capacities to expose races:
 | RestartHandoffLiveness | same, fair decision and recovery | 32 |
 | PayloadSafety | 3 call identities and 3 fixed-size payload charges | 171 |
 
-These are complete reachable-state explorations for the given configurations,
-not a proof for all instance sizes. TLC uses fingerprints, so its collision
-estimates are part of the raw evidence. The default runner retains those logs.
+The counts cover reachable states for each configuration. Checker logs retain
+TLC's fingerprint collision estimates.
 
 Ten safety mutations must fail: busy drain, early slot reuse, stale token,
 unowned signal, early idle, cancellation releasing credit, disconnect releasing
@@ -239,27 +163,16 @@ proof mutations.
 
 ## Payload accounting abstraction
 
-The runtime bounds retained wire payload reservations
-globally to 64 MiB by default and limits opaque string request IDs to 1,024
-bytes. `retainMessage` charges a full configured maximum message
-size, independently of operation credits. Cancellation can release a queued
-operation credit while its queued payload remains charged until the queue owner
-discards it. Likewise a definitive response can release an operation credit
-while a blocked writer still holds the response's payload reservation. The
-release-once reservation travels in SDK message `Extra`, which is not on wire.
+`PayloadAccounting.tla` checks conservation of fixed-size charges when queued
+calls cancel and output moves from queue to writer. Payload credit survives
+cancellation until discard and survives dequeue until write return. Output
+discard refunds queued output only. Mutations check overbooking and early
+refund at cancellation, dequeue and discard.
 
-`PayloadAccounting.tla` tracks charges independently from queue and writer
-ownership. Cancellation clears a waiting credit and may enqueue a reply if
-capacity permits. The original payload remains charged until discard.
-Dequeuing a reply for a writer transfers its charge through actual write
-return. Discarding pending output clears only the charges for the queue.
-TLC checks exact conservation and the cap, and finds counterexamples for
-overbooking and early refunds on cancellation, dequeue or output discard.
-
-The model covers fixed-size message reservations for the queued-cancellation
-and output paths. Variable-size initialization and SSE reservations, ID
-lengths, transient copies, Go heap usage and the complete runtime lifecycle
-remain separate obligations.
+In Go, `retainMessage` stores a release-once reservation in the SDK's local
+`Extra` field. Variable-size initialize and SSE reservations, ID limits,
+transient copies and heap usage require separate evidence.
+[Runtime budgets](../SPEC.md#resource-ledger)
 
 ## Hot restart handoff
 
@@ -285,10 +198,8 @@ EOF and failure, and exercise actual descriptor transfer.
 
 ## Runtime conformance
 
-This ledger maps the Go supervisor to the protocol specifications and their
-proof obligations. Symbols and named tests are implementation anchors; saved
-execution artifacts record exact source hashes and runtime results. The checked
-LifecycleCore refinements are model-to-model theorems, not a Go refinement proof.
+Symbols identify where Go enforces each obligation. Regression tests exercise
+those boundaries. The checked refinements relate models to each other.
 
 | Obligation | Implementation symbols | Inspected regression evidence and scope |
 | --- | --- | --- |
@@ -313,10 +224,8 @@ LifecycleCore refinements are model-to-model theorems, not a Go refinement proof
 
 ### Composed-core implementation mapping
 
-The additional LifecycleCore proofs check model-to-model refinement. They do not
-execute or translate Go. The runtime uses the existing single owner mutex;
-network/process/storage effects remain outside it. The independent runtime
-checks below exercise the same release and fencing obligations.
+The owner mutex serializes state transitions. Network, process and storage
+effects run outside it.
 
 | Core action/property | Runtime boundary and regression |
 | --- | --- |
@@ -326,80 +235,39 @@ checks below exercise the same release and fencing obligations.
 | ExactFinish | Operations include exact connection plus wire ID and are bound to the generation. Caller/control namespaces remain separate. `TestSupervisorLateResponseCannotCompleteReplacement`, `TestSupervisorCallerAndControlNamespacesRemainDistinct` |
 | Hold / Abandon / Expire / IdleDrain | Queued work, writes, active operations and unexpired abandonment grace feed `protectedLocked`; `drain` checks protection under mu. `TestSupervisorQueuedAndActiveWorkSurviveIdle`, `TestSupervisorAbandonedOperationsRetireOnlyAfterGrace` |
 
-Core proof assumptions: operation tokens represent the correct concrete
-connection/generation/request namespace; exit and durable-cleanup evidence are
-truthful; grace expiry is not early; serialized runtime critical sections
-implement the abstract actions; generation identities are fresh. Runtime tests
-exercise these obligations but do not prove their universal implementation.
-FD/payload byte arithmetic, OS behavior, parser/SDK behavior and wall-clock
-progress are outside this proof. Existing finite models retain their separate
-coverage of local ID reuse, boot fencing and bounded liveness.
+Applying these obligations to Go requires exact operation tokens, fresh
+generation IDs, truthful exit and durable-cleanup evidence, full grace
+intervals and critical sections that implement the abstract actions.
 
 ### Refinements and limits
 
-- `SupervisorLifecycle.Spawn` combines reservation and physical start.
-  `LifecycleCore` now models reservation, start, readiness, fencing, exit,
-  durable cleanup and refund separately, and refines both proof cores.
-  Runtime `prepareGeneration` performs the effects; `startGeneration` publishes
-  readiness or finishes failure cleanup. The model-to-Go mapping remains a
-  reviewed obligation, not a mechanically checked program refinement.
-- `SupervisorLifecycle.Recover` is atomic. Runtime starts a new boot only after
-  singleton exclusion, guardian recovery, and old-registry validation. It
-  refuses uncertain old ownership rather than adopting it. New boot nonces
-  cannot alone prove old transport fencing or child exit.
-- `AdmissionCore` excludes all held operations from draining. Its theorem
-  supports pure idle admission exclusion; controlled abandoned retirement is
-  checked by a distinct finite model and deliberately retains held credits.
+- `SupervisorLifecycle` combines reservation with spawn and confirmed exit
+  with durable cleanup. `LifecycleCore` separates these steps. In Go, exit can
+  release operation credits while a failed registry update retains slot and FD
+  capacity.
+- `SupervisorLifecycle.Recover` is atomic. Go requires the singleton lock,
+  guardian recovery and registry validation before starting a new boot.
 - Queue reservations bind to a worktree before exact generation delivery.
   Admission after an old generation entered drain reserves future replacement
   work and waits for its retained generation to exit. This is more detailed
   than the lifecycle model's single Admit transition.
-- Generation state Exited in runtime can still retain its slot/FD reservation
-  while durable registry cleanup fails. LifecycleCore models this directly as
-  exited but still reserved; its Forget requires removed record evidence.
-  The older finite SupervisorLifecycle model combines that cleanup with Exited,
-  so mapping every model by the runtime state's string alone remains wrong.
-- Operation models omit notifications. Runtime protects a notification's local
-  queue/write lifetime; a successful unacknowledged notification cannot prove
-  that all resulting asynchronous server work finished.
-- Server-originated requests and initialization handshakes are protected in the
-  runtime. Their exact byte/operation lifetimes need the named runtime tests;
-  they are not silently included in the smaller accounting state space.
-- Default idle duration is `time.Hour`, with 30-second maintenance scheduling.
-  The boundary test uses synctest. TLC proves neither wall-clock deadlines nor
-  suspend/resume behavior; progress requires advancing monotonic time, runnable
-  maintenance, successful storage, and cooperative child/group termination.
-- Guardian signal identity relies on its anchored session/process group,
-  private inherited pipes, actual direct-child Wait, bounded process observation,
-  and stable inherited flock lifetime. These are trusted OS/runtime boundaries,
-  not TLA+/TLAPS theorems. Arbitrary escaped/reparented descendant sessions on
-  Darwin cannot be proven contained by group TERM. Detected escapes retain
-  uncertainty; no claim of universal descendant cleanup follows.
-- The [runtime compatibility policy](../SPEC.md#9-spawning) requires gopls
-  v0.23.0 or newer and checks the selected Go toolchain's private telemetry-off
-  state. Telemetry dependencies are not pinned. Formal models do not verify
-  sidecar suppression, subprocess containment or third-party resource use.
-- `RestartHandoff` covers the successor's fencing and resume order.
-  Native [hot restart](../SPEC.md#persistent-owner-contract) tests exercise
-  descriptor inheritance, session transfer and the interpretation of pipe EOF.
-- No automated trace-to-model replay or complete runtime suite for every formal
-  mutation is supplied. In particular, the retirement active-work/grace/credit
-  traces have corresponding assertions, but early-slot replacement while TERM
-  is ignored, exhaustive same-boot delayed responses through replacement, and
-  every owner-crash/storage boundary still require independent runtime evidence.
-- Finite generations never recycle and all model clocks saturate. Long-run map,
-  log, file, inode, heap and goroutine bounds require measured churn/soak evidence.
-  A green finite model is not a proof that all possible Go bugs have been caught.
+- The operation models omit notifications, private handshakes and server
+  controls. Go tests cover their queue, write and credit lifetimes.
+- Guardian identity depends on private inherited pipes, direct-child Wait,
+  bounded group observation and inherited flock lifetime. Detected escapes
+  retain uncertainty. The models assume these OS primitives and do not cover
+  arbitrary escaped descendants or telemetry sidecar suppression.
+- Finite generations never recycle and model clocks saturate. Runtime evidence
+  must cover resource arithmetic, decoded amplification, blocked workers and
+  long-run map, log, inode, heap and goroutine retention.
 
-Runtime release evidence also requires native FD/process pressure,
-crash-at-every-commit checks and a greater-than-70-minute default-idle run,
-including suspend/resume. Generation nonces cannot close an open transport or
-make PID-based signalling safe against PID reuse.
-
-The finite models are not mechanically composed with each other or the Go
-implementation. LifecycleCore refines both proof cores; byte/FD/heap/disk
-arithmetic, decoded amplification and blocked-worker accumulation still require
-independent runtime evidence.
+Runtime release checks still need native FD/process pressure, crash injection
+at every durable boundary, and a default-idle run beyond 70 minutes including
+suspend/resume. The named regressions cover active-work and grace boundaries.
+Ignored TERM with early slot reuse, delayed responses through replacement,
+and crash/storage interleavings need broader runtime coverage. Conformance is
+reviewed against code and tests. The runner does not replay runtime traces
+against the models.
 
 ## Tool pins and observed verification
 

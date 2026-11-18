@@ -1,9 +1,8 @@
 # gopls-mcp-manager — behavioural spec
 
-Normative guarantees for the manager and its stdio/HTTP frontends. Invariant IDs
-are stable; cited tests pin their behaviour. Defaults are listed in the
-[configuration table](README.md#limits-and-measurements); ownership, release
-conditions and residual bounds are in the [resource ledger](#resource-ledger).
+Manager contracts with stable invariant IDs and named regression tests.
+See [configuration defaults](README.md#limits-and-measurements) and the
+[resource ledger](#resource-ledger).
 
 ## 1. Roles
 
@@ -17,22 +16,20 @@ MCP client → stdio/HTTP frontend → private Unix owner → SSE/HTTP → guard
 
 ### Persistent owner contract
 
-O1. **Singleton authority.** One persistent owner hosts routers, HTTP backends
-and every upstream Write; frontends have no direct fallback. Its lifetime
-registry lock excludes other owners. A versioned private Unix endpoint and
-configuration fingerprint reject incompatible clients before allocation.
-Canonical registry identity selects a short `/tmp` socket, independent of
+O1. **Singleton authority.** One persistent owner holds the registry lifetime
+lock and owns routers, HTTP backends and all upstream writes. Its private Unix
+endpoint rejects version or configuration mismatch before allocation.
+Canonical registry identity selects a short `/tmp` socket independent of
 TMPDIR/HOME length.
 → `TestSupervisorSocketUsesShortStablePrivateIdentity`,
 `TestSupervisorProtocolAndConfigMismatchFailBeforeAllocation`
 
-O2. **Idle retirement.** One mutex serializes admission, target binding and drain
-eligibility. Queued, active and protected abandoned work prevents retirement;
-quiet attachments do not. Readiness starts a monotonic completion clock and
-definitive responses advance it. The positive default idle period is one hour,
-sampled every 30 s and rechecked when draining. Cancellation/disconnect does not
-complete remote work: abandoned operations retain capacity through a separate
-idle grace and controlled generation retirement.
+O2. **Idle retirement.** One mutex serializes admission, target binding and
+drain eligibility. Queued, active and grace-protected abandoned operations
+prevent retirement. Quiet attachments allow it. Readiness starts the monotonic
+completion clock and definitive responses advance it. The owner checks the idle
+interval (default `1h`) every 30 s and rechecks it before draining. Abandoned
+operations keep their credits through the separate grace period and retirement.
 → `TestSupervisorIdleBoundaryAndQuietConnections`,
 `TestSupervisorQueuedAndActiveWorkSurviveIdle`,
 `TestSupervisorAbandonedOperationsRetireOnlyAfterGrace`,
@@ -67,22 +64,18 @@ advisory overload still completes local cancellation immediately.
 → `TestSupervisorGlobalAdmissionDoesNotMultiplyWithRouters`,
 `TestSupervisorSharedFilesystemWorkerSurvivesSessionChurnBoundedly`
 
-O5. **Immutable FD quota.** Complete watched-tree admission reserves child quota
-plus guardian/control headroom before spawn; RLIMIT_NOFILE enforces child/owner
-quotas. Victims stay charged until confirmed exit. Every later roots reply must
-fit the original child quota before publication or Write. Expansion fails and
-requires a new generation, preserving the prior snapshot and active/unknown-work
-protection. These limits do not bound RSS, arbitrary project subprocess fanout,
-external caches or all kernel watcher memory. Darwin process groups cannot prove
-containment of arbitrary escaped descendants. Old or unversioned gopls builds
-and incompatible selected Go telemetry settings fail explicitly (P5).
+O5. **Immutable FD quota.** Before spawn, reserve the watched-tree child quota
+and guardian/control headroom. RLIMIT_NOFILE enforces child and owner quotas.
+Capacity stays charged through confirmed exit and durable cleanup. Each roots
+reply must fit the original quota before publication or write. Expansion beyond
+it requires a new generation and leaves the prior snapshot and work protection
+intact. See [known limits](#10-known-limits) and P5 for runtime compatibility.
 → `TestSupervisorExpandedRootsRefuseBeforePublicationAndPreserveRetirement`,
 `TestSupervisorSameAndSmallerRootsFitImmutableQuota`
 
-O6. **Recovery.** The owner survives zero clients. After proven idle retirement,
-the first normal call reconnects before delivery; uncertain caller Writes never
-replay (F1). Legacy reservations are neither adopted nor signalled automatically:
-nonempty offline registries require operator reconciliation. See section 9.
+O6. **Recovery.** The owner survives zero clients. The first normal call after
+idle retirement reconnects before delivery. Legacy reservations require offline
+operator reconciliation (P1).
 → `TestSupervisorTwoBridgesAndHTTPShareAndReconnectAfterIdle`
 
 O7. **Separate lifetimes.** Routers require an explicit owner and retain local
@@ -98,18 +91,16 @@ worktree counters; disconnect abandons remote work without refunding credits.
 `TestConfirmedExitRestoresLongSessionCapacity`,
 `TestUnconfirmedExitRetainsRouterOperationCredits`
 
-O8. **Coordinated restart.** One operator restart drains queued, active and
-buffered work with cancellation and frontend admission live, closes admission
-once quiet, then pauses private frontend traffic at
-message boundaries. Work racing that pause aborts the restart safely. Unconfirmed
-abandonment, uncertain generations and failed durable retirement prevent transfer;
-no tool request is replayed. `restart` replaces all retained gopls generations.
-`restart --hot`/`reload` additionally fork/exec a compatible binary, inheriting
-the listener, singleton lock and frontend sockets. A transferred or inherited
-lock is released by close only, preserving the shared open file description;
-other owners also unlock explicitly. The old owner must not unlink
-the successor's socket. The successor marks inherited descriptors close-on-exec
-so its gopls and guardian children never hold the singleton lock.
+O8. **Coordinated restart.** Drain queued, active and buffered work while
+cancellation and frontend admission remain live. Once quiet, close admission
+and pause private traffic at message boundaries. Racing work, unconfirmed
+abandonment, uncertain exit or failed durable cleanup aborts restart. Sent
+requests are never replayed. `restart` replaces retained gopls generations.
+`restart --hot` and `reload` also fork/exec a compatible owner with the listener,
+singleton lock and frontend sockets. Release an inherited or transferred lock
+by close alone to preserve the shared lock. Other owners unlock explicitly.
+The old owner leaves the socket in place. The successor sets close-on-exec on
+inherited descriptors so guardians and gopls cannot retain the singleton lock.
 
 The checkpoint is bounded to 8 MiB. Public stdio framing, partial input and batch
 correlation remain in persistent frontend relays; home, initialization and sticky
@@ -131,14 +122,10 @@ paused frontend's resume, and then reopens general admission. A failed resume
 closes that frontend peer. The successor reports worktree startup and peer
 resume failures in its restart status.
 
-Process, filesystem or binary failures cannot promise uninterrupted service.
-The private protocol/configuration must remain compatible. The initial upgrade
-from a binary without handoff support requires a one-time reconnect.
-Frontend relays keep their existing executables until restarted separately;
-the handoff replaces the owner and gopls processes. See the
-[operator commands and upgrade steps](README.md#restart-and-binary-reload).
-`RestartHandoff.tla` checks the successor's post-preparation fencing and resume
-order. The native tests exercise fork/exec, inherited descriptors, and EOF.
+Compatibility and upgrade procedure are in the
+[restart guide](README.md#restart-and-binary-reload). `RestartHandoff.tla` checks
+the successor's exit fence and resume order. Native tests cover descriptor
+transfer and EOF.
 → `TestRestartPeerPreservesMessagesAcrossRepeatedPauses`,
 `TestRestartRestoresInitializedStickySession`,
 `TestRestartRefusesUnconfirmedWorkAndResumesClients`,
@@ -342,12 +329,11 @@ Each operation keeps its own aggregate budget.
 `FuzzDirectoryFilterPrecedence`
 
 S1b. **Missed changes require retirement.** A partial directory has an excluded
-descendant and is not itself covered by a root. File-scoped tools recheck package
-mtimes for Go edits there, but can miss added/removed entries and module changes.
-The manager records its Go-relevant names (included subdirectories and
-`.go`/`.mod`/`.sum`/`.work`/`.s` files) at the first roots view that may reach a
-server (S4a). gopls adds watches without reporting pre-existing files and never
-removes roots, so later sessions cannot replace that first view.
+descendant and unwatched immediate entries. File-scoped tools recheck package
+mtimes for Go edits and can miss added/removed entries and module changes.
+Snapshot included subdirectories and `.go`/`.mod`/`.sum`/`.work`/`.s` names on
+the first roots reply that may reach the server (S4a). Later sessions preserve
+that view because gopls adds watches without reporting pre-existing files.
 
 Snapshots belong to the dialled server's PID/StartedAt. A different server
 replaces the view; unknown-identity connections replace it on each answer. An
@@ -421,13 +407,11 @@ retries may duplicate mutations; there is no end-to-end at-most-once guarantee.
 → `TestHomeUpstreamEOFDoesNotCloseClient`,
 `TestSupervisorUncertainPostDoesNotReplayExecutedTool`
 
-F2. Upstream death explicitly fails each in-flight local call with its ID and an
-internal error, rather than leaving clients waiting indefinitely.
+F2. Upstream death fails each in-flight local call with an internal error on its ID.
 → `TestUpstreamDeathFailsItsInFlightCalls`
 
-F3. Pending calls are keyed by connection, not worktree, so an old reader cannot
-fail a replacement connection's calls. The same entry retains the worktree for
-cancellation routing (R7).
+F3. Claim pending calls by exact connection to fence readers from replaced
+connections. Keep the worktree for cancellation routing (R7).
 → `TestStaleUpstreamDeathSparesTheReconnectedCall`
 
 F4. Register pending calls before Write: a local server can reply before Write
@@ -470,8 +454,8 @@ owner metadata parse but require offline reconciliation (O6); they are not
 adopted. `Uses` and `UsedAt` are retained legacy fields, unused for admission or
 retirement.
 
-M1. Write a same-directory temporary file, fsync, then rename atomically. Set mode
-explicitly so even an exotic umask cannot leave the writer unable to read it.
+M1. Set mode 0600 on a same-directory temporary file, write and fsync it, then
+rename atomically.
 
 M2. Registry transactions use exclusive `<map>.lock` flock with cancellable,
 nonblocking acquisition; a separate lifetime lock excludes competing owners.
@@ -482,12 +466,12 @@ without mutation.
 → `TestWithRecordsWritesOnlyWhenTheFileWouldChange`, `FuzzReadMap`,
 `TestReadMapRefusesUncertainProcessReservations`
 
-M3. Every malformed nonblank or invalid-field record fails the whole read: no
-partial rows or rewrite, since it may reserve a live process. Blank lines consume
-budget. Errors name the file without revealing contents; repair is explicit.
-Reads reject >4 MiB, >4001 lines, >64 KiB scanner tokens and nonregular/symlink
-state using nonblocking descriptor checks. Writers reject >4001 records,
->4 MiB total or >65535 encoded bytes/record before rename, preserving prior data.
+M3. Reject the entire read if any nonblank record is malformed or invalid.
+Blank lines count toward the read limit. Errors name the file and omit its
+contents. Reads cap input at 4 MiB, 4001 lines and a 64 KiB scanner token.
+Nonblocking descriptor checks reject symlinks and nonregular files. Writes
+cap output at 4 MiB, 4001 records and 65535 encoded bytes per record before
+rename. Invalid state requires explicit repair.
 → `TestReadMapRefusesUncertainProcessReservations`
 
 M4. Worktree must be nonempty, PID 1…2^31−1 and Port within the allocation range.
@@ -511,9 +495,8 @@ keeping each record on one line.
 
 ## 7. Port allocation
 
-Range: 61100–65100. Start at `firstPort + sha256(worktree)[:8] mod count`, then
-probe in order past mapped ports and net.Listen failures. The stable hash tends
-to return a worktree to the same port.
+Use ports 61100–65100. Start at `firstPort + sha256(worktree)[:8] mod count`, then
+probe in order past reserved ports and `net.Listen` failures.
 → `TestBasePortIsStableAndInRange`, `TestAllocatePortProbesPastMappedAndOccupiedPorts`
 
 ## 8. Liveness
@@ -528,10 +511,8 @@ TERM retains slots/FDs (O2–O5).
 `TestMaintenanceSparesUncertainWatchMetadata`,
 `TestSupervisorGuardianLossRetainsCapacityThroughStorageFailure`
 
-`list` asks the owner to maintain. Offline, an empty registry prints the normal
-header; retained records fail with cleanup instructions. No legacy PID signals,
-pending-file publication or sampled LFU remain. Stop old writers and reconcile
-legacy processes before migration. `status` is observational.
+`list` runs owner maintenance. Offline, it prints the header for an empty
+registry or returns cleanup instructions for retained records. `status` is read-only.
 
 Readiness bypasses proxies/redirects. Bounded process/lsof output is diagnostic,
 never signal/refund authority. Malformed census output, including ferr/fNOFD,
@@ -585,19 +566,17 @@ the active owner's files.
 → `FuzzLogPath`, `TestLogTrimPreservesInheritedAppendDescriptor`,
 `TestLogTrimIgnoresUnrelatedFilesAndSymlinks`, `TestRunTrimLogs`
 
-P5. A Go-built gopls must report a semantic version of at least v0.23.0. Missing,
-invalid, `(devel)` and older version strings fail. The Go build package path must
-be `golang.org/x/tools/gopls`; telemetry dependency versions, checksums and
-replacements do not gate startup. Normal MCP initialization validates the
-connection. The guardian sets the internal `GO_TELEMETRY_CHILD=2` switch,
-which suppresses telemetry sidecars in tested releases. Newer versions may change
-that convention; escaped telemetry descendants then lie outside strict process
-and FD accounting. The version floor is a support policy, not containment proof.
+P5. gopls build info must identify `golang.org/x/tools/gopls` and a semantic
+version ≥v0.23.0. Missing, invalid, `(devel)` and older versions fail. The check
+ignores telemetry dependency versions, checksums and replacements. MCP
+initialization validates the connection. The guardian sets
+`GO_TELEMETRY_CHILD=2`, which suppresses sidecars in tested releases. Future
+releases may change this internal convention.
+
 Before startup and each ID-bearing upstream request, including private
-handshakes, the selected Go toolchain must report telemetry mode `off` and the
-exact private telemetry directory. The delivery check runs on the owner's
-filesystem worker before the upstream Write. A mismatch fails without changing
-global telemetry, HOME or GOTOOLCHAIN.
+handshakes, require telemetry `off` and the exact private `TEST_TELEMETRY_DIR`
+from the selected Go toolchain. Delivery checks run on the shared filesystem
+worker before write. Global telemetry, HOME and GOTOOLCHAIN are preserved.
 → `TestGuardianGoplsVersionCompatibility`, `TestGuardianConfigAndTelemetryPolicy`,
 `TestSupervisorNativeManagedToolchainContract`
 
@@ -690,22 +669,19 @@ environment proxies and refuses GET/POST redirects.
 `TestSSEOversizeBeforePost`, `TestSSERejectsEndpointEscape`,
 `TestSSERejectsRedirects`, `FuzzSSEFrameBudget`
 
-**Package boundary.** One Go module: internal/config owns policy/validation,
-internal/transport framing/connections/budgets, and internal/protocol pure roots,
-physical-path and complete-result adaptations. They never import the root
-command. Root owns routing, lanes, requests/terminal generations, upstreams,
-processes/probes and registry mutation. Leaf tests accompany packages; integration
-and lifecycle tests remain at root.
+**Package boundary.** Internal packages cannot import the root command. Protocol
+adaptations are independent of routing, transport and configuration. See the
+[package map](README.md#development).
 
 ## Stateless HTTP frontend
 
 `http [address [path]]` serves SDK stateless Streamable HTTP with JSON responses
 at `/mcp`; defaults are `127.0.0.1:6099` and home `.`. Listeners are loopback-only.
-Before rewriting/backend admission, validate the original numeric loopback or
-localhost Host and apply Go cross-origin protection to Origin/Sec-Fetch-Site.
-Unsafe browser requests receive 403 under the normal write deadline; nonbrowser
-clients without those headers remain supported. This is not local-process
-authentication. Stdio remains available.
+Validate the original numeric loopback or localhost Host and apply Go
+cross-origin protection to Origin and Sec-Fetch-Site before rewriting or
+backend admission. Rejected requests receive 403 under the write deadline,
+without allocating a backend or advancing its completion clock. Nonbrowser
+clients can omit those headers. Loopback clients are trusted.
 → `TestSupervisorHTTPRejectsUntrustedBrowserRequests`, `TestLoopbackHTTPProtection`
 
 Negotiation terminates locally; home supplies instructions, and tools/list/call
@@ -778,30 +754,11 @@ testdata/fuzz/FuzzCancelTarget/ (both signs, zero and range boundaries covered).
 
 ## Resource ownership and evidence ledger
 
-Historical audit baseline: `0437e95`, Go 1.27.4/gopls v0.23.0 on Darwin/Linux.
-Current CI also exercises gopls v0.24.0 on both platforms; exact toolchains and
-results belong to each source revision's CI evidence. These are bounded resources
-and exercised failure paths, not proof that all bugs are absent.
-
-### Findings and response
-
-Historical R1–R9 cover sockets, retired pending state, registry/helper/watch/log
-bounds, FD reservations, idle authority and guardians. Contracts above and the
-ledger replace the old subsystem descriptions; [formal runtime conformance](formal/README.md#runtime-conformance)
-maps evidence and assumptions. Original counterexamples remain in Git history.
-
-### HTTP browser boundary
-
-The [HTTP contract](#stateless-http-frontend) also pins no backend allocation or
-completion-clock update on rejected requests. Regressions cover IPv4/IPv6,
-localhost, same-origin and nonbrowser clients; trusted local-client/project/OS
-assumptions remain.
-
 ### Resource ledger
 
-Environment overrides are in README. Wire/count reservations are not byte-exact
-heap, RSS or kernel-memory bounds. Release requires actual consumption/teardown,
-not merely the caller stopping its wait.
+See [environment overrides](README.md#limits-and-measurements). Wire and count
+budgets exclude decoded heap, RSS and kernel memory. Local waiters can finish
+before the resources they used are released.
 
 | Resource | Scope/default admission | Release | Boundary |
 | --- | --- | --- | --- |
@@ -821,22 +778,16 @@ not merely the caller stopping its wait.
 | Registry | One read/temp FD per operation; 4 MiB/4001 lines/64 KiB scanner token | Close/unlink/atomic rename; failure preserves prior contents and forbids uncertain-row probing/signals | fsync/rename may block; crash may leave temp inode; ancestors trusted |
 | Locks/manifests | Stable lifetime/action names over 4001 ports; bounded recovery scan | FD close; retain lock inodes; remove manifests only on proof | Old lock/temp files need offline cleanup; no PID/age fallback |
 | Logs | One global worker; 128 jobs/≤1 MiB allocated queued+active payload; owner 64 MiB disk/≤server-cap+1 files | Bounded retention, serialized append, confirmed release; one terminal failure channel | Active-append counters approximate; mutation checks cover touched files; sole managed writer required |
-| Usage/pending mirrors | Removed; owner operations replace advisory files/sampled LFU | Not applicable | Stop old writers before migration |
 | Helpers | Stdout 64 KiB/4 MiB, stderr 64 KiB, derived deadline, 250 ms pipe-wait delay | Cancel/reap direct child on error/overflow; reject partial snapshots | Escaped grandchildren need OS containment |
 | Telemetry | Internal sidecar-suppression request; private Go mode-off state | Check selected Go's exact off directory before spawn/delivery | Future sidecars may escape accounting; external caches/global telemetry unchanged |
 
 ### Evidence and remaining work
 
-Registry churn checks /dev/fd across 256 failed cycles and 64 cancelled lock
-waits. Boundary tests cover FIFO/symlink/nonregular/corrupt input and no signals
-on uncertain activity. Retired pending-file tests are replaced by owner-startup
-and lease-reconciliation regressions. Pure concurrency/idle tests use synctest
-and in-memory storage; real sockets/processes stay outside fake time.
+Registry churn tests check `/dev/fd` across 256 failed cycles and 64 cancelled
+lock waits. Boundary tests cover corrupt/nonregular input and uncertain process
+identity. See the [verification plan](README.md#verify-correctness) and
+[runtime conformance mapping](formal/README.md#runtime-conformance).
 
-The [verification plan](README.md#verify-correctness) maps these contracts to
-fuzz targets, formal models and runtime tests. Formal artifacts are checked
-separately in formal/. Audit artifacts remain
-outside the repo under ~/.codex/artifacts/gopls-audit/. Final evidence must bind
-native Linux/macOS results and owner coverage to its source. Default-duration
-zero-client checks and 24h/72h soaks remain pending at this checkpoint; no
-long-soak or universal POSIX descendant-containment conclusion is claimed.
+Record native Linux/macOS results and owner coverage against the source revision.
+Default-duration zero-client checks and 24h/72h soaks remain pending. Keep audit
+artifacts under `~/.codex/artifacts/gopls-audit/`.

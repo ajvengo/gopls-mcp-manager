@@ -57,42 +57,30 @@ func (b *gatedBody) Read(p []byte) (int, error) {
 	return b.Reader.Read(p)
 }
 
-// benchRouter is the warm router the routing benchmarks below share.
 func benchRouter(b *testing.B) (*router, string) {
 	b.Helper()
 	dir := b.TempDir()
 	dir, err := filepath.EvalSymlinks(dir)
 	require.NoError(b, err)
-	// Use the same physical spelling for existing and nonexistent fixture files.
-	// Symlink memo consistency is covered separately by the routing tests.
+	// Use physical paths so Darwin's temp-directory alias cannot skew hits.
 	file := filepath.Join(dir, "main.go")
 	mustWriteFile(b, file, "package main\n")
 	r := newTestRouter(b, dir)
-	// Pre-seeded so the benchmark measures the memo hit, which is what a session
-	// spends its time on: the git call behind a miss happens a handful of times.
+	// Preseed the directory memo to exclude Git lookups.
 	parent, _ := containingDir(file)
 	r.worktrees[parent] = dir
 	return r, file
 }
 
-// toolCall is the message every benchmark here routes: one tools/call under a
-// fixed id, differing only in the arguments it names.
 func toolCall(tb testing.TB, params jsontext.Value) *jsonrpc.Request {
 	return &jsonrpc.Request{ID: mustID(tb, float64(1)), Method: "tools/call", Params: params}
 }
 
-// fileCallParams is the tool call every benchmark here sends: one naming one
-// file, which is what target has to resolve a worktree from.
 func fileCallParams(file string) jsontext.Value {
 	return jsontext.Value(`{"name":"go_file_context","arguments":{"file":` + strconv.Quote(file) + `}}`)
 }
 
-// What routeResolved adds to every tools/call after it has picked a lane, on the
-// reader goroutine beside BenchmarkTargetToolCall. The aliased row is the rewrite
-// itself; the physical row is what a session that has seen one symlinked spelling
-// pays on the calls that need no rewrite — measured at ~380ns against that
-// benchmark's ~540ns, which is why a session that has seen none is gated out of
-// this path entirely (memoState.aliased).
+// Measure scans and rewrites after the session has seen a path alias.
 func BenchmarkCanonicalToolCall(b *testing.B) {
 	for _, bench := range []struct{ name, physical string }{
 		{name: "physical"},
@@ -113,10 +101,7 @@ func BenchmarkCanonicalToolCall(b *testing.B) {
 	}
 }
 
-// loopbackConn is a gopls that answers every call at once and for free. What
-// gopls takes to answer is its own business and dwarfs everything here by
-// orders of magnitude; what the benchmark below is after is the bridge around
-// that call, so the answer has to cost nothing to stay visible.
+// Return minimal replies to isolate router overhead.
 func loopbackConn() *fakeConn {
 	c := &fakeConn{reads: make(chan jsonrpc.Message, laneQueue)}
 	c.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
@@ -134,16 +119,8 @@ func loopbackConn() *fakeConn {
 	return c
 }
 
-// One tool call, all the way through: the reader decides a worktree, records the
-// call, hands it to that worktree's lane, the lane writes it to its upstream,
-// the upstream's reader takes the answer back and the writer hands it to the
-// client. Every goroutine, channel, mutex and timer a warm session spends per
-// message, and nothing else — the dial and the handshake happen once, on the
-// first iteration.
-//
-// This is the number that says what the bridge costs an agent; the component
-// benchmarks around it say where it went. Compare against BenchmarkStdioCodec,
-// the same message's trip through the transport at either end.
+// Measure router round trips with in-memory connections. The first iteration
+// dials and initializes the upstream.
 func BenchmarkCallRoundTrip(b *testing.B) {
 	r, file := benchRouter(b)
 	handshakeReady(r)
@@ -168,11 +145,7 @@ func BenchmarkCallRoundTrip(b *testing.B) {
 	var i float64
 	for b.Loop() {
 		i++
-		// Not mustID: MakeID cannot fail for a float64, and its tb.Helper() takes
-		// testing's lock and walks the stack every iteration — some 280ns against
-		// the ~4µs measured here, which would be the bridge charged 6% for the
-		// benchmark's own scaffolding. An id that came out wrong anyway fails the
-		// answer check below.
+		// Skip the assertion helper's stack walk. MakeID accepts float64.
 		id, _ := jsonrpc.MakeID(i)
 		client <- &jsonrpc.Request{ID: id, Method: "tools/call", Params: params}
 		if resp, ok := (<-sink.writes).(*jsonrpc.Response); !ok || resp.Error != nil {
@@ -181,21 +154,8 @@ func BenchmarkCallRoundTrip(b *testing.B) {
 	}
 }
 
-// The transport under the bridge, both ends of it: encode a message, frame it,
-// read it back, decode it. Every message pays this twice — once arriving from
-// the client, once leaving for it — and the bridge's own work per message
-// (BenchmarkCallRoundTrip) sits on top of it.
-//
-// Measured so that nobody spends a diff shaving allocations off the routing
-// while the framing above it costs more than all of them together. Same
-// newline-delimited JSON codec StdioTransport uses, in memory.
-//
-// The two ends run concurrently as they do in production, so this is the wall
-// time one message spends in the transport, not the sum of both halves; the
-// allocations reported are the decoding end's, the one running here.
+// Measure elapsed time across a concurrent stdio encode/decode handoff.
 func BenchmarkStdioCodec(b *testing.B) {
-	// No router: nothing here routes, and the path only has to be the length a
-	// real one is, since what is measured is the bytes going through the codec.
 	file := filepath.Join(b.TempDir(), "main.go")
 	left, right := mcp.NewInMemoryTransports()
 	writer, err := left.Connect(b.Context())
@@ -1007,11 +967,6 @@ func TestRootlessInitializeIsForwardedWithWorkingRoots(t *testing.T) {
 	})
 }
 
-// A cold worktree used to be dialled on the goroutine that reads the client, so
-// every other worktree's calls queued behind its flock wait, gopls spawn and
-// handshake — up to the whole handshake budget. Each worktree has a lane of its
-// own now, and a call to one that is already connected must land while a cold
-// one is still stuck in its dial.
 func TestAColdWorktreeDoesNotHoldUpAnother(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		r := newTestRouter(t, testHome)
@@ -1020,9 +975,7 @@ func TestAColdWorktreeDoesNotHoldUpAnother(t *testing.T) {
 
 		handshakeReady(r)
 		parkedDial(t, r)
-		// Routing by path would have to resolve one through git, which a bubble
-		// cannot account for. A sticky worktree sends a path-less call to the same
-		// place, which is all this needs.
+		// Use sticky routing to keep Git subprocesses outside the bubble.
 		r.sticky = "/tmp/cold"
 		go connectedLane(r, home, warm).run()
 		// LIFO, so this runs after the lanes are closed — see the note above.
@@ -1081,11 +1034,8 @@ func TestTheClientInitializeIsRefusedByAnAlreadyHandshakenUpstream(t *testing.T)
 	})
 }
 
-// yieldingConn is an upstream that is already gone, and whose write is certain
-// to lose the race it is in: it lets every other goroutine in the bubble block
-// first, so a reader started before the write — the regression
-// TestSendRetriesInitialInitializeWithoutPrivateHandshake pins — always claims
-// the id. Left to a real race, that reader wins about once in ten thousand runs.
+// Yield until quiescent so a reader started too early can claim the call
+// before the failed write returns.
 func yieldingConn() *fakeConn {
 	c := deadConn()
 	c.onWrite = func(context.Context, jsonrpc.Message) error {
@@ -1513,14 +1463,7 @@ func TestWorktreeOfResolvesAndMemoizes(t *testing.T) {
 		wantMemo int // directory-memo entries afterwards
 	}{
 		{
-			// Every path in a directory has the same worktree, and resolving one
-			// costs a ~13ms fork. A memo keyed by the path would pay that again
-			// for every file the session names in a directory already resolved.
-			// Neither file exists, which is also the answer to "what does it key
-			// on for a file gopls is about to create": the directory holding it.
-			// The third is that same directory as a dir argument, spelled the way
-			// a client may well send one — a key of its own would fork git again
-			// for an answer already in the memo.
+			// Two missing files and the directory itself share one memo key.
 			name: "one directory, three spellings, one fork",
 			paths: []string{
 				filepath.Join(linked, "a.go"),

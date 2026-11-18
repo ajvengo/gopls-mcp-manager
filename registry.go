@@ -145,12 +145,8 @@ type record struct {
 	OwnerBoot   string `json:",omitzero"`
 	Generation  string `json:",omitzero"`
 	GuardianPID int    `json:",omitzero"`
-	// Persist seconds and milliseconds together for watch snapshot comparison.
-	StartedAt int64
-	// StartedAtMilli is the same instant in unix milliseconds, for comparing
-	// the start with a file's mtime (see startedPrecisely). Zero in a map
-	// written by a manager that predates it; that reader then falls back to
-	// StartedAt.
+	StartedAt   int64
+	// Millisecond precision for comparing module mtimes. Older records omit it.
 	StartedAtMilli int64 `json:",omitzero"`
 	Terminating    bool  `json:",omitzero"`
 	// Retain legacy JSON fields without using them for admission or eviction.
@@ -158,12 +154,7 @@ type record struct {
 	UsedAt int64   `json:",omitzero"`
 }
 
-// startedPrecisely is when r's gopls was spawned, to the millisecond, and false
-// for a record that cannot say. StartedAtMilli is trusted only when it agrees
-// with StartedAt: the map is meant to be editable by hand, and a milli that
-// contradicts the seconds beside it is a typo, not a better clock. A map
-// rewritten by an older manager carries no milli at all, so the seconds stand
-// in. A zero StartedAt is no start at all.
+// Use milliseconds only when they agree with the recorded seconds.
 func (r record) startedPrecisely() (time.Time, bool) {
 	if r.StartedAt == 0 {
 		return time.Time{}, false
@@ -174,12 +165,8 @@ func (r record) startedPrecisely() (time.Time, bool) {
 	return time.Unix(r.StartedAt, 0), true
 }
 
-// serverID names one gopls process: its pid and the unix second it started. A
-// pid alone is reused; the start tells a restart on the same pid from the same
-// server. Whole seconds, not StartedAtMilli: an older manager rewriting the map
-// drops the milli, and an identity that changed under it would orphan the
-// server's snapshot. The zero value is "unknown", which is what a connection
-// that did not come from ensure — a test's stub — carries.
+// Whole seconds keep the watcher identity stable if older writers drop
+// StartedAtMilli. A zero identity is unknown.
 type serverID struct {
 	pid     int
 	started int64
@@ -200,9 +187,7 @@ const (
 	maxProcessID     = 1<<31 - 1 // POSIX pid_t is signed; never allow integer truncation into a group signal.
 )
 
-// Blank formatting may be normalised; malformed nonblank state is never
-// exposed as a partial mutable snapshot.
-// A file that is not there yet is intact: it already says what no records say.
+// A missing file is a valid empty registry. Reject corrupt files as a unit.
 func readMap(path string) (records []record, intact bool, err error) {
 	f, err := openStateFile(path, maxRegistryBytes)
 	if errors.Is(err, os.ErrNotExist) {
@@ -213,19 +198,10 @@ func readMap(path string) (records []record, intact bool, err error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	// Unknown/corrupt nonblank records may still reserve a live process. Refuse
-	// the whole observation rather than silently rewrite away its only identity.
-	// Explicit operator repair is required; blank formatting is harmless.
-	//
-	// The fields are checked, not just decoded, because this file is meant to be
-	// editable by hand and every one of them is an argument to kill(2) or to a
-	// probe that decides on a kill: pid 0 signals this process's own group, a
-	// negative pid signals every process the user owns, and a port outside the
-	// range we allocate from can only refuse a probe and condemn a live server.
+	// Corrupt records may still reserve a live process. Validate fields before
+	// any probe or signal can use them.
 	var lines int
-	// Include invalid/blank lines in the count: skipped lines must not bypass
-	// the aggregate work bound. Keep a byte ceiling too, including concurrent
-	// growth after Stat. A failed read returns no partial registry to mutate.
+	// Charge blank lines and growth after Stat to the read budget.
 	limited := &io.LimitedReader{R: f, N: maxRegistryBytes + 1}
 	scanner := bufio.NewScanner(limited)
 	for scanner.Scan() {
@@ -270,8 +246,7 @@ func writeMap(path string, records []record) error {
 		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 	}()
-	// CreateTemp asks for 0600 but the kernel still applies the umask, and this
-	// file's mode is asserted, not merely hoped for.
+	// Set 0600 explicitly because CreateTemp applies the caller's umask.
 	if err := tmp.Chmod(0o600); err != nil {
 		return err
 	}
@@ -282,11 +257,7 @@ func writeMap(path string, records []record) error {
 		if r.Worktree == "" || r.PID <= 0 || r.PID > maxProcessID || r.Port < firstPort || r.Port > lastPort {
 			return fmt.Errorf("write %s: invalid registry fields", path)
 		}
-		// A Unix path is arbitrary bytes, but JSON strings require UTF-8.
-		// Refuse an unrepresentable path with a worktree-specific error:
-		// read back, it would never match its own worktree, so every ensure
-		// would start another gopls beside the last and forget would never find
-		// the record to drop.
+		// Require UTF-8 so the worktree key survives a JSON round trip.
 		if !utf8.ValidString(r.Worktree) {
 			return fmt.Errorf("worktree path is not valid UTF-8: %q", r.Worktree)
 		}

@@ -20,9 +20,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Routing state is owned by the readFromClient goroutine; each upstream belongs
-// to its own lane; the in-flight map is shared under mu, because the
-// per-upstream reader goroutines touch it too.
+// One routing loop commits route decisions. Each lane owns its upstream.
+// Upstream readers share request state under mu.
 type router struct {
 	ctx context.Context
 
@@ -34,19 +33,13 @@ type router struct {
 	paths     map[string]pathMemo // path argument, verbatim -> its resolution, see worktreeOf
 	memoMu    sync.Mutex          // guards both memo maps and the epoch below
 	memo      memoState           // expiry epoch and observations, under memoMu
-	// ctx bounds the dial, and only the dial: the connection it hands back is
-	// read under this same context for the rest of its life, so the caller
-	// cancels it on expiry rather than passing a deadline down. See dialBounded.
-	dial func(context.Context, string, int) (mcp.Connection, error)
-	// plan computes a worktree's roots for answerRoots. A seam, like dial: the
-	// real one walks the tree, which a test cannot hold open any other way.
+	// The connection keeps this context after dial. See dialBounded.
+	dial       func(context.Context, string, int) (mcp.Connection, error)
 	plan       func(worktree string, global []string) watchPlan
 	lookupCold func(context.Context, jsontext.Value) []string
 
 	mu sync.Mutex
-	// Client requests still in flight, so that a dying gopls fails its callers
-	// instead of leaving them hanging. Holding an id is also what confers the
-	// right to answer it: see finish in requests.go.
+	// Claim the matching admission before replying. See finish.
 	awaitingUpstream map[jsonrpc.ID]owed
 	perWorktree      map[string]int
 	remote           *ownerSession
@@ -63,12 +56,7 @@ type router struct {
 	retentionClosed       bool
 	initializeReservation *ownerMessageReservation
 
-	// Replayed to every upstream opened later. Written by readFromClient and
-	// read by every lane's handshake, so it carries its own synchronisation —
-	// and is read at handshake time rather than captured when the lane is
-	// built. A lane opened by a tool call that arrived before initialize does
-	// not wait for one: handshake fails that call outright, and it is a later
-	// attempt, if any, that finds the pointer filled.
+	// Each private handshake loads this template and fails if it is unset.
 	initialize atomic.Pointer[jsonrpc.Request]
 	sticky     string // worktree of the last path-bearing call
 	stateless  bool   // HTTP calls must not inherit another client's worktree
@@ -91,31 +79,6 @@ func newRouter(ctx context.Context, owner *supervisor, home string) *router {
 	return r
 }
 
-// bridge multiplexes one stdio MCP client across per-worktree gopls servers.
-//
-// A gopls instance only knows the worktree it was started in: asked about a file
-// outside it, it answers "no package metadata" rather than routing anywhere. One
-// upstream therefore cannot serve a client whose files live in a linked worktree
-// — which is exactly what an agent working under worktree isolation asks for.
-//
-// So every tools/call carrying a file path is routed to the gopls of THAT path's
-// worktree, started on demand. The client sees one server; each worktree keeps
-// its own index, which is the isolation the worktree was created for.
-//
-// Calls with no path argument (go_workspace, go_search, go_package_api) carry no
-// routable evidence. They follow the most recent path-bearing call, falling back
-// to the worktree the bridge was started in.
-// serve is the session over an already-connected client transport: everything
-// bridge does once it has one. Split out so that the shutdown order below — the
-// one thing here with a wrong answer — is reachable over a pair of in-memory
-// transports, since the one bridge opens is this process's real stdin.
-//
-// The session's context is derived here rather than handed in with a cancel to
-// match, so that nothing outside can end the session early or forget to end it
-// at all. Connecting a transport does not tie it to a context — StdioTransport's
-// Connect ignores the one it is given — so what stops the traffic is this
-// context, which every Read and Write below runs under, and Close, which ends
-// the connection itself. Both happen here, in that order.
 func serve(ctx context.Context, owner *supervisor, home string, stdio mcp.Connection) error {
 	return serveRouter(newRouter(ctx, owner, home), stdio)
 }
@@ -129,11 +92,8 @@ func serveRouter(r *router, stdio mcp.Connection) error {
 		defer r.finishUsage()
 		go r.reportUsage(m.diagnosticWriter())
 	}
-	// Only the reader is waited for, because r.lanes is its state and
-	// closeLanes must not race it. The writer is left where it stands: the
-	// stdio transport's Close closes stdin and no-ops on stdout, so a Write
-	// already inside a full stdout pipe never unblocks, and waiting for it would
-	// hang the exit on a client that stopped reading us.
+	// Join the lane producer before closing its queues. A blocked stdout
+	// write can survive Close, so shutdown cannot join the writer.
 	readerDone := make(chan struct{})
 	go r.writeToClient(stdio)
 	go func() {
@@ -196,25 +156,14 @@ func (r *router) finishUsage() {
 	}
 }
 
-// closeLanes ends every lane and lets it close its own connection.
-//
-// Only ever after the goroutine that owns r.lanes has stopped — it is the only
-// sender on l.reqs, so closing these channels is safe exactly because it is
-// provably gone. Every caller waits for theirs first.
-//
-// Waiting for the lanes to finish is deliberately the caller's, not folded in
-// here: it only terminates once the session context is cancelled, which the two
-// shutdown paths do first and a test closing a router's queues does not.
+// Stop the queue producer before closing the lanes.
 func (r *router) closeLanes() {
 	for _, l := range r.lanes {
 		close(l.reqs)
 	}
 }
 
-// awaitLanes waits out whatever each lane is still finishing — the cleanup of a
-// failed child, most of the time — so the process cannot exit and abandon it.
-// Manager waits are cancellable and that cleanup has its own short termination
-// budget, so this is bounded. Only meaningful after closeLanes.
+// After closeLanes, wait for in-progress cleanup before exiting.
 func (r *router) awaitLanes() {
 	for _, l := range r.lanes {
 		<-l.done
@@ -297,12 +246,7 @@ func (r *router) readIngress(stdio mcp.Connection, incoming chan<- delivery) {
 
 			r.initialize.Store(req)
 		} else if r.initialize.Load() == nil {
-			// A request the client sent before its own initialize, which the
-			// protocol disallows. Refused here rather than by the lane that
-			// would run it, because only this loop sees the client's own order:
-			// a lane could dial before the initialize behind it is stored. The
-			// invariant does not rest on winning that race — a connection then
-			// owed a second initialize refuses it itself (see upstream).
+			// Enforce initialize in wire order before dispatching to lanes.
 			r.refuse(req, jsonrpc.CodeInvalidRequest, "%s arrived before the client sent initialize", req.Method)
 			continue
 		}
@@ -357,10 +301,6 @@ func (r *router) reportError(err error) {
 	}
 }
 
-// errorResponse builds the one error shape this bridge sends, in both
-// directions: refuse and failInFlight forward it to the client,
-// answeredUpstream writes it back to a gopls. Shared so they cannot drift into
-// answering the same way in different words.
 func errorResponse(id jsonrpc.ID, code int64, format string, args ...any) *jsonrpc.Response {
 	return &jsonrpc.Response{ID: id, Error: &jsonrpc.Error{
 		Code:    code,
@@ -375,18 +315,14 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	// roots/list is answered off this loop: planning walks the worktree, and
-	// nothing else from this upstream is forwarded while the loop is in it. One
-	// reply worker per reader serializes replies; planRoots shares one filesystem
-	// worker across reconnects. The small queue backpressures only this reader.
+	// Plan roots off the read loop so worktree walks can run alongside replies.
 	asks := make(chan jsonrpc.ID, 4)
 	defer close(asks)
 	go r.answerRootsAsks(ctx, conn, worktree, asks)
 	for {
 		msg, err := conn.Read(ctx)
 		if err != nil {
-			// An upstream dying is not the stdio client's problem. Its cached
-			// connection fails the next write, which redials and retries once.
+			// Fail this connection's calls while keeping the client attached.
 			r.failInFlight(conn, worktree, err)
 			return
 		}
@@ -407,9 +343,7 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 		}
 		if resp, ok := msg.(*jsonrpc.Response); ok {
 			if _, claimed := r.finish(resp.ID, conn, nil); !claimed {
-				// send() got to this id first — its write failed after the upstream
-				// had already taken the message — and answered it. Forwarding now
-				// would be a second reply to a call the client has closed.
+				// Another terminal path may already have claimed this admission.
 				continue
 			}
 		}
@@ -417,13 +351,7 @@ func (r *router) readFromUpstream(conn mcp.Connection, worktree string) {
 	}
 }
 
-// answerRootsAsks replies to the roots/list ids the reader hands over, each
-// under its own delivery ceiling (S4a). A failed reply closes the connection,
-// which fails the reader's Read, and fails the connection's calls here as well:
-// failInFlight claims each id under r.mu, so whichever of the two runs first
-// answers it and the other finds nothing. Later asks on a failed connection are
-// drained unanswered, so the reader never blocks on a dead worker. It ends when
-// the reader closes asks.
+// After a failed roots reply, drain asks until the reader closes the queue.
 func (r *router) answerRootsAsks(parent context.Context, conn mcp.Connection, worktree string, asks <-chan jsonrpc.ID) {
 	failed := false
 	for id := range asks {
@@ -441,18 +369,8 @@ func (r *router) answerRootsAsks(parent context.Context, conn mcp.Connection, wo
 	}
 }
 
-// answeredUpstream handles a server-initiated request here rather than passing
-// it to the client, and reports whether it did.
-//
-// Every read loop that can see one has to call this — see answerRoots for what
-// goes wrong when a roots/list reaches the client. Anything else is refused: an
-// upstream holding an unanswerable question waits forever, so a definite error
-// is the kinder reply.
-//
-// ctx is the caller's budget for talking to conn: the handshake answers roots
-// inside its deadline (S2); steady-state replies get the delivery ceiling. Only
-// the handshake reaches roots/list here: the steady-state reader hands it to
-// answerRootsAsks, so its walk of the worktree blocks no response.
+// Handle server requests on their originating connection. Only handshake
+// roots replies run inline. Steady-state roots use answerRootsAsks.
 func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, worktree string, msg jsonrpc.Message) (bool, error) {
 	req, ok := msg.(*jsonrpc.Request)
 	if !ok || !req.ID.IsValid() {
@@ -467,17 +385,7 @@ func (r *router) answeredUpstream(ctx context.Context, conn mcp.Connection, work
 		"gopls-mcp-manager does not relay %q to the client", req.Method))
 }
 
-// answerRoots tells an upstream the roots of the worktree it serves — the
-// worktree itself, or the directories covering it minus what its filters
-// exclude (see watchroots.go) — instead of forwarding the question to the client.
-//
-// This is what makes a gopls notice a file created after it started: its watcher
-// only watches the roots the client reports, and it only asks for them once it
-// has seen the roots capability in initialize — which is why withRootsCapability
-// puts one there. Left to the client, every upstream would hear the same answer,
-// the single tree the session was opened in, and every other worktree would watch
-// nothing and answer "no package metadata" for a file that is right there on
-// disk — indistinguishable from a genuinely broken tree.
+// Report filtered roots for this upstream so gopls watches its own worktree.
 func (r *router) answerRoots(ctx context.Context, conn mcp.Connection, worktree string, id jsonrpc.ID) error {
 	owner := r.owner
 	var g *ownedGeneration

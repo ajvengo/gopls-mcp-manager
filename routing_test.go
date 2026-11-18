@@ -94,16 +94,7 @@ func TestMemoRefreshAtCapacityDoesNotEvict(t *testing.T) {
 	require.Truef(t, r.memo.rollovers == 1 && len(r.paths) == 1, "new key did not enforce capacity")
 }
 
-// The whole routing decision for the message an agent sends most: unmarshal
-// plus the memo hit below. Its allocs/op is what says whether target still
-// gathers its path arguments into a slice before resolving them.
-//
-// The reader goroutine runs this for every message and nothing else routes
-// while it does — but it is not the throughput ceiling: reading the message off
-// the transport costs several times more and allocates two orders of magnitude
-// more, the SDK's decoder taking a fresh 64KiB buffer per message. See
-// BenchmarkStdioCodec, and BenchmarkCallRoundTrip for the two together, before
-// spending a diff on the routing rather than the decode above it.
+// Isolate argument decoding and memo-hit routing from transport cost.
 func BenchmarkTargetToolCall(b *testing.B) {
 	r, file := benchRouter(b)
 	req := toolCall(b, fileCallParams(file))
@@ -117,11 +108,6 @@ func BenchmarkTargetToolCall(b *testing.B) {
 	}
 }
 
-// A tools/call naming many files at once — the shape a multi-file edit or a
-// package-wide query sends. One memo lookup per path, and the answer is needed
-// before any of them can be routed, so this is the reader goroutine's worst
-// case per message. Compared against the single-file benchmark above, it says
-// whether the per-path cost is flat.
 func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 	r, file := benchRouter(b)
 	dir := filepath.Dir(file)
@@ -140,22 +126,8 @@ func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 	}
 }
 
-// Probe-only microbenchmark. Full maintenance probes every record outside the
-// flock; acquisition probes only the requested worktree. See
-// BenchmarkAcquisitionVersusSweep for those production paths.
-//
-// The rows are the verdicts a probe can reach. "live" is the steady state, one
-// local round trip. "refused" is conclusively dead; "odd" answers but not like
-// ours, so the verdict is inconclusive — both then fork a ps per record, and
-// that fork, not the probe, is what they measure. "silent" is §10's case, a
-// server that took the connection and said nothing: it costs probeClient's
-// whole timeout, so it runs at half a second an iteration by construction and
-
-// A file the path memo has not seen, under a directory it has: the miss the
-// verbatim-path memo exists to keep off the reader goroutine. The cost over the
-// hit above is containingDir's EvalSymlinks walk — one lstat per component —
-// plus the stat that tells a file from a directory. The memo grows an entry per
-// iteration, as it does per file in a session.
+// Miss the path memo while keeping the directory memo warm to isolate
+// filesystem canonicalization from Git lookup.
 func BenchmarkWorktreeOfNewPath(b *testing.B) {
 	r, file := benchRouter(b)
 	dir := filepath.Dir(file)

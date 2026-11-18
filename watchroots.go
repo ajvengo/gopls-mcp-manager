@@ -19,25 +19,9 @@ import (
 	"golang.org/x/mod/modfile"
 )
 
-// A gopls watches every root answerRoots reports recursively, and on darwin
-// every entry under a watched directory costs it a descriptor (see the
-// descriptor reservations in supervisor.go). So instead of the worktree itself,
-// answerRoots reports the smallest set of directories that covers the worktree
-// minus what its filters exclude: the go.mod ignore directives of the worktree's
-// modules, then GOPLS_MANAGER_DIRECTORY_FILTERS. With no rule excluding
-// anything the plan is the worktree itself, exactly as before.
-//
-// What no root covers is the entries directly inside a directory that has an
-// excluded descendant — a "partial" directory, the worktree itself whenever
-// anything is excluded. gopls catches edits to Go files there anyway, because
-// every file-scoped MCP tool compares the mtimes of its package's files first,
-// but not a file added or removed, a new subdirectory, or a go.mod/go.sum/
-// go.work change. A manager therefore keeps the Go-relevant entry names of each
-// partial directory, and maintenance condemns a gopls whose partial
-// directories gained or lost one, or whose module files changed after it
-// started; the next call starts a fresh one. See watchChanged.
-
-// watchPlan is what answerRoots tells a gopls to watch.
+// Filter recursive roots to limit descriptor use on Darwin. Snapshot relevant
+// entries in partial directories because their immediate entries are unwatched
+// (SPEC S1b).
 type watchPlan struct {
 	err       error                     // a failed plan must never be reported as complete roots
 	started   time.Time                 // admission order, so a late plan cannot replace a newer generation
@@ -149,7 +133,6 @@ func (b *watchBudget) readDir(dir, rel string, depth int) ([]os.DirEntry, error)
 	}
 }
 
-// partialEntries is what a partial directory held when the plan was made.
 type partialEntries struct {
 	// names are its Go-relevant entries, sorted; see relevantNames.
 	names []string
@@ -158,7 +141,7 @@ type partialEntries struct {
 	files bool
 }
 
-// watchSnapshot is the plan a manager last reported for a worktree, and when.
+// watchSnapshot retains a generation's first possible watcher view.
 type watchSnapshot struct {
 	planned time.Time
 	partial map[string]partialEntries
@@ -169,16 +152,12 @@ type watchSnapshot struct {
 	uncertain bool
 }
 
-// watchPlans holds this manager's snapshots by worktree.
 type watchPlans struct {
 	mu    sync.Mutex
 	plans map[string]watchSnapshot
 }
 
-// skippedByWatcher reports whether gopls' watcher never descends into a
-// directory of this name (filewatcher.skipDir), so it neither needs excluding
-// nor makes its parent partial. .git is the case that matters: a worktree's own
-// .git directory is never watched, whatever a filter says.
+// Match gopls filewatcher.skipDir so skipped directories never make a parent partial.
 func skippedByWatcher(name string) bool {
 	return strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "testdata"
 }
@@ -264,12 +243,8 @@ func usableFilterRule(rule string) bool {
 	return len(rule) > 0 && len(rule) <= config.MaxDirectoryFilterBytes && utf8.ValidString(rule) && (rule[0] == '+' || rule[0] == '-')
 }
 
-// dirFilter judges directories by one rule list: include is pathIncludeFunc's
-// verdict, and mayInclude whether an excluded directory is worth looking into,
-// that is, whether some + rule could include it or something below it. A rule
-// with a "**" segment may match anywhere, so it always says yes; any other rule
-// names one path, which an excluded directory can lead to only when it is that
-// path or an ancestor of it. Without + rules nothing excluded is worth a look.
+// Prune excluded subtrees unless a re-include can reach them. Treat any
+// re-include containing ** as potentially reachable.
 type dirFilter struct {
 	include    func(string) bool
 	mayInclude func(string) bool
@@ -426,7 +401,6 @@ func (b *watchBudget) readModuleFile(path string) ([]byte, error) {
 	return data, nil
 }
 
-// planWatch computes the roots a gopls for worktree is told to watch.
 func planWatch(worktree string, global []string) watchPlan {
 	return planWatchWithLimits(worktree, global, defaultWatchLimits())
 }
@@ -488,9 +462,7 @@ func (w *planner) addPartial(dir string, names []string, files bool) error {
 	return nil
 }
 
-// walk reports whether the tree at dir has no excluded directory, adding the
-// roots and partial directories that cover it to the plan when it does. A
-// directory read error fails the plan rather than certifying a partial view.
+// Propagate read errors so an incomplete walk cannot certify coverage.
 func (w *planner) walk(dir, rel string, depth int) (bool, error) {
 	entries, err := w.budget.readDir(dir, rel, depth)
 	if err != nil {
@@ -538,11 +510,7 @@ func (w *planner) walk(dir, rel string, depth int) (bool, error) {
 	return false, w.addPartial(dir, names, true)
 }
 
-// walkExcluded looks inside an excluded directory for descendants a later +
-// rule includes again; the caller has checked that one may exist. Only its
-// subdirectories are recorded, those that may hold such a descendant, since a
-// new one may: its own files are excluded, so a change among them, or a new
-// subdirectory no + rule can reach, must not condemn a gopls.
+// In excluded directories, track only subdirectories a re-include can reach.
 func (w *planner) walkExcluded(dir, rel string, depth int) error {
 	entries, err := w.budget.readDir(dir, rel, depth)
 	if err != nil {
@@ -578,11 +546,8 @@ func (w *planner) walkExcluded(dir, rel string, depth int) error {
 	return w.addPartial(dir, names, false)
 }
 
-// relevantNames lists the entries of a partial directory whose appearance or
-// disappearance gopls would have needed to hear about, subdirectories with a
-// trailing slash. With files set (a directory that is itself included) that is
-// its included subdirectories and watched files; without (an excluded one), the
-// subdirectories a + rule may reach (dirFilter.worthListing).
+// Mark directories with a trailing slash so file/directory replacement counts
+// as a change.
 func relevantNames(entries []os.DirEntry, rel string, filter dirFilter, files bool, budget *watchBudget) ([]string, error) {
 	names := []string{}
 	for _, e := range entries {
@@ -635,15 +600,8 @@ func (m *manager) rememberWatch(worktree string, server serverID, plan watchPlan
 	m.watch.plans[worktree] = watchSnapshot{partial: plan.partial, taken: time.Now(), planned: plan.started, server: server, uncertain: plan.uncertain}
 }
 
-// watchChanged reports whether r's gopls has missed a change no root of its plan
-// covers: a partial directory whose relevant entries differ from the snapshot,
-// or a module file in one modified after the server started. Only a snapshot of
-// r's own server describes r's watcher. With both identities known that is
-// compared; otherwise a snapshot taken before r started belongs to a server this
-// manager reported roots to earlier. It returns the snapshot to hand to
-// forgetWatch once r is condemned rather than dropping it, because a caller may
-// still spare the server (a busy worktree) and so must not use the change up:
-// one change condemns one server.
+// Compare this generation's view, using its start time when identity is unknown.
+// Keep the snapshot if active work prevents retirement.
 func (m *manager) watchChanged(r record) (watchSnapshot, bool, error) {
 	return m.watchChangedWithLimits(r, defaultWatchLimits())
 }
@@ -694,10 +652,7 @@ func (m *manager) watchChangedWithLimits(r record, limits watchLimits) (watchSna
 	return watchSnapshot{}, false, nil
 }
 
-// partialChanged reports whether partial directory dir of r's worktree no
-// longer holds the relevant entries it did, or holds a module file modified
-// after r started. A record from before StartedAt existed skips the mtime half.
-// Read/stat failures report uncertainty; they cannot certify a fresh watcher.
+// Read or stat failure leaves watcher freshness uncertain.
 func partialChanged(r record, dir string, want partialEntries, filter dirFilter, budget *watchBudget) (bool, error) {
 	rel, err := filepath.Rel(r.Worktree, dir)
 	if err != nil {
