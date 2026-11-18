@@ -124,6 +124,7 @@ type delivery struct {
 // accidentally cancel a call on a replacement connection.
 type cancellation struct {
 	req      *jsonrpc.Request
+	id       jsonrpc.ID
 	conn     mcp.Connection
 	deadline time.Time
 	placed   <-chan struct{}
@@ -181,12 +182,8 @@ func (l *lane) sendCancellation(control cancellation) {
 		return
 	}
 	defer func() { <-l.writes }()
-	id, valid := cancelledID(control.req.Params)
-	if !valid {
-		return
-	}
 	l.r.mu.Lock()
-	stale := l.r.owner.staleCancellation(operationKey{control.conn, id}, control.state)
+	stale := l.r.owner.staleCancellation(operationKey{control.conn, control.id}, control.state)
 	l.r.mu.Unlock()
 	if stale {
 		return // this id now belongs to a later upstream operation

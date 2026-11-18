@@ -186,8 +186,7 @@ func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 	}
 	state.timer = time.AfterFunc(r.limits.Execution, func() {
 		if owner, ok := r.finish(id, nil, state); ok {
-			params, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: "execution deadline exceeded"})
-			r.queueCancellation(owner, &jsonrpc.Request{Method: "notifications/cancelled", Params: params})
+			r.queueCancellation(owner, id, cancellationRequest(id, "execution deadline exceeded"))
 			r.mu.Lock()
 			r.usage.ExecutionExpired++
 			r.mu.Unlock()
@@ -326,9 +325,15 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 	if !named {
 		return
 	}
+	if owner, ok := r.cancelRequest(id); ok {
+		r.queueCancellation(owner, id, req)
+	}
+}
+
+func (r *router) cancelRequest(id jsonrpc.ID) (owed, bool) {
 	owner, ok := r.finish(id, nil, nil)
 	if !ok {
-		return
+		return owed{}, false
 	}
 	r.mu.Lock()
 	r.usage.Cancelled++
@@ -336,10 +341,15 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 	// The queued delivery is already stopped: removeLocked cancels every record
 	// no upstream has taken, under mu, which is where that rule belongs.
 	r.forward(errorResponse(id, -32800, "request cancelled"))
-	r.queueCancellation(owner, req)
+	return owner, true
 }
 
-func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
+func cancellationRequest(id jsonrpc.ID, reason string) *jsonrpc.Request {
+	params, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: reason})
+	return &jsonrpc.Request{Method: "notifications/cancelled", Params: params}
+}
+
+func (r *router) queueCancellation(owner owed, id jsonrpc.ID, req *jsonrpc.Request) {
 	if owner.conn == nil {
 		return
 	}
@@ -358,7 +368,7 @@ func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
 			return // Advisory overload never delays local cancellation.
 		}
 		select {
-		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, state: owner.state, deadline: time.Now().Add(sendBudget)}:
+		case l.controls <- cancellation{req: req, id: id, conn: owner.conn, placed: owner.placed, state: owner.state, deadline: time.Now().Add(sendBudget)}:
 		default:
 			releaseMessage(req)
 		}

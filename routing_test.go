@@ -787,12 +787,12 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		l := pausedLane(t, r, testHome)
 		writing := make(chan struct{})
 		release := make(chan struct{})
-		cancelled := make(chan struct{}, 1)
+		cancelled := make(chan jsontext.Value, 1)
 		conn := newFakeConn()
 		conn.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
 			req := msg.(*jsonrpc.Request)
 			if req.Method == "notifications/cancelled" {
-				cancelled <- struct{}{}
+				cancelled <- req.Params
 				return nil
 			}
 			close(writing)
@@ -807,7 +807,8 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		queuedCall(t, r, "writing")
 		go l.run()
 		mustRecv(t, writing, "the call's write to begin")
-		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"writing"}`)})
+		params := jsontext.Value(`{"requestId":"writing","reason":"client stopped","extra":{"keep":true}}`)
+		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: params})
 		synctest.Wait()
 		select {
 		case <-cancelled:
@@ -815,7 +816,7 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		default:
 		}
 		close(release)
-		mustRecv(t, cancelled, "cancellation after delivery")
+		require.Equal(t, params, mustRecv(t, cancelled, "cancellation after delivery"))
 		close(l.reqs)
 		mustRecv(t, l.done, "lane shutdown")
 	})

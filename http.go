@@ -225,8 +225,9 @@ func (b *httpBackend) call(ctx context.Context, method string, params any, resul
 		}
 		return json.Unmarshal(resp.Result, result)
 	case <-ctx.Done():
-		cancelled, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: "HTTP request ended"})
-		b.r.cancelCall(&jsonrpc.Request{Method: "notifications/cancelled", Params: cancelled})
+		if owner, ok := b.r.cancelRequest(id); ok && owner.conn != nil {
+			b.r.queueCancellation(owner, id, cancellationRequest(id, "HTTP request ended"))
+		}
 		return ctx.Err()
 	case <-b.r.ctx.Done():
 		return b.r.ctx.Err()
