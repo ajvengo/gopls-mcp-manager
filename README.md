@@ -10,8 +10,8 @@ go install github.com/ajvengo/gopls-mcp-manager@latest
 ```
 
 Building requires Go 1.27 or newer. Runtime requires Git, Go, and a Go-built
-`gopls` v0.23.0 or newer on `PATH`; CI exercises v0.23.0 and v0.24.0 on Linux and
-macOS. The manager checks gopls' package identity and declared module version,
+`gopls` v0.23.0 or newer on `PATH`. CI exercises v0.23.0 and v0.24.0 on Linux.
+The manager checks gopls' package identity and declared module version,
 without a dependency allowlist. Missing, invalid and `(devel)` versions fail.
 `list` and `status` do not need gopls to inspect retained state.
 
@@ -303,8 +303,8 @@ golangci-lint run ./...
 ```
 
 CI uses the latest patch release matching `go.mod` (Go 1.27), builds for
-`linux/amd64` and `darwin/arm64`, and requires 85% statement coverage in every
-package and overall. Tests use real HTTP/stdio/SSE transports with SDK upstreams.
+`linux/amd64`, and requires 85% statement coverage in every package and overall.
+Tests use real HTTP/stdio/SSE transports with SDK upstreams.
 The optional real-gopls suite starts and reaps children in disposable worktrees
 with a private registry; CI runs it against gopls v0.23.0 and v0.24.0:
 
@@ -340,7 +340,7 @@ input in the target's `testdata/fuzz` corpus so ordinary tests replay it. CI
 retains the corpus when the fuzz job fails.
 
 Run the [formal checks](formal/README.md) with Java 25 and Bun 1.4.4. CI checks
-the models and proofs on Linux and macOS and requires the guard-removal
+the models and proofs on Linux and requires the guard-removal
 mutations to produce the expected counterexamples. Use the conformance ledger
 to pair model changes with Go regressions. Formal results apply to the models.
 

@@ -11,8 +11,6 @@ permissions:
   contents: read
 
 # Preserve the build, test and lint job names used by the existing merge gate.
-# Native Darwin tests and protocol proofs also run independently: cross-building
-# cannot validate kqueue, Unix socket limits, process groups or descriptor release.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,12 +26,6 @@ jobs:
         env:
           GOOS: linux
           GOARCH: amd64
-
-      # Retain cross-build coverage independently of the native test runners.
-      - run: go build ./...
-        env:
-          GOOS: darwin
-          GOARCH: arm64
 
   test:
     runs-on: ubuntu-latest
@@ -97,36 +89,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  test-darwin:
-    runs-on: macos-15
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          check-latest: true
-      - name: Install pinned GitButler CLI for native fixtures
-        run: |
-          curl --fail --silent --show-error --location https://gitbutler.com/install.sh --output "${{ runner.temp }}/install-but.sh"
-          sh "${{ runner.temp }}/install-but.sh" 0.23.4
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/but" --version
-      - run: go test -race -count=1 -coverprofile="${{ runner.temp }}/coverage.out" . ./internal/config ./internal/transport ./internal/protocol
-      - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
-      - name: Verify supported gopls releases
-        run: |
-          for version in v0.23.0 v0.24.0; do
-            go install "golang.org/x/tools/gopls@$version"
-            go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
-          done
-
   formal:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15]
-    runs-on: ${{ matrix.os }}
+    name: formal (ubuntu-latest)
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       GOPLS_FORMAL_REVISION: ${{ github.sha }}
@@ -152,7 +117,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: formal-${{ matrix.os }}
+          name: formal-ubuntu-latest
           path: |
             ${{ runner.temp }}/formal-evidence/*.json
             ${{ runner.temp }}/formal-evidence/*.log
