@@ -273,6 +273,7 @@ func usableFilterRule(rule string) bool {
 type dirFilter struct {
 	include    func(string) bool
 	mayInclude func(string) bool
+	hasRules   bool
 }
 
 func newDirFilter(rules []string) (dirFilter, error) {
@@ -300,6 +301,7 @@ func newDirFilter(rules []string) (dirFilter, error) {
 				return prefix == "**" || prefix == rel || strings.HasPrefix(prefix, rel+"/")
 			})
 		},
+		hasRules: len(rules) != 0,
 	}, nil
 }
 
@@ -434,22 +436,12 @@ func planWatchWithLimits(worktree string, global []string, limits watchLimits) w
 	if err := b.nameBytes(worktree); err != nil {
 		return watchPlan{err: err}
 	}
-	rules, err := b.moduleIgnoreFilters(worktree)
-	if err != nil {
-		return watchPlan{err: err}
-	}
-	for _, rule := range global {
-		if err := b.rule(rule); err != nil {
-			return watchPlan{err: err}
-		}
-		rules = append(rules, rule)
-	}
-	filter, err := newDirFilter(rules)
+	filter, err := b.watchFilter(worktree, global)
 	if err != nil {
 		return watchPlan{err: err}
 	}
 	w := planner{filter: filter, budget: b, plan: watchPlan{partial: make(map[string]partialEntries)}}
-	if len(rules) == 0 {
+	if !filter.hasRules {
 		err = w.addRoot(worktree)
 	} else {
 		var clean bool
@@ -680,7 +672,7 @@ func (m *manager) watchChangedWithLimits(r record, limits watchLimits) (watchSna
 		return watchSnapshot{}, false, nil
 	}
 	b := &watchBudget{remaining: limits}
-	filter, err := m.watchFilter(r.Worktree, b)
+	filter, err := b.watchFilter(r.Worktree, m.limits.DirectoryFilters)
 	if err != nil {
 		return watchSnapshot{}, false, err
 	}
@@ -749,15 +741,13 @@ func partialChanged(r record, dir string, want partialEntries, filter dirFilter,
 	return false, nil
 }
 
-// watchFilter rebuilds the directory filter for worktree, so that a new
-// subdirectory is judged by the rules in force now.
-func (m *manager) watchFilter(worktree string, budget *watchBudget) (dirFilter, error) {
-	rules, err := budget.moduleIgnoreFilters(worktree)
+func (b *watchBudget) watchFilter(worktree string, global []string) (dirFilter, error) {
+	rules, err := b.moduleIgnoreFilters(worktree)
 	if err != nil {
 		return dirFilter{}, err
 	}
-	for _, rule := range m.limits.DirectoryFilters {
-		if err := budget.rule(rule); err != nil {
+	for _, rule := range global {
+		if err := b.rule(rule); err != nil {
 			return dirFilter{}, err
 		}
 		rules = append(rules, rule)
