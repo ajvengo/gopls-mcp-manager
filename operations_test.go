@@ -120,13 +120,12 @@ func TestIngressCancellationBypassesBlockedResolution(t *testing.T) {
 		r := newTestRouter(t, testHome)
 		handshakeReady(r)
 		r.sticky = testWorktree
-		entered, release := make(chan struct{}), make(chan struct{})
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
+		entered := make(chan struct{})
+		r.lookupCold = func(ctx context.Context, _ jsontext.Value) []string {
 			close(entered)
-			<-release
+			<-ctx.Done()
 			return []string{"/late/worktree"}
-		}}
-		go r.resolver.run(t.Context())
+		}
 		r.dial = func(context.Context, string, int) (mcp.Connection, error) { return loopbackConn(), nil }
 		client := startClient(t, r, 4)
 		id := mustID(t, "resolving")
@@ -140,7 +139,6 @@ func TestIngressCancellationBypassesBlockedResolution(t *testing.T) {
 		resp, ok := response.(*jsonrpc.Response)
 		require.Falsef(t, !ok || resp.ID != mustID(t, "pathless") || resp.Error != nil, "pathless call failed: %#v", response)
 		require.Zerof(t, time.Since(start), "cancellation or pathless call waited for routing timeout")
-		close(release)
 		synctest.Wait()
 		require.Equal(t, testWorktree, r.sticky, "cancelled resolution committed late sticky state")
 		wantClientQuiet(t, r, "late lookup completed twice")
@@ -152,13 +150,12 @@ func TestFullIngressQueueStillAcceptsCancellation(t *testing.T) {
 		r := newTestRouter(t, testHome)
 		handshakeReady(r)
 		l := pausedLane(t, r, testHome)
-		entered, release := make(chan struct{}), make(chan struct{})
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
+		entered := make(chan struct{})
+		r.lookupCold = func(ctx context.Context, _ jsontext.Value) []string {
 			close(entered)
-			<-release
+			<-ctx.Done()
 			return []string{testHome}
-		}}
-		go r.resolver.run(t.Context())
+		}
 		client := startClient(t, r, laneQueue+4)
 		client <- &jsonrpc.Request{ID: mustID(t, "resolving"), Method: "tools/call", Params: fileCallParams("/uncached/file.go")}
 		mustRecv(t, entered, "blocked resolution")
@@ -173,7 +170,6 @@ func TestFullIngressQueueStillAcceptsCancellation(t *testing.T) {
 		require.Zerof(t, time.Since(start), "cancellation waited for resolution timeout")
 		client <- &jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"resolving"}`)}
 		_ = wantClientError(t, r, mustID(t, "resolving"), "resolving call not cancelled")
-		close(release)
 		synctest.Wait()
 		require.Lenf(t, l.reqs, laneQueue-1, "delivered %d queued calls", len(l.reqs))
 		require.Equal(t, 1, r.requestUsage().Rejections["routing_queue"], "routing overload not counted")

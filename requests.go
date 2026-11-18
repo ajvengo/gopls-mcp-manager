@@ -33,8 +33,6 @@ type requestUsage struct {
 
 type stageTiming struct{ Count, TotalNS, MaxNS int64 }
 
-// now is the clock the stage timings are taken from, and it does not tick
-// unless metrics are asked for: a zero start is what timed skips on.
 func (r *router) now() time.Time {
 	if !r.limits.Metrics {
 		return time.Time{}
@@ -42,10 +40,7 @@ func (r *router) now() time.Time {
 	return time.Now()
 }
 
-// timed is off unless metrics are asked for, because on it is three or four
-// acquisitions of the router's central lock per request — the same lock admit,
-// bindWorktree, placeDelivery and finish already take for that request, from a
-// different goroutine each time — bought for a snapshot nobody is reading.
+// A zero start skips the metrics lock when collection is disabled.
 func (r *router) timed(stage string, start time.Time) {
 	if !r.limits.Metrics || start.IsZero() {
 		return
@@ -84,10 +79,7 @@ func (r *router) requestUsage() requestUsage {
 	return usage
 }
 
-// admit records id as outstanding and reports the generation token minted for
-// it — nil for a notification, which is owed no answer and so tracked nowhere.
-// No worktree is taken here because none is known yet: per-lane admission is
-// bindWorktree's, once routing has picked the lane. See owed.
+// admit tracks requests before routing. bindWorktree charges the lane later.
 func (r *router) admit(id jsonrpc.ID, cancel func()) (*callState, error) {
 	if !validOwnerID(id) {
 		return nil, fmt.Errorf("opaque request id exceeds %d bytes", maxOwnerIDBytes)
@@ -144,15 +136,8 @@ func release(counts map[string]int, key string) {
 	}
 }
 
-// ownerLocked is the record still owed under id, provided state is the
-// admission the caller came from. A nil state asks for the record whoever holds
-// it, which is what a client's own cancellation does.
-//
-// The generation-token comparison is the tracker's load-bearing rule — a wire
-// id the client reuses gets a fresh token, so an older caller's checks fail
-// against it rather than answering the new call — and every caller that looks a
-// record up has to make it. Made here so a seventh caller cannot forget to.
-// Caller holds mu.
+// ownerLocked checks the admission token to fence reused IDs. Client
+// cancellation passes nil to select the current admission. Caller holds mu.
 func (r *router) ownerLocked(id jsonrpc.ID, state *callState) (owed, bool) {
 	owner, ok := r.awaitingUpstream[id]
 	if !ok || (state != nil && owner.state != state) {
@@ -186,8 +171,7 @@ func (r *router) startExecution(id jsonrpc.ID, state *callState) {
 	}
 	state.timer = time.AfterFunc(r.limits.Execution, func() {
 		if owner, ok := r.finish(id, nil, state); ok {
-			params, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: "execution deadline exceeded"})
-			r.queueCancellation(owner, &jsonrpc.Request{Method: "notifications/cancelled", Params: params})
+			r.queueCancellation(owner, id, cancellationRequest(id, "execution deadline exceeded"))
 			r.mu.Lock()
 			r.usage.ExecutionExpired++
 			r.mu.Unlock()
@@ -211,24 +195,9 @@ func (r *router) clearRequests() {
 	r.owner.abandonSession(r.remote)
 }
 
-// owed is a request in flight: the worktree it was routed to, and the upstream
-// that has taken it, once one has.
-//
-// Ingress records the call before its worktree is known; routing fills in
-// the worktree before delivery assigns the connection. conn is nil while queued. A cancellation arriving in that window still has to find where its
-// call went (R7), which is why one record covers both stages rather than the
-// route appearing only once an upstream owes an answer.
-//
-// state is what says this record is still the admission a given delivery came
-// from: a wire id the client reuses after a cancellation gets a fresh token, so
-// the old delivery's own checks fail against it rather than failing or
-// answering the new call. It is the only identity the record needs, which is
-// why the ingress context is not kept here beside it.
-//
-// conn is compared by connection, never by worktree: send() replaces a dead
-// connection with a live one under the same worktree, and matching by name
-// would let the dead one's reader fail calls the reconnect had already placed
-// successfully.
+// owed tracks one local admission from ingress through delivery. Routing fills
+// in the worktree before delivery assigns conn. The token fences ID reuse, and
+// exact connection identity fences replies from a replaced upstream.
 type owed struct {
 	conn     mcp.Connection
 	worktree string
@@ -243,22 +212,12 @@ func (r *router) rejected(reason string) {
 	r.rejectedLocked(reason)
 }
 
-// Both halves in one place: the total and the breakdown have to stay in step
-// for a usage snapshot to add up, and the five sites that already hold mu were
-// each counting them by hand.
 func (r *router) rejectedLocked(reason string) {
 	r.usage.Rejected++
 	r.usage.Rejections[reason]++
 }
 
-// failIngress fails a call that never reached a lane. Nothing else about it
-// differs from any other terminal failure, so it is that same claim-then-answer
-// — see failDelivery — plus the counter that says where it died.
-//
-// The delivery is cancelled here rather than at each of the six call sites:
-// removeLocked already does it for a tracked id, so the copies only ever
-// mattered for a notification, whose invalid id was never tracked — half a rule
-// in the shared function and half in every caller.
+// Cancel here so untracked notifications release their delivery context too.
 func (r *router) failIngress(call delivery, code int64, message string) {
 	defer call.cancel()
 	defer releaseMessage(call.req)
@@ -302,13 +261,7 @@ func (r *router) bindWorktree(call delivery, worktree string, cancel context.Can
 	return nil
 }
 
-// cancelledID is the request id a notifications/cancelled names, and whether it
-// named one at all.
-//
-// Ids arrive off the wire as the same nil/float64/string that json.Unmarshal
-// produces here, and both sides go through MakeID, so one rebuilt from the
-// notification compares equal to the one the route was recorded under.
-// MakeID truncates numbers to int64, so reject values that would name another id.
+// Reject numbers that MakeID would truncate into a different request ID.
 func cancelledID(params jsontext.Value) (jsonrpc.ID, bool) {
 	var cancelled mcp.CancelledParams
 	if json.Unmarshal(params, &cancelled) != nil {
@@ -326,20 +279,29 @@ func (r *router) cancelCall(req *jsonrpc.Request) {
 	if !named {
 		return
 	}
+	if owner, ok := r.cancelRequest(id); ok {
+		r.queueCancellation(owner, id, req)
+	}
+}
+
+func (r *router) cancelRequest(id jsonrpc.ID) (owed, bool) {
 	owner, ok := r.finish(id, nil, nil)
 	if !ok {
-		return
+		return owed{}, false
 	}
 	r.mu.Lock()
 	r.usage.Cancelled++
 	r.mu.Unlock()
-	// The queued delivery is already stopped: removeLocked cancels every record
-	// no upstream has taken, under mu, which is where that rule belongs.
 	r.forward(errorResponse(id, -32800, "request cancelled"))
-	r.queueCancellation(owner, req)
+	return owner, true
 }
 
-func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
+func cancellationRequest(id jsonrpc.ID, reason string) *jsonrpc.Request {
+	params, _ := json.Marshal(mcp.CancelledParams{RequestID: id.Raw(), Reason: reason})
+	return &jsonrpc.Request{Method: "notifications/cancelled", Params: params}
+}
+
+func (r *router) queueCancellation(owner owed, id jsonrpc.ID, req *jsonrpc.Request) {
 	if owner.conn == nil {
 		return
 	}
@@ -358,7 +320,7 @@ func (r *router) queueCancellation(owner owed, req *jsonrpc.Request) {
 			return // Advisory overload never delays local cancellation.
 		}
 		select {
-		case l.controls <- cancellation{req: req, conn: owner.conn, placed: owner.placed, state: owner.state, deadline: time.Now().Add(sendBudget)}:
+		case l.controls <- cancellation{req: req, id: id, conn: owner.conn, placed: owner.placed, state: owner.state, deadline: time.Now().Add(sendBudget)}:
 		default:
 			releaseMessage(req)
 		}
@@ -375,26 +337,13 @@ func (r *router) refuse(req *jsonrpc.Request, code int64, format string, args ..
 	r.forward(errorResponse(req.ID, code, format, args...))
 }
 
-// failInFlight answers every request still owed by conn with an error. The
-// calls in flight when a gopls dies get no retry — nothing else will ever
-// produce their ids — so left alone they strand a client that has no timeout.
-//
-// One worktree names them all: a connection belongs to one lane, and a lane to
-// one worktree, so every id matched here was tracked under the caller's own.
+// Claim failed calls on the exact connection before writing their errors.
 func (r *router) failInFlight(conn mcp.Connection, worktree string, cause error) {
-	// A slice, not a map: nothing looks these up, they are collected under the
-	// lock and then walked once.
 	var stranded []jsonrpc.ID
 	r.mu.Lock()
 	for id, owner := range r.awaitingUpstream {
 		if owner.conn == conn {
 			stranded = append(stranded, id)
-			// The claim and the answer, same as refuse makes them, but once for
-			// the whole set: taking the id here is what says this caller answers
-			// it, and leaving it would route a later cancellation to a lane that
-			// has stopped waiting. Nothing can put it back before the forward
-			// below — a retry only re-tracks an id whose claim it won, and the
-			// claim is this delete.
 			r.removeLocked(id, owner)
 		}
 	}
@@ -451,11 +400,7 @@ func (r *router) placeDelivery(id jsonrpc.ID, expected *callState, cancel contex
 	return waiter.state, true
 }
 
-// failDelivery answers a call this caller has just taken terminal ownership of,
-// and reports whether it was still the caller's to answer. The one spelling of
-// that pair: claiming the id under mu is what says nobody else will answer it,
-// and the reply goes out after unlocking so a slow client cannot hold the
-// tracker.
+// Claim terminal ownership under mu and send the reply after unlocking.
 func (r *router) failDelivery(id jsonrpc.ID, state *callState, code int64, message string) bool {
 	if _, ok := r.finish(id, nil, state); !ok {
 		return false

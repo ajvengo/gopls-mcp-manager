@@ -39,34 +39,6 @@ type Limits struct {
 	DirectoryFilters []string
 }
 
-// WithDefaults fills nonpositive limits for policy values built by hand.
-// Execution is unchanged; FromEnv validates overrides against Default instead.
-func (l Limits) WithDefaults() Limits {
-	d := Default()
-	for _, field := range []struct{ target, fallback *int }{
-		{&l.PerLane, &d.PerLane}, {&l.Session, &d.Session},
-		{&l.Lanes, &d.Lanes}, {&l.CacheEntries, &d.CacheEntries},
-		{&l.MessageBytes, &d.MessageBytes}, {&l.HTTPBytes, &d.HTTPBytes},
-		{&l.SSEBytes, &d.SSEBytes}, {&l.SharedServers, &d.SharedServers},
-		{&l.LogBytes, &d.LogBytes}, {&l.OpenFiles, &d.OpenFiles},
-		{&l.HTTPConnections, &d.HTTPConnections},
-		{&l.OwnerSessions, &d.OwnerSessions}, {&l.OwnerOperations, &d.OwnerOperations},
-		{&l.OwnerLogBytes, &d.OwnerLogBytes},
-		{&l.OwnerRetainedBytes, &d.OwnerRetainedBytes},
-	} {
-		if *field.target <= 0 {
-			*field.target = *field.fallback
-		}
-	}
-	if l.CacheTTL <= 0 {
-		l.CacheTTL = d.CacheTTL
-	}
-	if l.Idle <= 0 {
-		l.Idle = d.Idle
-	}
-	return l
-}
-
 // Default returns an independent value containing the shipped limits.
 func Default() Limits {
 	return Limits{PerLane: 128, Session: 1024, Lanes: 64, CacheEntries: 4096, CacheTTL: 5 * time.Minute,

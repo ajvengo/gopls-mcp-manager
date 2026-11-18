@@ -73,31 +73,6 @@ func TestFromEnvOverrides(t *testing.T) {
 	require.Equal(t, want, got, "disabled timeout and metrics")
 }
 
-func TestWithDefaults(t *testing.T) {
-	t.Parallel()
-	configured := Limits{PerLane: 1, Session: 2, Lanes: 3, CacheEntries: 4,
-		MessageBytes: 5, HTTPBytes: 6, SSEBytes: 7, SharedServers: 8, LogBytes: 9, OpenFiles: 10,
-		CacheTTL: time.Minute, Execution: time.Second, Metrics: true, HTTPConnections: 11,
-		OwnerSessions: 12, OwnerOperations: 13, Idle: 14 * time.Minute, OwnerLogBytes: 15, OwnerRetainedBytes: 16}
-	partial := Default()
-	partial.Execution, partial.Metrics = time.Second, true
-	for _, tc := range []struct {
-		name     string
-		in, want Limits
-	}{
-		{name: "zero", want: Default()},
-		{name: "negative", in: Limits{PerLane: -1, CacheTTL: -1}, want: Default()},
-		{name: "configured", in: configured, want: configured},
-		{name: "partial", in: Limits{Execution: time.Second, Metrics: true}, want: partial},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := tc.in.WithDefaults()
-			require.Equalf(t, tc.want, got, "WithDefaults(%+v) = %+v, want %+v", tc.in, got, tc.want)
-		})
-	}
-}
-
 func TestParseDirectoryFilters(t *testing.T) {
 	t.Parallel()
 	filters, err := ParseDirectoryFilters(" -docs/ , ,+docs/go,-**/node_modules,-./scripts,-")

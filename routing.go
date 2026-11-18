@@ -27,11 +27,7 @@ func (r *router) laneFor(worktree string) *lane {
 	return l
 }
 
-// admitted is the delivery req travels as, or no delivery at all: a client's
-// cancellation never becomes one — it answers a call already admitted, and
-// queueing it behind that call's own routing is how it would arrive too late to
-// stop anything. Stated here rather than at each of the two entry points, which
-// is what kept the rule in step with itself.
+// Cancellation bypasses delivery so it can stop a call still waiting to route.
 func (r *router) admitted(req *jsonrpc.Request) (delivery, bool) {
 	if req.Method == "notifications/cancelled" && !req.ID.IsValid() {
 		r.cancelCall(req)
@@ -65,11 +61,6 @@ func (r *router) prepare(req *jsonrpc.Request) (delivery, bool) {
 func (r *router) routePrepared(call delivery) {
 	r.timed("routing_queue", call.queued)
 	defer r.timed("routing", r.now())
-	// A call whose budget went while it waited is not checked for here: every
-	// path below reports it. resolveWorktrees refuses an expired parent before
-	// it queues any filesystem work, and routeResolved fails whatever reaches it
-	// on its own ctx check — so an expired queue entry is answered once, in the
-	// words of the deadline that actually passed.
 	worktree, err := r.targetContext(call.ctx, call.req)
 	r.routeResolved(call, worktree, err)
 }
@@ -89,10 +80,7 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 		return
 	}
 	ctx, stop := context.WithTimeout(call.ctx, sendBudget)
-	// Closed over by name, not through call: a closure captures whole variables,
-	// and this one outlives the delivery — it is held in the tracker for the
-	// length of the upstream call, which would keep the client's original
-	// request and its params bytes alive with it.
+	// Capture only the cancel function. The tracker outlives the request bytes.
 	parentCancel := call.cancel
 	cancel := func() { stop(); parentCancel() }
 	if err := r.bindWorktree(call, worktree, cancel); err != nil {
@@ -102,9 +90,7 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 	}
 	l := r.laneFor(worktree)
 	if req.Method == "tools/call" {
-		// Forward the physical spelling of every path argument (R10). A copy is
-		// delivered because the original request is still the one this ingress
-		// admitted and may report on.
+		// Preserve the admitted request when rewriting paths for delivery (R10).
 		if params, rewritten := r.canonicalToolCall(req.Params); rewritten {
 			forwarded := *req
 			forwarded.Params = params
@@ -123,8 +109,7 @@ func (r *router) routeResolved(call delivery, worktree string, err error) {
 		releaseMessage(req)
 	default:
 		releaseMessage(req)
-		// The compound cancel, not failIngress's: this one also stops the send
-		// budget's timer by name rather than waiting for the parent to reach it.
+		// Stop the delivery timer too.
 		cancel()
 		r.rejected("delivery_queue")
 		r.failIngress(call, -32000, fmt.Sprintf("gopls for %s is overloaded: delivery queue is full", worktree))
@@ -174,43 +159,10 @@ func (r *router) cancelTarget(params jsontext.Value) string {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Whether that worktree still has an upstream to tell is deliberately not
-	// asked: the lane owns its connection and is the only party whose answer
-	// cannot already be stale by the time it is acted on, so it decides — see
-	// send.
 	return r.awaitingUpstream[id].worktree
 }
 
 const routingBudget = 10 * time.Second
-
-type resolution struct {
-	ctx    context.Context
-	params jsontext.Value
-	reply  chan []string
-}
-
-// One worker, no buffered jobs: a filesystem call that the OS cannot cancel
-// occupies at most this worker. A timed-out job cannot commit sticky state.
-// Work is committed on the reader in wire order, preserving pathless routing
-// and cancellation-after-admission semantics.
-type pathResolver struct {
-	jobs   chan resolution
-	lookup func(context.Context, jsontext.Value) []string
-}
-
-func (p *pathResolver) run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case job := <-p.jobs:
-			if job.ctx.Err() != nil {
-				continue
-			}
-			job.reply <- p.lookup(job.ctx, job.params)
-		}
-	}
-}
 
 func (r *router) resolveWorktrees(parent context.Context, params jsontext.Value) ([]string, error) {
 	if err := parent.Err(); err != nil {
@@ -219,45 +171,22 @@ func (r *router) resolveWorktrees(parent context.Context, params jsontext.Value)
 	if found, complete := r.cachedWorktrees(params); complete {
 		return found, parent.Err()
 	}
-	if r.resolver == nil {
-		// Unsynchronised, and safe for the same reason the worker is single:
-		// resolveWorktrees has one caller per router — the stdio reader, or the
-		// HTTP backend's one cold-resolution goroutine — so the first miss of a
-		// session is the only thing that ever reaches this branch. Built here
-		// rather than in newRouter so a session that never misses the memo, which
-		// is most of them, starts no goroutine at all.
-		//
-		// Only this worker performs filesystem lookups. It touches the memo maps
-		// and their lock, never request tracking or lane state — and it runs
-		// under the job's own context, not the session's, so a routing budget
-		// that expires cuts the lookup it paid for and no other.
-
-		owner := r.owner
-		lookup := func(ctx context.Context, params jsontext.Value) []string {
-			found, _ := ownerFilesystemCall(ctx, owner, func() []string { return r.toolCallWorktrees(ctx, params) })
-			return found
-		}
-
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: lookup}
-		go r.resolver.run(r.ctx)
-	}
 	ctx, cancel := context.WithTimeout(parent, routingBudget)
 	defer cancel()
-	job := resolution{ctx: ctx, params: params, reply: make(chan []string, 1)}
-	select {
-	case r.resolver.jobs <- job:
-	case <-ctx.Done():
-		return nil, fmt.Errorf("routing budget exhausted: %w", ctx.Err())
+	lookup := r.lookupCold
+	if lookup == nil {
+		lookup = r.lookupWorktrees
 	}
-	select {
-	case found := <-job.reply:
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("routing budget exhausted: %w", err)
-		}
-		return found, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("routing budget exhausted: %w", ctx.Err())
+	found := lookup(ctx, params)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("routing budget exhausted: %w", err)
 	}
+	return found, nil
+}
+
+func (r *router) lookupWorktrees(ctx context.Context, params jsontext.Value) []string {
+	found, _ := ownerFilesystemCall(ctx, r.owner, func() []string { return r.toolCallWorktrees(ctx, params) })
+	return found
 }
 
 // Parsing and memo hits never wait for a filesystem syscall held by the worker.
@@ -266,10 +195,7 @@ func (r *router) cachedWorktrees(params jsontext.Value) ([]string, bool) {
 	r.memoMu.Lock()
 	defer r.memoMu.Unlock()
 	r.expireMemosLocked()
-	// Written out rather than as a closure over found, for the reason
-	// toolCallWorktrees gives: this runs on the goroutine that routes every
-	// worktree's calls, and a closure capturing found heap-allocates both on
-	// each tools/call, memo hit included.
+	// Avoid capturing found and allocating on memo hits.
 	var found []string
 	var ok bool
 	for _, path := range [...]string{args.File, args.Dir} {

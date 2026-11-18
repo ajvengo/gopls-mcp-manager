@@ -641,9 +641,12 @@ func TestSupervisorStartupFailureCleanup(t *testing.T) {
 				require.Len(t, s.snapshot().Generations, 1)
 				require.True(t, s.snapshot().Generations[0].ConfirmedExit)
 				require.Greater(t, s.snapshot().FDReserved, baseline, "failed durable cleanup refunded the FD reservation")
+				s.mu.Lock()
+				exited := s.generations[root].exited
+				s.mu.Unlock()
 				s.updateRecords = persist
 				s.idleSweep()
-				require.Eventually(t, func() bool { return len(s.snapshot().Generations) == 0 }, time.Second, time.Millisecond)
+				mustRecv(t, exited, "retry of durable registry cleanup")
 			}
 			require.Empty(t, s.snapshot().Generations)
 			require.Equal(t, baseline, s.snapshot().FDReserved)
@@ -714,8 +717,17 @@ func TestSupervisorConcurrentStartsReserveDistinctPorts(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.EqualValues(t, 2, starts.Load(), "warm reuse spawned another process at capacity")
+	s.mu.Lock()
+	exits := make([]<-chan struct{}, 0, len(roots))
+	for _, root := range roots {
+		exits = append(exits, s.generations[root].exited)
+	}
+	s.mu.Unlock()
 	s.shutdown()
-	require.Eventually(t, func() bool { return len(s.snapshot().Generations) == 0 }, time.Second, time.Millisecond)
+	for _, exited := range exits {
+		mustRecv(t, exited, "generation cleanup after concurrent startup")
+	}
+	require.Empty(t, s.snapshot().Generations)
 }
 
 func TestSupervisorPartialStartKeepsLeaseUntilReconciliation(t *testing.T) {
@@ -848,8 +860,12 @@ func TestSupervisorCancelledWaiterCannotCancelSharedStart(t *testing.T) {
 	unblock()
 	require.NoError(t, mustRecv(t, second, "independent client awaiting the shared start"))
 	require.EqualValues(t, 1, starts.Load())
+	s.mu.Lock()
+	exited := s.generations[root].exited
+	s.mu.Unlock()
 	s.shutdown()
-	require.Eventually(t, func() bool { return len(s.snapshot().Generations) == 0 }, time.Second, time.Millisecond)
+	mustRecv(t, exited, "shared generation cleanup")
+	require.Empty(t, s.snapshot().Generations)
 }
 
 func TestSupervisorCallerAndControlNamespacesRemainDistinct(t *testing.T) {
@@ -868,7 +884,15 @@ func TestSupervisorCallerAndControlNamespacesRemainDistinct(t *testing.T) {
 				require.NoError(t, s.bind(state, testHome))
 				require.NoError(t, s.begin(state, key, testHome, nil, 0, 0))
 				require.NoError(t, s.serverControl(key, g))
-				require.Equal(t, 2, s.snapshot().Operations)
+				require.Equal(t, 2, s.snapshot().Generations[0].Operations)
+				other := readyTestGeneration(t, s, testHome+"/other")
+				snapshot := s.snapshot()
+				require.Equal(t, 2, snapshot.Operations)
+				counts := make(map[string]int)
+				for _, generation := range snapshot.Generations {
+					counts[generation.Generation] = generation.Operations
+				}
+				require.Equal(t, map[string]int{g.id: 2, other.id: 0}, counts)
 				answerCaller := func() {
 					wire.reads <- &jsonrpc.Response{ID: id}
 					_, err := conn.Read(t.Context())

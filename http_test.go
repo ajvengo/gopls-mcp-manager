@@ -28,30 +28,33 @@ import (
 )
 
 func TestHTTPBodyBudgetIncludesSlowReaders(t *testing.T) {
-	t.Parallel()
-	b := newHTTPBackend(t.Context(), routerTestOwner(t, nil), testHome)
-	defer b.cancel()
-	b.r.limits.Session = 10
-	b.r.limits.MessageBytes = 64
-	b.r.limits.HTTPBytes = 128
-	handler := newHTTPHandler(b, "")
-	release := make(chan struct{})
-	done := make(chan struct{}, 2)
-	for range 2 {
-		body := &gatedBody{Reader: strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), entered: make(chan struct{}), release: release}
-		req := httptest.NewRequest(http.MethodPost, "/mcp", body)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		go func() { handler.ServeHTTP(httptest.NewRecorder(), req); done <- struct{}{} }()
-		mustRecv(t, body.entered, "body reader did not start")
-	}
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{}`)))
-	close(release)
-	for range 2 {
-		mustRecv(t, done, "HTTP exchange did not release")
-	}
-	require.Equalf(t, http.StatusServiceUnavailable, response.Code, "budget overload = %d, want 503", response.Code)
+	bubble(t, func(t *testing.T) {
+		b := newHTTPBackend(t.Context(), routerTestOwner(t, nil), testHome)
+		defer b.cancel()
+		b.r.limits.Session = 10
+		b.r.limits.MessageBytes = 64
+		b.r.limits.HTTPBytes = 128
+		handler := newHTTPHandler(b, "")
+		release := make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(release) })
+		defer unblock()
+		done := make(chan struct{}, 2)
+		for range 2 {
+			body := &gatedBody{Reader: strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), entered: make(chan struct{}), release: release}
+			req := httptest.NewRequest(http.MethodPost, "/mcp", body)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			go func() { handler.ServeHTTP(httptest.NewRecorder(), req); done <- struct{}{} }()
+			mustRecv(t, body.entered, "body reader did not start")
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{}`)))
+		unblock()
+		for range 2 {
+			mustRecv(t, done, "HTTP exchange did not release")
+		}
+		require.Equalf(t, http.StatusServiceUnavailable, response.Code, "budget overload = %d, want 503", response.Code)
+	})
 }
 
 func TestHTTPRejectsOversizeAndReleasesReservation(t *testing.T) {
@@ -91,17 +94,15 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		b := newHTTPBackend(t.Context(), routerTestOwner(t, nil), testHome)
-		entered, release := make(chan struct{}), make(chan struct{})
-		b.r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
+		entered := make(chan struct{})
+		b.r.lookupCold = func(ctx context.Context, _ jsontext.Value) []string {
 			close(entered)
-			<-release
-			return []string{testHome}
-		}}
-		go b.r.resolver.run(b.r.ctx)
+			<-ctx.Done()
+			return nil
+		}
 		b.r.dial = func(context.Context, string, int) (mcp.Connection, error) { return loopbackConn(), nil }
 		b.start()
 		defer b.close()
-		defer close(release)
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		coldDone := make(chan error, 1)
@@ -118,6 +119,40 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 		cancel()
 		err := mustRecv(t, coldDone, "cancelled cold call did not finish")
 		require.ErrorIsf(t, err, context.Canceled, "cold error = %v", err)
+	})
+}
+
+func TestHTTPBackendShutdownReleasesColdQueue(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		owner := routerTestOwner(t, nil)
+		b := newHTTPBackend(t.Context(), owner, testHome)
+		entered := make(chan struct{})
+		b.r.lookupCold = func(ctx context.Context, _ jsontext.Value) []string {
+			close(entered)
+			<-ctx.Done()
+			return nil
+		}
+		b.start()
+		t.Cleanup(b.close)
+		results := make(chan error, 2)
+		call := func() {
+			results <- b.call(t.Context(), "tools/call", fileCallParams("/cold/file.go"), new(jsontext.Value))
+		}
+		go call()
+		mustRecv(t, entered, "cold resolution in progress")
+		go call()
+		synctest.Wait()
+		state := owner.snapshot()
+		require.Equal(t, 2, state.Queued)
+		require.Equal(t, 2*b.r.limits.MessageBytes, state.RetainedMessageBytes)
+
+		b.close()
+		state = owner.snapshot()
+		require.Zero(t, state.Queued)
+		require.Zero(t, state.RetainedMessageBytes)
+		for range 2 {
+			require.ErrorIs(t, mustRecv(t, results, "cancelled cold call"), context.Canceled)
+		}
 	})
 }
 

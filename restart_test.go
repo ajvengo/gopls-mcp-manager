@@ -487,6 +487,37 @@ func TestRestartHTTPGateWaitsForEveryActiveRequest(t *testing.T) {
 	})
 }
 
+func TestRestartReopensAdmissionAfterPeerResumeSettles(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		s := stateSupervisor(t)
+		s.restart.active, s.restart.closed, s.restart.blockHTTP = true, true, true
+		conn, remote := net.Pipe()
+		peer := newRestartPeer(s.ctx, conn, conn, 1024, false)
+		defer func() { _ = peer.Close(); _ = remote.Close() }()
+		peer.paused = &restartPauseState{id: 1, resume: make(chan struct{})}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.resumeAfterRestart([]*restartSession{{peer: peer}}, errors.New("worktree start failed"), true)
+		}()
+		synctest.Wait()
+		require.False(t, s.restartHTTPBlocked())
+		_, admitted := s.frontendAdmission()
+		require.False(t, admitted, "admission opened while peer resumption was blocked")
+		requireBlocked(t, done, "blocked peer resume completed")
+
+		require.NoError(t, remote.Close())
+		mustRecv(t, done, "peer resumption to settle")
+		release, admitted := s.frontendAdmission()
+		require.True(t, admitted)
+		release()
+		status := s.restartStatus()
+		require.False(t, status.Active)
+		require.Contains(t, status.Error, "worktree start failed")
+		require.Contains(t, status.Error, io.ErrClosedPipe.Error())
+	})
+}
+
 func TestRestartCheckpointRefusesUnsupportedListener(t *testing.T) {
 	t.Parallel()
 	s := stateSupervisor(t)

@@ -373,6 +373,25 @@ func (s *supervisor) handleRestart(w http.ResponseWriter, req *http.Request) {
 	_ = http.NewResponseController(w).Flush()
 }
 
+func (s *supervisor) resumeAfterRestart(sessions []*restartSession, failure error, recordFailure bool) {
+	s.restart.mu.Lock()
+	s.restart.blockHTTP = false
+	s.restart.mu.Unlock()
+	ctx, cancel := context.WithTimeout(s.ctx, sendBudget)
+	defer cancel()
+	for _, session := range sessions {
+		if err := session.peer.resume(ctx); err != nil && recordFailure {
+			failure = errors.Join(failure, err)
+		}
+	}
+	s.restart.mu.Lock()
+	if failure != nil {
+		s.restart.failure = failure.Error()
+	}
+	s.restart.active, s.restart.closed = false, false
+	s.restart.mu.Unlock()
+}
+
 func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (restartReceipt, error) {
 	s.restart.mu.Lock()
 	if s.restart.active {
@@ -387,21 +406,9 @@ func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (re
 	s.restart.mu.Unlock()
 	var sessions []*restartSession
 	defer func() {
-		if s.m.restart.isTransferred() {
-			return
+		if !s.m.restart.isTransferred() {
+			s.resumeAfterRestart(sessions, nil, false)
 		}
-		s.restart.mu.Lock()
-		s.restart.blockHTTP = false
-		s.restart.mu.Unlock()
-		resumeCtx, cancel := context.WithTimeout(s.ctx, sendBudget)
-		defer cancel()
-		for _, session := range sessions {
-			// A failed resume closes its own session.
-			_ = session.peer.resume(resumeCtx)
-		}
-		s.restart.mu.Lock()
-		s.restart.active, s.restart.closed = false, false
-		s.restart.mu.Unlock()
 	}()
 	if request.Hot {
 		if _, err := restartFDReserve(s.m); err != nil {
@@ -918,22 +925,7 @@ func (s *supervisor) restoreRestartSessions() error {
 			}
 		}
 		inherit.checkpoint.Worktrees = nil
-		s.restart.mu.Lock()
-		s.restart.blockHTTP = false
-		s.restart.mu.Unlock()
-		resumeCtx, resumeCancel := context.WithTimeout(s.ctx, sendBudget)
-		defer resumeCancel()
-		for _, session := range sessions {
-			if resumeErr := session.peer.resume(resumeCtx); resumeErr != nil {
-				err = errors.Join(err, resumeErr)
-			}
-		}
-		s.restart.mu.Lock()
-		if err != nil {
-			s.restart.failure = err.Error()
-		}
-		s.restart.active, s.restart.closed = false, false
-		s.restart.mu.Unlock()
+		s.resumeAfterRestart(sessions, err, true)
 	}()
 	return nil
 }

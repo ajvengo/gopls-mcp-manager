@@ -16,6 +16,7 @@ import (
 	"testing"
 	"testing/synctest"
 
+	"github.com/ajvengo/gopls-mcp-manager/internal/config"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -105,12 +106,9 @@ func newTestRouter(tb testing.TB, home string) *router {
 func routerTestOwner(tb testing.TB, m *manager) *supervisor {
 	tb.Helper()
 	if m == nil {
-		m = &manager{}
-	}
-	if m.limits.OwnerRetainedBytes == 0 {
+		m = &manager{limits: config.Default()}
 		m.limits.OwnerRetainedBytes = 1 << 30
 	}
-	m.limits = m.limits.WithDefaults()
 	if m.watch == nil {
 		m.watch = &watchPlans{plans: make(map[string]watchSnapshot)}
 	}

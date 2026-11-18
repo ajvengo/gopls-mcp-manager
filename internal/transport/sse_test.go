@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -20,29 +21,30 @@ import (
 
 func TestSSELifetimeCancellationReleasesUnreadFrame(t *testing.T) {
 	t.Parallel()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, "event: endpoint\ndata: /message\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notification\"}\n\n")
-		w.(http.Flusher).Flush()
-		<-req.Context().Done()
-	}))
-	t.Cleanup(server.Close)
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
-	budget := NewBudget(4096)
-	conn, err := ConnectSSE(ctx, server.URL, 1024, budget)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-	require.Eventually(t, func() bool {
-		used, _ := budget.Snapshot()
-		return used > 0
-	}, time.Second, time.Millisecond, "the unread frame never reached its handoff")
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		conn := sseStreamFixture(t, ctx, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notification\"}\n\n")
+		synctest.Wait()
+		used, _ := conn.budget.Snapshot()
+		require.Positive(t, used, "the unread frame never reached its handoff")
 
-	cancel()
-	require.Eventually(t, func() bool {
-		used, _ := budget.Snapshot()
-		return used == 0
-	}, time.Second, time.Millisecond, "lifetime cancellation retained an unread frame without Close")
+		cancel()
+		synctest.Wait()
+		used, _ = conn.budget.Snapshot()
+		require.Zero(t, used, "lifetime cancellation retained an unread frame without Close")
+	})
+}
+
+func sseStreamFixture(t *testing.T, parent context.Context, frames string) *sseConn {
+	t.Helper()
+	ctx, cancel := context.WithCancel(parent)
+	body := io.NopCloser(strings.NewReader(frames))
+	conn := &sseConn{ctx: ctx, cancel: cancel, body: body, budget: NewBudget(4096), maxBytes: 1024,
+		incoming: make(chan sseResult), done: make(chan struct{})}
+	t.Cleanup(func() { _ = conn.Close() })
+	go conn.readStream(bufio.NewReader(body))
+	return conn
 }
 
 func TestSSECloseCancelsInProgressPost(t *testing.T) {
@@ -248,38 +250,22 @@ func TestSSEFrameBoundsAndOwnership(t *testing.T) {
 
 func TestSSEReadAheadAndSlowConsumerClose(t *testing.T) {
 	t.Parallel()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprint(w, ": comment\n\nevent: endpoint\ndata: /message\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n")
-		w.(http.Flusher).Flush()
-		<-req.Context().Done()
-	}))
-	t.Cleanup(server.Close)
-	budget := &Budget{limit: 4096}
-	conn, err := ConnectSSE(t.Context(), server.URL, 1024, budget)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-	msg, err := conn.Read(t.Context())
-	require.NoError(t, err)
-	response, ok := msg.(*jsonrpc.Response)
-	wantID, _ := jsonrpc.MakeID(float64(1))
-	require.Truef(t, ok && response.ID == wantID, "read-ahead response: %v", msg)
-	// The second frame is retained by an unbuffered handoff, even though no
-	// consumer is reading. Close must return its charge without needing a Read.
-	deadline := time.Now().Add(time.Second)
-	for used, _ := budget.Snapshot(); used <= 0; used, _ = budget.Snapshot() {
-		if time.Now().After(deadline) {
-			require.FailNow(t, "second frame did not arrive")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	require.NoError(t, conn.Close())
-	for used, _ := budget.Snapshot(); used != 0; used, _ = budget.Snapshot() {
-		if time.Now().After(deadline) {
-			require.FailNow(t, "Close retained frame capacity")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		conn := sseStreamFixture(t, t.Context(), ": comment\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n")
+		msg, err := conn.Read(t.Context())
+		require.NoError(t, err)
+		response, ok := msg.(*jsonrpc.Response)
+		wantID, _ := jsonrpc.MakeID(float64(1))
+		require.Truef(t, ok && response.ID == wantID, "read-ahead response: %v", msg)
+
+		synctest.Wait()
+		used, _ := conn.budget.Snapshot()
+		require.Positive(t, used, "second frame did not reach the unbuffered handoff")
+		require.NoError(t, conn.Close())
+		synctest.Wait()
+		used, _ = conn.budget.Snapshot()
+		require.Zero(t, used, "Close retained frame capacity")
+	})
 }
 
 func TestSSEOversizeBeforePost(t *testing.T) {
@@ -390,7 +376,7 @@ func TestSSEReadContracts(t *testing.T) {
 			t.Parallel()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = fmt.Fprint(w, "event: endpoint\ndata: /message\n\n", tc.frame)
+				_, _ = fmt.Fprint(w, ": comment\n\nevent: endpoint\ndata: /message\n\n", tc.frame)
 			}))
 			t.Cleanup(server.Close)
 			budget := NewBudget(4096)

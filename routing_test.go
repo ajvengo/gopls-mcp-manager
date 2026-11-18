@@ -11,7 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -94,16 +94,7 @@ func TestMemoRefreshAtCapacityDoesNotEvict(t *testing.T) {
 	require.Truef(t, r.memo.rollovers == 1 && len(r.paths) == 1, "new key did not enforce capacity")
 }
 
-// The whole routing decision for the message an agent sends most: unmarshal
-// plus the memo hit below. Its allocs/op is what says whether target still
-// gathers its path arguments into a slice before resolving them.
-//
-// The reader goroutine runs this for every message and nothing else routes
-// while it does — but it is not the throughput ceiling: reading the message off
-// the transport costs several times more and allocates two orders of magnitude
-// more, the SDK's decoder taking a fresh 64KiB buffer per message. See
-// BenchmarkStdioCodec, and BenchmarkCallRoundTrip for the two together, before
-// spending a diff on the routing rather than the decode above it.
+// Isolate argument decoding and memo-hit routing from transport cost.
 func BenchmarkTargetToolCall(b *testing.B) {
 	r, file := benchRouter(b)
 	req := toolCall(b, fileCallParams(file))
@@ -117,11 +108,6 @@ func BenchmarkTargetToolCall(b *testing.B) {
 	}
 }
 
-// A tools/call naming many files at once — the shape a multi-file edit or a
-// package-wide query sends. One memo lookup per path, and the answer is needed
-// before any of them can be routed, so this is the reader goroutine's worst
-// case per message. Compared against the single-file benchmark above, it says
-// whether the per-path cost is flat.
 func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 	r, file := benchRouter(b)
 	dir := filepath.Dir(file)
@@ -140,22 +126,8 @@ func BenchmarkTargetToolCallManyFiles(b *testing.B) {
 	}
 }
 
-// Probe-only microbenchmark. Full maintenance probes every record outside the
-// flock; acquisition probes only the requested worktree. See
-// BenchmarkAcquisitionVersusSweep for those production paths.
-//
-// The rows are the verdicts a probe can reach. "live" is the steady state, one
-// local round trip. "refused" is conclusively dead; "odd" answers but not like
-// ours, so the verdict is inconclusive — both then fork a ps per record, and
-// that fork, not the probe, is what they measure. "silent" is §10's case, a
-// server that took the connection and said nothing: it costs probeClient's
-// whole timeout, so it runs at half a second an iteration by construction and
-
-// A file the path memo has not seen, under a directory it has: the miss the
-// verbatim-path memo exists to keep off the reader goroutine. The cost over the
-// hit above is containingDir's EvalSymlinks walk — one lstat per component —
-// plus the stat that tells a file from a directory. The memo grows an entry per
-// iteration, as it does per file in a session.
+// Miss the path memo while keeping the directory memo warm to isolate
+// filesystem canonicalization from Git lookup.
 func BenchmarkWorktreeOfNewPath(b *testing.B) {
 	r, file := benchRouter(b)
 	dir := filepath.Dir(file)
@@ -166,6 +138,21 @@ func BenchmarkWorktreeOfNewPath(b *testing.B) {
 			require.FailNow(b, "no worktree")
 		}
 		i++
+	}
+}
+
+func BenchmarkResolveColdPath(b *testing.B) {
+	r, file := benchRouter(b)
+	params := fileCallParams(file)
+	b.ReportAllocs()
+	for b.Loop() {
+		r.memoMu.Lock()
+		delete(r.paths, file)
+		r.memoMu.Unlock()
+		worktrees, err := r.resolveWorktrees(b.Context(), params)
+		if err != nil || len(worktrees) != 1 || worktrees[0] != r.home {
+			b.Fatalf("cold resolution = %v, %v", worktrees, err)
+		}
 	}
 }
 
@@ -352,10 +339,9 @@ func TestMemoCapacityRevalidatesEvictedPaths(t *testing.T) {
 	require.False(t, ok, "old memo survived capacity rollover")
 	_, ok = r.paths["/0"]
 	require.False(t, ok, "old memo survived capacity rollover")
-	r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
+	r.lookupCold = func(context.Context, jsontext.Value) []string {
 		return []string{testWorktree}
-	}}
-	go r.resolver.run(t.Context())
+	}
 	got, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: fileCallParams("/0")})
 	require.Falsef(t, err != nil || got != testWorktree, "evicted path not resolved afresh: %s, %v", got, err)
 }
@@ -389,22 +375,27 @@ func TestRoutingBudgetDoesNotMultiplyOrGrowWorkers(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		r := newTestRouter(t, testHome)
 		r.sticky = testWorktree
-		blocked := make(chan struct{})
-		var calls atomic.Int64
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
-			calls.Add(1)
-			<-blocked // models a filesystem syscall ignoring cancellation
-			return []string{"/repo/late"}
-		}}
-		go r.resolver.run(t.Context())
+		entered, blocked := make(chan struct{}), make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(blocked) })
+		defer unblock()
+		done := make(chan error, 1)
+		go func() {
+			_, err := ownerFilesystemCall(t.Context(), r.owner, func() struct{} {
+				close(entered)
+				<-blocked
+				return struct{}{}
+			})
+			done <- err
+		}()
+		mustRecv(t, entered, "owner filesystem worker")
 		for range 2 {
 			start := time.Now()
 			_, err := r.target(&jsonrpc.Request{Method: "tools/call", Params: jsontext.Value(`{"arguments":{"file":"/uncached/file.go"}}`)})
 			require.ErrorIsf(t, err, context.DeadlineExceeded, "routing returned %v", err)
 			require.Truef(t, time.Since(start) == routingBudget, "routing multiplied its budget")
 		}
-		require.Equalf(t, int64(1), calls.Load(), "stalled resolution grew more workers")
-		close(blocked)
+		unblock()
+		require.NoError(t, mustRecv(t, done, "owner filesystem worker release"))
 		synctest.Wait()
 		require.Equalf(t, testWorktree, r.sticky, "expired routing changed sticky state")
 	})
@@ -768,12 +759,12 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		l := pausedLane(t, r, testHome)
 		writing := make(chan struct{})
 		release := make(chan struct{})
-		cancelled := make(chan struct{}, 1)
+		cancelled := make(chan jsontext.Value, 1)
 		conn := newFakeConn()
 		conn.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
 			req := msg.(*jsonrpc.Request)
 			if req.Method == "notifications/cancelled" {
-				cancelled <- struct{}{}
+				cancelled <- req.Params
 				return nil
 			}
 			close(writing)
@@ -788,7 +779,8 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		queuedCall(t, r, "writing")
 		go l.run()
 		mustRecv(t, writing, "the call's write to begin")
-		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: jsontext.Value(`{"requestId":"writing"}`)})
+		params := jsontext.Value(`{"requestId":"writing","reason":"client stopped","extra":{"keep":true}}`)
+		r.route(&jsonrpc.Request{Method: "notifications/cancelled", Params: params})
 		synctest.Wait()
 		select {
 		case <-cancelled:
@@ -796,7 +788,7 @@ func TestCancellationCannotOvertakeItsCall(t *testing.T) {
 		default:
 		}
 		close(release)
-		mustRecv(t, cancelled, "cancellation after delivery")
+		require.Equal(t, params, mustRecv(t, cancelled, "cancellation after delivery"))
 		close(l.reqs)
 		mustRecv(t, l.done, "lane shutdown")
 	})
