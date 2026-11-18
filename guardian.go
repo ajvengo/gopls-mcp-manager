@@ -561,15 +561,11 @@ func guardianLeaseCount(stateDir string) (int, error) {
 }
 
 func guardianReadRecord(path string) (guardianRecord, error) {
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	file, err := openStateFile(path, guardianFrameBytes)
 	if err != nil {
 		return guardianRecord{}, err
 	}
 	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() > guardianFrameBytes {
-		return guardianRecord{}, errors.New("guardian manifest must be a bounded regular file")
-	}
 	data, err := io.ReadAll(io.LimitReader(file, guardianFrameBytes+1))
 	if err != nil {
 		return guardianRecord{}, err
