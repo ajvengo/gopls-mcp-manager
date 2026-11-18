@@ -40,6 +40,8 @@ const modelSources: Record<string, string> = {
   "OperationSafety.cfg": "CONSTANTS\n    Clients = {bridgeA, bridgeB}\n    Connections = {old, retry}\n    MaxRequest = 2\n    Credits = 2\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
   "LifecycleSafety.cfg": "CONSTANTS\n    Trees = {home}\n    Clients = {bridgeA, bridgeB}\n    Generations = {first, second}\n    Capacity = 1\n    OperationCapacity = 2\n    IdleTicks = 2\n    MaxBoot = 2\n    CooperativeExit = TRUE\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
   "RetirementSafety.cfg": "CONSTANTS\n    Generations = {first, second}\n    Clients = {bridgeA, bridgeB}\n    Capacity = 1\n    OperationCapacity = 2\n    IdleTicks = 2\n    CooperativeExit = TRUE\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+  "RestartHandoffSafety.cfg": "CONSTANTS\n    Frontends = {stdio, http}\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+  "PayloadSafety.cfg": "CONSTANTS\n    Calls = {first, second, third}\n    Capacity = 3\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
 };
 for (const [name, base, replacements] of [
   ['LifecyclePureIdle', 'LifecycleSafety',
@@ -62,6 +64,9 @@ for (const [name, base, replacements] of [
      ['CHECK_DEADLOCK', 'PROPERTY AbandonedReclaims\nCHECK_DEADLOCK']]],
   ['RetirementThreeClients', 'RetirementSafety',
     [['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, bridgeC}']]],
+  ['RestartHandoffLiveness', 'RestartHandoffSafety',
+    [['SPECIFICATION Spec', 'SPECIFICATION FairSpec'],
+     ['CHECK_DEADLOCK', 'PROPERTY Settles\nCHECK_DEADLOCK']]],
 ] as const) modelSources[`${name}.cfg`] = configText(`${base}.cfg`, replacements);
 for await (const name of new Bun.Glob('*.tla').scan(sourceDir)) {
   modelSources[name] = await Bun.file(join(sourceDir, name)).text();
@@ -197,6 +202,9 @@ if (mode === 'all' || mode === 'models') {
     ['RetirementSafety', 'AbandonedRetirement.tla'],
     ['RetirementLiveness', 'AbandonedRetirement.tla'],
     ['RetirementThreeClients', 'AbandonedRetirement.tla'],
+    ['RestartHandoffSafety', 'RestartHandoff.tla'],
+    ['RestartHandoffLiveness', 'RestartHandoff.tla'],
+    ['PayloadSafety', 'PayloadAccounting.tla'],
   ] as const) await tlc(name, model, `${name}.cfg`, 'pass');
 }
 if (mode === 'all' || mode === 'mutations') {
@@ -231,6 +239,22 @@ if (mode === 'all' || mode === 'mutations') {
   const stuckRetirement = await configVariant('noncooperative-retirement', 'RetirementLiveness.cfg',
     [['CooperativeExit = TRUE', 'CooperativeExit = FALSE']]);
   await tlc('noncooperative-retirement', 'AbandonedRetirement.tla', stuckRetirement, 'liveness');
+  for (const mutation of ['commit-refunds', 'commit-starts', 'commit-opens-http',
+      'commit-resumes', 'failure-opens-admission', 'early-admission']) {
+    const name = `mutation-handoff-${mutation}`;
+    const config = await configVariant(name, 'RestartHandoffSafety.cfg',
+      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
+    await tlc(name, 'RestartHandoff.tla', config, 'safety');
+  }
+  const stalledHandoff = await configVariant('mutation-handoff-never-settles', 'RestartHandoffLiveness.cfg',
+    [['Mutation = "none"', 'Mutation = "never-settles"']]);
+  await tlc('mutation-handoff-never-settles', 'RestartHandoff.tla', stalledHandoff, 'liveness');
+  for (const mutation of ['overbook', 'refund-cancel', 'refund-dequeue', 'refund-writer']) {
+    const name = `mutation-payload-${mutation}`;
+    const config = await configVariant(name, 'PayloadSafety.cfg',
+      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
+    await tlc(name, 'PayloadAccounting.tla', config, 'safety');
+  }
 }
 if (mode === 'all' || mode === 'proofs') {
   const asset = tlapsAssets[`${process.platform}-${process.arch}`];

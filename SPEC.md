@@ -130,7 +130,8 @@ from a binary without handoff support requires a one-time reconnect.
 Frontend relays keep their existing executables until restarted separately;
 the handoff replaces the owner and gopls processes. See the
 [operator commands and upgrade steps](README.md#restart-and-binary-reload).
-The existing TLA+ models do not model this fork/exec handoff.
+`RestartHandoff.tla` checks the successor's post-preparation fencing and resume
+order. The native tests exercise fork/exec, inherited descriptors, and EOF.
 → `TestRestartPeerPreservesMessagesAcrossRepeatedPauses`,
 `TestRestartRestoresInitializedStickySession`,
 `TestRestartRefusesUnconfirmedWorkAndResumesClients`,
@@ -802,7 +803,9 @@ on uncertain activity. Retired pending-file tests are replaced by owner-startup
 and lease-reconciliation regressions. Pure concurrency/idle tests use synctest
 and in-memory storage; real sockets/processes stay outside fake time.
 
-Formal artifacts are checked separately in formal/. Audit artifacts remain
+The [verification plan](README.md#verify-correctness) maps these contracts to
+fuzz targets, formal models and runtime tests. Formal artifacts are checked
+separately in formal/. Audit artifacts remain
 outside the repo under ~/.codex/artifacts/gopls-audit/. Final evidence must bind
 native Linux/macOS results and owner coverage to its source. Default-duration
 zero-client checks and 24h/72h soaks remain pending at this checkpoint; no

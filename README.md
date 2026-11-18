@@ -493,14 +493,42 @@ go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|G
 GOMAXPROCS=4 go test -tags=integration -run '^$' -bench '^BenchmarkRealGoplsRoundTrip$' -benchmem .
 ```
 
-CI also runs [formal lifecycle verification](formal/README.md) natively on Linux
-and macOS with Java 25 and Bun 1.4.4. Its pinned verifier downloads and cached
-archives are checksum-verified; model proofs do not prove the Go implementation.
-To reproduce:
+### Verify correctness
+
+Start with the changed behavior in [SPEC.md](SPEC.md) and choose the checks
+that can observe it.
+
+| Behavior | Evidence to run or extend |
+| --- | --- |
+| Worktree routing, registry records, JSON-RPC framing and adapters | Go fuzz targets exercise malformed input, round trips, SDK agreement, and routing properties |
+| Admission, cancellation, abandonment, idle retirement and capacity | TLC models and TLAPS safety proofs cover the transition rules. `FuzzSupervisorLifecycleAccounting` compares real owner transitions with an independent event ledger |
+| Payload lifetime and backpressure | The payload model checks conservation and capacity. `FuzzRetainedPayloadAccounting` compares queued credits and retained bytes across two routers. Bubble tests exercise blocked writes and transport release |
+| Hot-restart handoff | The handoff model checks exit-proof fencing and admission order. Native tests exercise lifetime-pipe EOF, inherited descriptors, and frontend recovery |
+| Timers, cancellation and worker shutdown | Use `testing/synctest` for in-memory fixtures, assert quiescence with `synctest.Wait`, and advance fake time only for deadline behavior. Use native race tests for sockets, filesystem workers, subprocesses, and OS guarantees |
+
+Run every Go fuzz target with Bun 1.4.4. CI gives each target three seconds and
+two workers. Use a longer per-target budget for verification of changed contracts.
+
+```sh
+bun --install=force run scripts/fuzz.ts
+bun --install=force run scripts/fuzz.ts 60s
+go test -run '^$' -fuzz '^FuzzRetainedPayloadAccounting$' -fuzztime=60s -parallel=2 .
+```
+
+On a fuzz failure, use Go's printed seed replay command. Preserve the minimized
+input in the target's `testdata/fuzz` corpus so ordinary tests replay it. CI
+retains the corpus when the fuzz job fails.
+
+Run the [formal checks](formal/README.md) with Java 25 and Bun 1.4.4. CI checks
+the models and proofs on Linux and macOS and requires the guard-removal
+mutations to produce the expected counterexamples. Use the conformance ledger
+to pair model changes with Go regressions. Formal results apply to the models.
 
 ```sh
 bun --install=force run formal/check.ts all
 ```
+
+### Performance and resource checks
 
 For warm frontend overhead, `BenchmarkHTTPRoundTrip` and `BenchmarkStdioRoundTrip`
 include real wire framing, routing, queues and SSE calls to a minimal SDK server;
@@ -527,8 +555,6 @@ quiescent heap/goroutine profiles outside the repository:
 
 ```sh
 GOPLS_MANAGER_AUDIT_PROFILES=/tmp/gopls-audit-profiles go test -race -v -run '^TestAuditSessionChurn$' .
-go test -run '^$' -fuzz '^FuzzDirectoryFilterPrecedence$' -fuzztime=60s .
-go test -run '^$' -fuzz '^FuzzSSEFrameBudget$' -fuzztime=60s ./internal/transport
 ```
 
 Production roots planning and resolution share one owner-wide filesystem worker,

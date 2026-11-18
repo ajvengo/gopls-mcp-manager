@@ -1,6 +1,7 @@
-# Lifecycle verification
+# Formal verification
 
-These specifications check the shared-process ownership protocol.
+These specifications check shared-process ownership, retained payloads and hot
+restart handoff.
 They do not verify the Go binary, gopls, the MCP SDK, or the operating system.
 The supervisor implementation and its conformance tests must be reviewed
 against the transition obligations below before these results support a release.
@@ -21,7 +22,7 @@ checker logs, generated configurations, state directories, proof caches and
 
 Model configurations are declared in `check.ts` and written into the evidence
 directory before checking. Their recorded `.cfg` names remain reproducible case
-identifiers; all six `.tla` specifications stay checked in.
+identifiers. The TLA+ sources stay checked in.
 
 Use `GOPLS_FORMAL_TOOLS` and `GOPLS_FORMAL_OUT` to select absolute external tool
 and evidence directories. `GOPLS_FORMAL_REVISION` can record the implementation
@@ -214,6 +215,9 @@ The checked configurations deliberately use small capacities to expose races:
 | RetirementSafety | 2 clients, 2 same-boot generations, 1 worktree/slot, 2 credits | 11,730 |
 | RetirementLiveness | same, no response-completion fairness | 11,730 |
 | RetirementThreeClients | 3 clients, 2 same-boot generations, 1 worktree/slot, 2 credits | 189,786 |
+| RestartHandoffSafety | 2 inherited frontends and 1 abstract worktree start | 32 |
+| RestartHandoffLiveness | same, fair decision and recovery | 32 |
+| PayloadSafety | 3 call identities and 3 fixed-size payload charges | 171 |
 
 These are complete reachable-state explorations for the given configurations,
 not a proof for all instance sizes. TLC uses fingerprints, so its collision
@@ -227,28 +231,55 @@ two proof mutations must also fail for their intended reason. Four additional
 retirement safety mutations must fail: retire active work, skip abandonment
 grace, release credits on retirement, and reuse a slot before confirmed exit.
 Disabling retirement and disabling cooperative exit each produce a retirement
-liveness counterexample. Thus there are fourteen safety negatives, four
-liveness negatives, and ten rejected proof mutations in the complete runner.
+liveness counterexample. The handoff and payload mutations below bring the
+complete runner to 24 safety negatives, 5 liveness negatives and 10 rejected
+proof mutations.
 
 ## Payload accounting abstraction
 
-The runtime policy under review bounds retained wire payload reservations
+The runtime bounds retained wire payload reservations
 globally to 64 MiB by default and limits opaque string request IDs to 1,024
-bytes. `supervisor.reserveMessage` charges a full configured maximum message
+bytes. `retainMessage` charges a full configured maximum message
 size, independently of operation credits. Cancellation can release a queued
 operation credit while its queued payload remains charged until the queue owner
 discards it. Likewise a definitive response can release an operation credit
 while a blocked writer still holds the response's payload reservation. The
 release-once reservation travels in SDK message `Extra`, which is not on wire.
 
-These specifications count operation identities and intentionally abstract
-payloads to finite uninterpreted values. Their operation bound cannot establish
-the byte budget, ID limit, or Go heap usage. In particular, the byte budget is
-not an RSS ceiling: decoding, copied buffers, SDK objects, in-flight readers,
-and fixed per-session allocations require separate amplification and global
-admission analysis. Boundary/churn tests must check independent payload lifetime
-and operation lifetime. No byte-conservation theorem or Go refinement proof is
-claimed here.
+`PayloadAccounting.tla` tracks charges independently from queue and writer
+ownership. Cancellation clears a waiting credit and may enqueue a reply if
+capacity permits. The original payload remains charged until discard.
+Dequeuing a reply for a writer transfers its charge through actual write
+return. Discarding pending output clears only the charges for the queue.
+TLC checks exact conservation and the cap, and finds counterexamples for
+overbooking and early refunds on cancellation, dequeue or output discard.
+
+The model covers fixed-size message reservations for the queued-cancellation
+and output paths. Variable-size initialization and SSE reservations, ID
+lengths, transient copies, Go heap usage and the complete runtime lifecycle
+remain separate obligations.
+
+## Hot restart handoff
+
+`RestartHandoff.tla` starts with a prepared successor and fenced inherited
+frontends. Commit authorizes the successor to wait for the previous owner's
+exit evidence. Only observed lifetime-pipe EOF releases the extra reservation
+and permits worktree starts and frontend recovery. A failed handoff leaves
+frontend admission closed. After EOF the HTTP gate can open, while general
+admission waits for every inherited peer's resume attempt to settle. An
+individual resume failure represents that peer closing.
+
+`RestartHandoffLiveness` checks eventual completion or failure. It assumes a
+commit decision, an EOF observation or failure before recovery, and weak
+fairness of recovery, resume attempts and finalization. The safety mutations
+refund capacity, start work, reopen HTTP or resume peers on commit alone. They
+also test reopening admission after failure or before resume attempts settle.
+Disabling resume progress violates liveness.
+
+The model abstracts fork/exec, descriptor inheritance, deadline duration,
+the distinction between timeout and pipe/cancellation errors, and individual
+worktree startup outcomes. Native tests check the runtime's interpretation of
+EOF and failure, and exercise actual descriptor transfer.
 
 ## Runtime conformance
 
@@ -271,7 +302,8 @@ LifecycleCore refinements are model-to-model theorems, not a Go refinement proof
 | Boot/session fencing and conservative restart | `ownerNonce`, `startGeneration`, `connection`, `available`; private versioned Unix owner endpoint; `withSupervisorSingleton`, `guardianRecovery`, `validateOwnerRegistry` | `TestSupervisorProtocolAndConfigMismatchFailBeforeAllocation`, `TestGuardianRecoveryKeepsPositivePIDAndLegacyUncertainty`; a complete two-owner stale-session/crash-window runtime matrix remains a separate integration obligation |
 | Storage errors cannot erase reservations | `supervisor.terminate` persists matching boot/generation before signal; `confirmExited` retains generation/FD quota until registry removal succeeds | `TestSupervisorCorruptRegistryNeverLosesReservations` covers malformed storage. Native injected failures at every registry/manifest fsync/rename boundary are not established by TLC stuttering |
 | Finite FD allocation | `supervisorFDAllowance`, `reserveGenerationFDs`, `countWatchDescriptors`, child RLIMIT and guardian allowance | Runtime budget/OS pressure tests must establish the concrete bounds; `ReservationCore` proves only abstract retained-slot containment |
-| Payload and ID ownership independent of operation credits | `validOwnerID`, `reserveMessage`, `ownerMessageReservation.release`, `retainMessage`, `releaseMessage`, `releaseRetainedMessages` | `TestSupervisorCancellationDoesNotRefundQueuedPayload`, `TestSupervisorBlockedWriterKeepsPayloadChargedAcrossChurn`, `TestSupervisorOpaqueIDBoundaryAndControls` cover reservation lifetime and ID boundary |
+| Payload and ID ownership independent of operation credits | `validOwnerID`, `reserveMessageBytes`, `retainMessage`, `releaseMessage`, `releaseRetainedMessages`, `writeToClient` | `FuzzRetainedPayloadAccounting` compares actual queue credits and bytes with an ownership ledger. `TestSupervisorCancellationDoesNotRefundQueuedPayload`, `TestSupervisorBlockedWriterKeepsPayloadChargedAcrossChurn` and `TestSupervisorOpaqueIDBoundaryAndControls` check production boundaries |
+| Hot restart exit proof and admission fence | `restoreRestartSessions`, `awaitPreviousOwner`, `frontendAdmission`, `restartHTTPBlocked` | `TestRestartPreviousOwnerReservationRequiresEOF`, `TestRestartHandoffFailsWithoutPreviousOwnerExit` and `TestRestartNativeForkExecPreservesAttachmentAndLock` check EOF, fail-closed handoff and native transfer |
 | Server requests/handshakes share protection/accounting | `supervisor.serverControl`, `ownedUpstream.Write`, `Read` | `TestSupervisorOpaqueIDBoundaryAndControls`, `TestSupervisorUnknownOrFailedControlCannotRefreshIdle`; finite accounting model omits these message classes |
 | One bounded shared filesystem worker | `ownerFilesystemCall`, `newSupervisor.filesystem` | `TestSupervisorSharedFilesystemWorkerSurvivesSessionChurnBoundedly` blocks one worker across expired sessions under `bubble`/synctest; it does not assume syscall cancellation |
 
