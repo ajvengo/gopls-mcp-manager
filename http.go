@@ -50,7 +50,7 @@ func newHTTPBackend(parent context.Context, owner *supervisor, home string) *htt
 
 func (b *httpBackend) start() {
 	cold := make(chan delivery, laneQueue)
-	var coldMu sync.Mutex
+	coldDone := make(chan struct{})
 	type resolved struct {
 		call      delivery
 		worktrees []string
@@ -58,34 +58,20 @@ func (b *httpBackend) start() {
 	}
 	ready := make(chan resolved)
 	go func() {
-		defer func() {
-			coldMu.Lock()
-			defer coldMu.Unlock()
-			for {
-				select {
-				case call := <-cold:
-					releaseMessage(call.req)
-				default:
-					return
-				}
-			}
-		}()
-		for {
-			select {
-			case <-b.r.ctx.Done():
-				return
-			case call := <-cold:
+		defer close(coldDone)
+		for call := range cold {
+			if b.r.ctx.Err() == nil {
 				start := b.r.now()
 				worktrees, err := b.r.resolveWorktrees(call.ctx, call.req.Params)
 				b.r.timed("resolution", start)
 				select {
 				case ready <- resolved{call, worktrees, err}:
+					continue
 				case <-b.r.ctx.Done():
-					call.cancel()
-					releaseMessage(call.req)
-					return
 				}
 			}
+			call.cancel()
+			releaseMessage(call.req)
 		}
 	}()
 	go func() {
@@ -97,6 +83,7 @@ func (b *httpBackend) start() {
 			for {
 				select {
 				case call := <-b.queue:
+					call.cancel()
 					releaseMessage(call.req)
 				default:
 					return
@@ -106,6 +93,8 @@ func (b *httpBackend) start() {
 		defer b.r.clearRequests()
 		defer b.r.awaitLanes()
 		defer b.r.closeLanes()
+		// Cancelled calls stop waiting for filesystem work even if a syscall is stuck.
+		defer func() { close(cold); <-coldDone }()
 		for {
 			select {
 			case <-b.r.ctx.Done():
@@ -130,10 +119,9 @@ func (b *httpBackend) start() {
 					b.r.routeResolved(call, worktree, err)
 					continue
 				}
-				coldMu.Lock()
 				if b.r.ctx.Err() != nil {
+					call.cancel()
 					releaseMessage(call.req)
-					coldMu.Unlock()
 					return
 				}
 				select {
@@ -142,7 +130,6 @@ func (b *httpBackend) start() {
 					b.r.rejected("resolution_queue")
 					b.r.failIngress(call, -32000, "resolution queue is full")
 				}
-				coldMu.Unlock()
 			}
 		}
 	}()

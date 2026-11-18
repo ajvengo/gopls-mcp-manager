@@ -183,35 +183,6 @@ func (r *router) cancelTarget(params jsontext.Value) string {
 
 const routingBudget = 10 * time.Second
 
-type resolution struct {
-	ctx    context.Context
-	params jsontext.Value
-	reply  chan []string
-}
-
-// One worker, no buffered jobs: a filesystem call that the OS cannot cancel
-// occupies at most this worker. A timed-out job cannot commit sticky state.
-// Work is committed on the reader in wire order, preserving pathless routing
-// and cancellation-after-admission semantics.
-type pathResolver struct {
-	jobs   chan resolution
-	lookup func(context.Context, jsontext.Value) []string
-}
-
-func (p *pathResolver) run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case job := <-p.jobs:
-			if job.ctx.Err() != nil {
-				continue
-			}
-			job.reply <- p.lookup(job.ctx, job.params)
-		}
-	}
-}
-
 func (r *router) resolveWorktrees(parent context.Context, params jsontext.Value) ([]string, error) {
 	if err := parent.Err(); err != nil {
 		return nil, err
@@ -219,45 +190,22 @@ func (r *router) resolveWorktrees(parent context.Context, params jsontext.Value)
 	if found, complete := r.cachedWorktrees(params); complete {
 		return found, parent.Err()
 	}
-	if r.resolver == nil {
-		// Unsynchronised, and safe for the same reason the worker is single:
-		// resolveWorktrees has one caller per router — the stdio reader, or the
-		// HTTP backend's one cold-resolution goroutine — so the first miss of a
-		// session is the only thing that ever reaches this branch. Built here
-		// rather than in newRouter so a session that never misses the memo, which
-		// is most of them, starts no goroutine at all.
-		//
-		// Only this worker performs filesystem lookups. It touches the memo maps
-		// and their lock, never request tracking or lane state — and it runs
-		// under the job's own context, not the session's, so a routing budget
-		// that expires cuts the lookup it paid for and no other.
-
-		owner := r.owner
-		lookup := func(ctx context.Context, params jsontext.Value) []string {
-			found, _ := ownerFilesystemCall(ctx, owner, func() []string { return r.toolCallWorktrees(ctx, params) })
-			return found
-		}
-
-		r.resolver = &pathResolver{jobs: make(chan resolution), lookup: lookup}
-		go r.resolver.run(r.ctx)
-	}
 	ctx, cancel := context.WithTimeout(parent, routingBudget)
 	defer cancel()
-	job := resolution{ctx: ctx, params: params, reply: make(chan []string, 1)}
-	select {
-	case r.resolver.jobs <- job:
-	case <-ctx.Done():
-		return nil, fmt.Errorf("routing budget exhausted: %w", ctx.Err())
+	lookup := r.lookupCold
+	if lookup == nil {
+		lookup = r.lookupWorktrees
 	}
-	select {
-	case found := <-job.reply:
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("routing budget exhausted: %w", err)
-		}
-		return found, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("routing budget exhausted: %w", ctx.Err())
+	found := lookup(ctx, params)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("routing budget exhausted: %w", err)
 	}
+	return found, nil
+}
+
+func (r *router) lookupWorktrees(ctx context.Context, params jsontext.Value) []string {
+	found, _ := ownerFilesystemCall(ctx, r.owner, func() []string { return r.toolCallWorktrees(ctx, params) })
+	return found
 }
 
 // Parsing and memo hits never wait for a filesystem syscall held by the worker.

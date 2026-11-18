@@ -40,7 +40,8 @@ type router struct {
 	dial func(context.Context, string, int) (mcp.Connection, error)
 	// plan computes a worktree's roots for answerRoots. A seam, like dial: the
 	// real one walks the tree, which a test cannot hold open any other way.
-	plan func(worktree string, global []string) watchPlan
+	plan       func(worktree string, global []string) watchPlan
+	lookupCold func(context.Context, jsontext.Value) []string
 
 	mu sync.Mutex
 	// Client requests still in flight, so that a dying gopls fails its callers
@@ -54,7 +55,6 @@ type router struct {
 	usage      requestUsage
 	finalUsage chan requestUsage // one final snapshot, consumed by the existing metrics worker
 	usageDone  chan struct{}
-	resolver   *pathResolver
 	sseBudget  *transport.Budget
 
 	out                   chan jsonrpc.Message

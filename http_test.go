@@ -94,17 +94,15 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		b := newHTTPBackend(t.Context(), routerTestOwner(t, nil), testHome)
-		entered, release := make(chan struct{}), make(chan struct{})
-		b.r.resolver = &pathResolver{jobs: make(chan resolution), lookup: func(context.Context, jsontext.Value) []string {
+		entered := make(chan struct{})
+		b.r.lookupCold = func(ctx context.Context, _ jsontext.Value) []string {
 			close(entered)
-			<-release
-			return []string{testHome}
-		}}
-		go b.r.resolver.run(b.r.ctx)
+			<-ctx.Done()
+			return nil
+		}
 		b.r.dial = func(context.Context, string, int) (mcp.Connection, error) { return loopbackConn(), nil }
 		b.start()
 		defer b.close()
-		defer close(release)
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		coldDone := make(chan error, 1)
@@ -121,6 +119,40 @@ func TestHTTPWarmCallsBypassBlockedResolution(t *testing.T) {
 		cancel()
 		err := mustRecv(t, coldDone, "cancelled cold call did not finish")
 		require.ErrorIsf(t, err, context.Canceled, "cold error = %v", err)
+	})
+}
+
+func TestHTTPBackendShutdownReleasesColdQueue(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		owner := routerTestOwner(t, nil)
+		b := newHTTPBackend(t.Context(), owner, testHome)
+		entered := make(chan struct{})
+		b.r.lookupCold = func(ctx context.Context, _ jsontext.Value) []string {
+			close(entered)
+			<-ctx.Done()
+			return nil
+		}
+		b.start()
+		t.Cleanup(b.close)
+		results := make(chan error, 2)
+		call := func() {
+			results <- b.call(t.Context(), "tools/call", fileCallParams("/cold/file.go"), new(jsontext.Value))
+		}
+		go call()
+		mustRecv(t, entered, "cold resolution in progress")
+		go call()
+		synctest.Wait()
+		state := owner.snapshot()
+		require.Equal(t, 2, state.Queued)
+		require.Equal(t, 2*b.r.limits.MessageBytes, state.RetainedMessageBytes)
+
+		b.close()
+		state = owner.snapshot()
+		require.Zero(t, state.Queued)
+		require.Zero(t, state.RetainedMessageBytes)
+		for range 2 {
+			require.ErrorIs(t, mustRecv(t, results, "cancelled cold call"), context.Canceled)
+		}
 	})
 }
 
