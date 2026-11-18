@@ -628,7 +628,7 @@ expiry, lanes/memos, path hits/misses, expiry epochs/rollovers, unresolved/aband
 operations, SSE current/peak capacity, and count/total/max nanoseconds for routing,
 resolution, queue waits and handshake. Counters copy under their owning locks;
 Completed includes local termination and shutdown cleanup, not just successes.
-→ `TestFromEnvRejectsInvalidSettings`, `TestFromEnvOverrides`, `TestWithDefaults`,
+→ `TestFromEnvRejectsInvalidSettings`, `TestFromEnvOverrides`,
 `TestAccountingTerminalPathsAndSnapshots`
 
 `status` is read-only JSON and never sweeps. It reports registry integrity,

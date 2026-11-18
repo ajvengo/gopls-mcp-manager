@@ -340,7 +340,8 @@ func TestMetricsShutdownDoesNotWaitForStderr(t *testing.T) {
 	var first [1]byte
 	_, err = reader.Read(first[:])
 	require.NoError(t, err)
-	m := &manager{limits: config.Limits{Metrics: true}}
+	m := &manager{limits: config.Default()}
+	m.limits.Metrics = true
 	done := make(chan error, 1)
 	owner := routerTestOwner(t, m)
 	go func() { done <- serve(t.Context(), owner, testHome, deadConn()) }()
@@ -366,7 +367,9 @@ func TestMetricsFinalSnapshotFollowsCleanup(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		r := newRouter(ctx, routerTestOwner(t, &manager{limits: config.Limits{Metrics: true}}), testHome)
+		m := &manager{limits: config.Default()}
+		m.limits.Metrics = true
+		r := newRouter(ctx, routerTestOwner(t, m), testHome)
 		var output strings.Builder
 		go r.reportUsage(&output)
 		_, err := r.admit(mustID(t, "cleanup"), func() {})

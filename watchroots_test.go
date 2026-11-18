@@ -28,8 +28,7 @@ import (
 
 func TestExpiredRootsPlanCannotRememberSnapshot(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}}
-		r := newRouter(t.Context(), routerTestOwner(t, m), testHome)
+		r := newTestRouter(t, testHome)
 		ctx, cancel := context.WithCancel(t.Context())
 		r.plan = func(string, []string) watchPlan {
 			cancel()
@@ -38,14 +37,14 @@ func TestExpiredRootsPlanCannotRememberSnapshot(t *testing.T) {
 		conn := &identifiedConn{Connection: newFakeConn(), id: serverID{pid: 1, started: 1}}
 		err := r.answerRoots(ctx, testConnection(r, conn, testHome), testHome, mustID(t, "roots"))
 		require.ErrorIs(t, err, context.Canceled)
-		require.Empty(t, m.watch.plans, "expired planning published an obsolete server snapshot")
+		require.Empty(t, r.owner.m.watch.plans, "expired planning published an obsolete server snapshot")
 	})
 }
 
 func TestLateRootsPlanCannotReplaceNewerGeneration(t *testing.T) {
 	bubble(t, func(t *testing.T) {
-		m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}}
-		r := newRouter(t.Context(), routerTestOwner(t, m), testHome)
+		r := newTestRouter(t, testHome)
+		m := r.owner.m
 		entered, release := make(chan struct{}), make(chan struct{})
 		r.plan = func(string, []string) watchPlan {
 			close(entered)
@@ -374,8 +373,7 @@ func TestWaitingRootsReplyCanCancelWithoutReleasingAnotherReply(t *testing.T) {
 
 func TestFailedRootsPlanIsNeverForwarded(t *testing.T) {
 	t.Parallel()
-	m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}}
-	r := newRouter(t.Context(), routerTestOwner(t, m), testHome)
+	r := newTestRouter(t, testHome)
 	want := errors.New("roots planning resource budget exhausted")
 	r.plan = func(string, []string) watchPlan { return watchPlan{err: want} }
 	conn := newFakeConn()
@@ -383,7 +381,7 @@ func TestFailedRootsPlanIsNeverForwarded(t *testing.T) {
 	err := r.answerRoots(t.Context(), testConnection(r, conn, testHome), testHome, mustID(t, "bounded-roots"))
 	require.ErrorIs(t, err, want)
 	require.Empty(t, conn.writes, "an incomplete roots plan reached gopls as a complete answer")
-	require.Empty(t, m.watch.plans, "failed planning published a freshness snapshot")
+	require.Empty(t, r.owner.m.watch.plans, "failed planning published a freshness snapshot")
 }
 
 func TestRootsSnapshotTracksDeliveryCertainty(t *testing.T) {
@@ -429,14 +427,13 @@ func TestRootsSnapshotTracksDeliveryCertainty(t *testing.T) {
 func TestInvalidRootNameCannotPublishWatcherSnapshot(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		m := &manager{watch: &watchPlans{plans: make(map[string]watchSnapshot)}}
-		r := newRouter(t.Context(), routerTestOwner(t, m), testHome)
+		r := newTestRouter(t, testHome)
 		r.plan = func(string, []string) watchPlan { return watchPlan{roots: []string{"/root/\xff"}} }
 		conn := newFakeConn()
 		err := r.answerRoots(t.Context(), testConnection(r, conn, testHome), testHome, mustID(t, "roots"))
 		require.Error(t, err)
 		require.Empty(t, conn.writes)
-		require.Empty(t, m.watch.plans)
+		require.Empty(t, r.owner.m.watch.plans)
 	})
 }
 
