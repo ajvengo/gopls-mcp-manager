@@ -25,13 +25,19 @@ import (
 // The process census and actual child/descendant lifetimes require real OS
 // processes, so these fault regressions intentionally stay outside synctest.
 func TestGuardianFailedInitialObservationRetainsUncertainty(t *testing.T) {
-	for _, firstSnapshot := range []string{"exit 1", "exit 0"} {
-		t.Run(firstSnapshot, func(t *testing.T) {
+	for _, firstSnapshot := range []struct {
+		name, command, detail string
+	}{
+		{name: "failed", command: "exit 1", detail: "exit status 1"},
+		{name: "empty", command: "exit 0", detail: "omits observer identity"},
+		{name: "deadline", command: "exec /bin/sleep 10", detail: "process census exceeded 1s: context deadline exceeded (signal: killed)"},
+	} {
+		t.Run(firstSnapshot.name, func(t *testing.T) {
 			for _, mode := range []string{"normal", "with-escape"} {
 				t.Run(mode, func(t *testing.T) {
 					dir := t.TempDir()
 					marker := filepath.Join(dir, "first-snapshot-failed")
-					shim := "#!/bin/sh\nif [ ! -e \"$GPM_GUARDIAN_PS_MARKER\" ]; then\n  : > \"$GPM_GUARDIAN_PS_MARKER\"\n  " + firstSnapshot + "\nfi\nexec /bin/ps \"$@\"\n"
+					shim := "#!/bin/sh\nif [ ! -e \"$GPM_GUARDIAN_PS_MARKER\" ]; then\n  : > \"$GPM_GUARDIAN_PS_MARKER\"\n  " + firstSnapshot.command + "\nfi\nexec /bin/ps \"$@\"\n"
 					require.NoError(t, os.WriteFile(filepath.Join(dir, "ps"), []byte(shim), 0o700))
 					t.Setenv("GPM_GUARDIAN_PS_MARKER", marker)
 					t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -48,6 +54,7 @@ func TestGuardianFailedInitialObservationRetainsUncertainty(t *testing.T) {
 					record, err := guardianReadRecord(fixture.child.StatePath)
 					require.NoError(t, err, "missing observation must retain its durable reservation")
 					require.Contains(t, record.Uncertain, "initial descendant observation failed")
+					require.Contains(t, record.Uncertain, firstSnapshot.detail)
 					if mode == "with-escape" {
 						data, err := os.ReadFile(fixture.stop + ".desc.pid")
 						require.NoError(t, err)

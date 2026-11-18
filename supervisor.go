@@ -913,14 +913,18 @@ func (s *supervisor) drain(g *ownedGeneration, reason string, idle bool) bool {
 		s.mu.Unlock()
 		return false
 	}
-	g.state, g.reason = generationDraining, reason
-	g.terminating = true
-	g.drainDone = make(chan struct{})
-	connections := generationConnections(g)
+	connections := markDrainingLocked(g, reason)
 	s.mu.Unlock()
 	closeSupervisedConnections(connections)
 	go s.terminate(g)
 	return true
+}
+
+func markDrainingLocked(g *ownedGeneration, reason string) []*ownedUpstream {
+	g.state, g.reason = generationDraining, reason
+	g.terminating = true
+	g.drainDone = make(chan struct{})
+	return generationConnections(g)
 }
 
 func (s *supervisor) terminate(g *ownedGeneration) {
