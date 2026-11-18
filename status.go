@@ -17,6 +17,59 @@ import (
 	"time"
 )
 
+type supervisorGenerationSnapshot struct {
+	Worktree, Generation, State, TerminationReason, Error string
+	PID, GuardianPID, Attachments, Operations             int
+	LastCompletion, IdleDeadline                          time.Time
+	ConfirmedExit                                         bool
+}
+
+type supervisorSnapshot struct {
+	Boot                         string
+	PID                          int
+	Queued, Operations, Sessions int
+	Generations                  []supervisorGenerationSnapshot
+	FDReserved                   int
+	RetainedMessageBytes         int
+	Logs                         *ownerLogSnapshot
+	Restart                      restartStatus
+}
+
+func (s *supervisor) snapshot() supervisorSnapshot {
+	s.mu.Lock()
+	result := supervisorSnapshot{Boot: s.boot, PID: os.Getpid(), Queued: len(s.queued), Operations: len(s.operations) + len(s.controls), FDReserved: s.fdReserved, RetainedMessageBytes: s.retainedBytes, Restart: s.restartStatus()}
+	for _, g := range s.generations {
+		item := supervisorGenerationSnapshot{Worktree: g.worktree, Generation: g.id, State: string(g.state),
+			TerminationReason: g.reason, PID: g.record.PID, GuardianPID: g.record.GuardianPID,
+			Attachments: len(g.connections), LastCompletion: g.completed, IdleDeadline: g.completed.Add(s.m.limits.Idle), ConfirmedExit: g.state == generationExited}
+		if g.err != nil {
+			item.Error = g.err.Error()
+		}
+		for _, op := range s.operations {
+			if op.generation == g {
+				item.Operations++
+			}
+		}
+		for _, op := range s.controls {
+			if op.generation == g {
+				item.Operations++
+			}
+		}
+		result.Generations = append(result.Generations, item)
+	}
+	s.mu.Unlock()
+	if s.frontends != nil {
+		s.frontends.mu.Lock()
+		result.Sessions = len(s.frontends.sessions) + len(s.frontends.backends)
+		s.frontends.mu.Unlock()
+	}
+	if s.m.ownerLogs != nil {
+		logs := s.m.ownerLogs.Snapshot()
+		result.Logs = &logs
+	}
+	return result
+}
+
 type serverUsage struct {
 	record
 	RSSKiB   *int64
