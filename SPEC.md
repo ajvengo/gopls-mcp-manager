@@ -124,6 +124,13 @@ Until EOF, the successor retains that reservation, keeps clients paused,
 admission closed and HTTP blocked, and starts no gopls. No EOF by the checkpoint
 deadline, unexpected pipe data or cancellation fails the handoff: the successor
 exits with an error and never resumes its clients.
+
+The same-owner completion or rollback and the successor's post-EOF recovery
+use the same resume order. The owner unblocks HTTP proxy traffic, attempts each
+paused frontend's resume, and then reopens general admission. A failed resume
+closes that frontend peer. The successor reports worktree startup and peer
+resume failures in its restart status.
+
 Process, filesystem or binary failures cannot promise uninterrupted service.
 The private protocol/configuration must remain compatible. The initial upgrade
 from a binary without handoff support requires a one-time reconnect.
@@ -135,6 +142,7 @@ order. The native tests exercise fork/exec, inherited descriptors, and EOF.
 → `TestRestartPeerPreservesMessagesAcrossRepeatedPauses`,
 `TestRestartRestoresInitializedStickySession`,
 `TestRestartRefusesUnconfirmedWorkAndResumesClients`,
+`TestRestartReopensAdmissionAfterPeerResumeSettles`,
 `TestRestartNativeForkExecPreservesAttachmentAndLock`,
 `TestRestartHandoffFailsWithoutPreviousOwnerExit`,
 `TestSupervisorSingletonReleasesLockHeldByForkedDescendant`,
@@ -161,10 +169,12 @@ does not block another lane.
 → `TestTargetFallsBackToTheLastPathBearingCall`,
 `TestAColdWorktreeDoesNotHoldUpAnother`
 
-R4. One 10 s routing budget covers queueing and all paths in a message. Resolution
-uses one synchronized worker with an unbuffered job channel. A syscall may
-outlive cancellation, but cannot create replacement workers or commit a late
-sticky result. Routing timeout fails the call rather than selecting another tree.
+R4. On a cache miss, all paths in a message share one 10 s lookup budget. It
+starts when resolution begins, covers waiting for the shared worker, and is
+capped by the remaining ingress deadline. Misses submit directly to the owner's
+filesystem worker over an unbuffered channel. A syscall can outlive cancellation
+and keep the worker occupied. An expired lookup cannot commit sticky state.
+Routing timeout fails the call.
 
 A separate ingress reader admits calls and handles cancellation even when the
 64-message routing queue is full. Pathless calls and complete path-memo hits
@@ -194,9 +204,10 @@ uses the delivery budget; expired queued work cannot start a server.
 
 R7. Cancellation completes the named request locally with -32800, releases its
 outstanding slot, suppresses later responses, and cancels queued/dialling work.
-Once assigned, the advisory carries the exact connection and waits for the
-original Write to finish. Full control queues may drop advisories without
-reversing local completion. Unknown/completed/malformed IDs are dropped;
+Once assigned, the advisory carries the exact connection, parsed target ID and
+local admission identity. It keeps the original notification parameters and
+waits for the original Write to finish. A full control queue may drop the
+advisory after local completion. Unknown/completed/malformed IDs are dropped;
 fractional/out-of-range decoded numbers are rejected before SDK truncation.
 The notification has no response; the terminal response belongs to its target.
 
@@ -319,7 +330,9 @@ devices/FIFOs), size overflow or planning-budget exhaustion fail the complete
 plan. Individual rules are capped at 4096 bytes before regexp compilation;
 invalid decoded module paths and unusable module rules are ignored. Environment
 rules must be valid UTF-8; oversize rules fail startup. Aggregate bounds are in
-the ledger.
+the ledger. Roots planning and freshness checking build the filter from current
+metadata in the same order, with module rules followed by environment rules.
+Each operation keeps its own aggregate budget.
 → `TestUpstreamRootsCoverTheWorktreeMinusFilters`,
 `TestPlanWatchCoversTheWorktreeMinusExcludedTrees`,
 `TestPlanWatchWithoutExclusionsIsTheWorktree`,
@@ -371,8 +384,9 @@ originating connection and are never forwarded.
 
 S4a. Replies have a 30 s ceiling, shortened by a handshake deadline. Failure
 closes the connection and fails outstanding calls; the next call may reconnect.
-Roots planning shares that deadline and the single owner filesystem worker;
-uncancellable calls cannot create replacements. Expired/closed-connection work
+Roots planning and FD estimation submit separate jobs to the shared owner
+filesystem worker under that deadline. Uncancellable calls can occupy the
+worker after the reply expires. Expired work or work on a closed connection
 cannot publish, and old plans cannot replace a newer generation's snapshot.
 Closure cancels queued roots work even behind a backpressured reader.
 
@@ -537,6 +551,12 @@ only after released-lease reconciliation proves no child started. Recovery
 refuses unresolved manifests/busy leases; no age/PID adoption guesses or direct
 frontend spawns are allowed.
 
+Guardian manifest reads share the registry's nonblocking, no-follow regular-file
+opener and enforce a 64 KiB manifest cap, including if the file grows during the
+read. Strict JSON and manifest identity validation run before reconciliation.
+→ `TestGuardianLeaseAndManifestFIFOsAreRefused`,
+`TestGuardianPreForkCrashReconcilesOnlyAfterLeaseRelease`
+
 P2. Readiness polls for up to ten seconds, backing off 10–100 ms, outside owner mutex
 and registry lock. Callers for one worktree share the same start; cancelling a
 waiter cannot cancel it or signal another caller's process.
@@ -573,17 +593,20 @@ connection. The guardian sets the internal `GO_TELEMETRY_CHILD=2` switch,
 which suppresses telemetry sidecars in tested releases. Newer versions may change
 that convention; escaped telemetry descendants then lie outside strict process
 and FD accounting. The version floor is a support policy, not containment proof.
-Before startup and every delivery, the selected Go toolchain must report the
-exact private telemetry-off directory. Mismatch fails without changing global
-telemetry, HOME or GOTOOLCHAIN.
-→ `TestGuardianGoplsVersionCompatibility`, `TestGuardianConfigAndTelemetryPolicy`
+Before startup and each ID-bearing upstream request, including private
+handshakes, the selected Go toolchain must report telemetry mode `off` and the
+exact private telemetry directory. The delivery check runs on the owner's
+filesystem worker before the upstream Write. A mismatch fails without changing
+global telemetry, HOME or GOTOOLCHAIN.
+→ `TestGuardianGoplsVersionCompatibility`, `TestGuardianConfigAndTelemetryPolicy`,
+`TestSupervisorNativeManagedToolchainContract`
 
 ## 10. Known limits
 
-- One owner-wide worker bounds production resolution/roots planning even across
-  session churn. An uncancellable syscall may occupy it indefinitely; shutdown
-  does not wait or create replacements. Direct test seams retain router-local
-  workers. Registry reads, fsync and rename are also not context-interruptible.
+- One owner-wide worker bounds filesystem jobs across session churn. A caller
+  can stop waiting when its context ends. An uncancellable syscall can continue
+  occupying the worker, and the owner does not create a replacement. Registry
+  reads, fsync and rename are also not context-interruptible.
 - A full 64-message output queue fails the session, including on transient bursts
   of terminal replies/failures/handshake messages. Readers never park after
   releasing operation credits and thereby retain unbounded decoded results.
@@ -635,10 +658,13 @@ Completed includes local termination and shutdown cleanup, not just successes.
 server/termination state, matching-identity RSS in KiB and lsof OpenFiles/total
 against budget. One bounded ps snapshot covers recorded PIDs; failure discards
 it entirely. Missing values and legacy active-client counts are null. The Owner
-snapshot reports exact bounded state when reachable, otherwise an error rather
-than invented zeros. Logs report record sizes, aggregate bytes/file count,
-largest file and count above trim threshold.
-→ `TestStatusMeasuresWithoutChangingRegistry`, `TestStatusRejectsFailedProcessSnapshot`
+snapshot reports bounded owner state when reachable. The JSON records a failed
+owner query in `OwnerError`. The snapshot reports queued credits separately.
+Per-generation operation counts include caller and server-control credits, including
+abandoned work whose credit remains held. Logs report record sizes, aggregate
+bytes/file count, largest file and count above trim threshold.
+→ `TestStatusMeasuresWithoutChangingRegistry`, `TestStatusRejectsFailedProcessSnapshot`,
+`TestSupervisorCallerAndControlNamespacesRemainDistinct`
 
 **Stdio.** A direct case-sensitive scalar parser owns raw fields as copies; the
 SDK handles writes, batch correlation and remaining validation. Notification-only
@@ -687,15 +713,19 @@ use a shared router's legacy SSE lanes, roots replies, handshakes and accounting
 No frontend session identifier is issued/used. Internal IDs are unique across
 clients. HTTP never reads/writes sticky state: pathless calls go home; absolute
 paths retain R1/R2/R10 rules. Limits/caches persist across POSTs. Cold resolution
-has a separate 64-message queue/coordinator so warm/pathless calls bypass a
-stalled filesystem worker without changing stdio order or creating workers.
-→ `TestHTTPWarmCallsBypassBlockedResolution`
+has a separate 64-message queue and coordinator so warm/pathless calls can
+route while a cold lookup is pending. Upstream delivery can still wait on the
+same filesystem worker for toolchain validation. On teardown the routing owner
+closes the cold queue and waits for the coordinator to discard remaining calls
+and release their payloads.
+→ `TestHTTPWarmCallsBypassBlockedResolution`, `TestHTTPBackendShutdownReleasesColdQueue`
 
-Request cancellation completes the internal call and sends its owning SSE
-connection an advisory. Cross-request cancellation and unsolicited upstream
-notifications are not relayed. Failed/cancelled cached backends fail the current
-request without replay and retire despite recent traffic. Only a later independent
-request initializes a replacement. Closing entries reject reuse and stay charged
+Request cancellation completes the call by its assigned internal ID. A delivered
+call can receive an advisory on its owning SSE connection. The frontend drops
+cross-request cancellations and unsolicited upstream notifications. Failed or
+cancelled cached backends fail the current request without replay and retire
+despite recent traffic. Only a later independent request initializes a
+replacement. Closing entries reject reuse and stay charged
 through active handlers and actual teardown, with one sweep/shutdown teardown owner.
 → `TestSupervisorRetiringBackendKeepsCapacityUntilCloseCompletes`,
 `TestSupervisorFailedHTTPBackendRetiresDespiteRecentUse`,

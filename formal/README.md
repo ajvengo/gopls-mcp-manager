@@ -18,11 +18,13 @@ The runner downloads official TLC/TLAPS releases, checks pinned SHA-256 digests,
 and keeps tools under `~/.cache/gopls-mcp-formal`. It writes copied specifications,
 checker logs, generated configurations, state directories, proof caches and
 `results.json` outside the checkout, under
-`~/.codex/artifacts/gopls-audit/formal/<timestamp>/`. No repository data is uploaded.
+`~/.codex/artifacts/gopls-audit/formal/<timestamp>/`. CI publishes the copied
+models, generated configurations, checker logs, and results as workflow artifacts.
 
-Model configurations are declared in `check.ts` and written into the evidence
-directory before checking. Their recorded `.cfg` names remain reproducible case
-identifiers. The TLA+ sources stay checked in.
+`check.ts` declares each TLC case with its model, configuration and expected
+result. It writes each configuration into the evidence directory before
+checking. The `.cfg` names identify cases in the results. The TLA+ sources
+stay checked in.
 
 Use `GOPLS_FORMAL_TOOLS` and `GOPLS_FORMAL_OUT` to select absolute external tool
 and evidence directories. `GOPLS_FORMAL_REVISION` can record the implementation
@@ -295,6 +297,7 @@ LifecycleCore refinements are model-to-model theorems, not a Go refinement proof
 | Pure idle boundary; passive attachments do not pin | `ownedUpstream.available`, `supervisor.idleSweep`, `drain` recheck completion/protection under mutex | `TestSupervisorIdleBoundaryAndQuietConnections`; `TestSupervisorIdleCandidateRechecksLastCompletion` covers completion after candidate selection |
 | Same-boot abandoned retirement preserves credits | `router.removeLocked`, `abandonOperationLocked`, `clearRequests`; `supervisor.abandon`, `protectedLocked`, `drain` | `TestSupervisorAbandonedOperationsRetireOnlyAfterGrace` checks full grace, retained credit through drain, then exit release. `AbandonedRetirement` models this policy separately from pure idle |
 | Definitive result releases exact operation | `operationKey{conn,id}`, `callState`, `router.ownerLocked`, `finish`, `supervisor.completeOperationLocked`; `ownedUpstream.Read`, `supervisor.answered` | `TestDeliveryCompletionCannotTouchReusedID`, `TestAbandonedIDCannotBeReusedOnItsConnection`, `TestCancelledQueueEntryCannotClaimReusedID`, `TestDelayedCancellationCannotCancelReusedID` and `TestResponseReadCannotReleaseIDBeforeWaiterClaim` cover local-generation/connection reuse and atomic response claiming |
+| Advisory cancellation preserves exact request identity | `router.cancelRequest`, `queueCancellation`, `lane.sendCancellation`, `supervisor.staleCancellation` | The queue carries the parsed ID, connection and admission identity. `TestCancellationCannotOvertakeItsCall` checks the original notification parameters and write order. `TestCancellationWriteFencesIDReuse` checks the write gate |
 | Cancellation/timeout/disconnect do not prove completion | `router.startExecution`, `removeLocked`, `clearRequests`; `ownedUpstream.Close`, `supervisor.abandon` | `TestAbandonedOperationsBoundFurtherDelivery`, `TestDisconnectedOperationsDoNotReleaseCredits`, `TestExecutionTimeoutQueuesAdvisoryCancellation` preserve unresolved credits. Local abandonment starts retirement grace; it does not release credit |
 | Uncertain delivery is not replayed as a new execution | `router.beginOperation`, transport delivery certainty, `supervisor.rejectedBeforeDelivery` | `TestSupervisorUncertainPostDoesNotReplayExecutedTool` executes once, loses POST acknowledgement, then observes abandoned ownership |
 | Signals require owned identity; TERM is not exit | `startOwnedGuardian`, `guardianChild.Signal`, `guardianController`, `runGuardian`, `supervisor.terminate`, `fenceUncertain` | Guardian OS tests and `TestGuardianCleanupProofDoesNotReleaseBeforeGuardianExit` distinguish child/group proof from guardian Wait. Unexpected guardian EOF/death is uncertainty |
@@ -303,9 +306,10 @@ LifecycleCore refinements are model-to-model theorems, not a Go refinement proof
 | Storage errors cannot erase reservations | `supervisor.terminate` persists matching boot/generation before signal; `confirmExited` retains generation/FD quota until registry removal succeeds | `TestSupervisorCorruptRegistryNeverLosesReservations` covers malformed storage. Native injected failures at every registry/manifest fsync/rename boundary are not established by TLC stuttering |
 | Finite FD allocation | `supervisorFDAllowance`, `reserveGenerationFDs`, `countWatchDescriptors`, child RLIMIT and guardian allowance | Runtime budget/OS pressure tests must establish the concrete bounds; `ReservationCore` proves only abstract retained-slot containment |
 | Payload and ID ownership independent of operation credits | `validOwnerID`, `reserveMessageBytes`, `retainMessage`, `releaseMessage`, `releaseRetainedMessages`, `writeToClient` | `FuzzRetainedPayloadAccounting` compares actual queue credits and bytes with an ownership ledger. `TestSupervisorCancellationDoesNotRefundQueuedPayload`, `TestSupervisorBlockedWriterKeepsPayloadChargedAcrossChurn` and `TestSupervisorOpaqueIDBoundaryAndControls` check production boundaries |
-| Hot restart exit proof and admission fence | `restoreRestartSessions`, `awaitPreviousOwner`, `frontendAdmission`, `restartHTTPBlocked` | `TestRestartPreviousOwnerReservationRequiresEOF`, `TestRestartHandoffFailsWithoutPreviousOwnerExit` and `TestRestartNativeForkExecPreservesAttachmentAndLock` check EOF, fail-closed handoff and native transfer |
+| HTTP cold-queue teardown releases retained payloads | `httpBackend.start`, `httpBackend.close` | `TestHTTPBackendShutdownReleasesColdQueue` checks cancel and discard of active and queued cold calls before backend close returns |
+| Hot restart exit proof and admission fence | `restoreRestartSessions`, `awaitPreviousOwner`, `resumeAfterRestart`, `frontendAdmission`, `restartHTTPBlocked` | `TestRestartPreviousOwnerReservationRequiresEOF` and `TestRestartHandoffFailsWithoutPreviousOwnerExit` check EOF and fail-closed handoff. `TestRestartReopensAdmissionAfterPeerResumeSettles` checks resume order and `TestRestartNativeForkExecPreservesAttachmentAndLock` checks native transfer |
 | Server requests/handshakes share protection/accounting | `supervisor.serverControl`, `ownedUpstream.Write`, `Read` | `TestSupervisorOpaqueIDBoundaryAndControls`, `TestSupervisorUnknownOrFailedControlCannotRefreshIdle`; finite accounting model omits these message classes |
-| One bounded shared filesystem worker | `ownerFilesystemCall`, `newSupervisor.filesystem` | `TestSupervisorSharedFilesystemWorkerSurvivesSessionChurnBoundedly` blocks one worker across expired sessions under `bubble`/synctest; it does not assume syscall cancellation |
+| One bounded shared filesystem worker | `ownerFilesystemCall`, `supervisor.filesystem`, `router.lookupWorktrees`, `router.planRoots`, `router.answerRoots`, `ownedUpstream.Write` | `TestSupervisorSharedFilesystemWorkerSurvivesSessionChurnBoundedly` and `TestRoutingBudgetDoesNotMultiplyOrGrowWorkers` simulate a worker held by an uncancellable syscall |
 
 ### Composed-core implementation mapping
 
@@ -375,8 +379,9 @@ coverage of local ID reuse, boot fencing and bounded liveness.
   v0.23.0 or newer and checks the selected Go toolchain's private telemetry-off
   state. Telemetry dependencies are not pinned. Formal models do not verify
   sidecar suppression, subprocess containment or third-party resource use.
-- [Hot restart](../SPEC.md#persistent-owner-contract), including descriptor and
-  session transfer, is covered by runtime tests rather than these formal models.
+- `RestartHandoff` covers the successor's fencing and resume order.
+  Native [hot restart](../SPEC.md#persistent-owner-contract) tests exercise
+  descriptor inheritance, session transfer and the interpretation of pipe EOF.
 - No automated trace-to-model replay or complete runtime suite for every formal
   mutation is supplied. In particular, the retirement active-work/grace/credit
   traces have corresponding assertions, but early-slot replacement while TERM

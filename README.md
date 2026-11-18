@@ -133,6 +133,9 @@ configuration before pausing clients. It forks/execs the new owner and transfers
 the Unix listener, singleton lock, frontend sockets and bounded session
 checkpoint. The successor waits for confirmed old-owner exit before resuming
 traffic. Both owners' FD footprints must fit the budget during handoff.
+After worktree startup attempts finish, the successor unblocks HTTP proxy
+traffic and attempts to resume each paused frontend. It reopens general
+admission after those attempts settle.
 
 Client-facing stdio and HTTP frontend processes keep running their existing
 binaries. They retain partial input and public connections; the successor restores
@@ -183,15 +186,17 @@ IDs are translated to unique internal IDs, so concurrent clients cannot collide.
 The frontend advertises tools; it does not relay unsolicited notifications,
 progress streams, or client roots to the shared upstream sessions.
 
-Cancel the HTTP request to cancel its internal call. A separate
+Cancel the HTTP request to cancel its internal call by its assigned ID. A separate
 `notifications/cancelled` POST cannot identify another client's call in stateless
 mode and has no cross-request effect. Cancellation still completes locally first;
 an advisory SSE cancellation does not prove gopls stopped its work.
 
 Existing outstanding-call, lane and memo limits apply across the HTTP service.
 HTTP cache misses wait on a separate bounded 64-message resolution queue.
-Pathless and fully cached HTTP calls proceed while a filesystem lookup is stuck;
-lane creation still has one owner and filesystem work still has one worker.
+Pathless and fully cached calls can reach their lanes while a cold lookup is
+pending. Delivery still waits for any required work on the shared filesystem
+worker, including validation of the selected Go toolchain. Backend teardown
+discards pending cold calls and waits for their payload reservations to be released.
 Concurrent HTTP exchanges are capped by both the session outstanding limit and
 the body budget divided by the maximum message size (16 exchanges by default).
 Each exchange reserves a maximum-size body allowance until its response finishes,
@@ -224,26 +229,29 @@ Every `tools/call` is inspected for a `file`, `dir`, or `files` argument:
 - **A cancellation completes the call locally** and releases its outstanding
   slot. Queued or dialling delivery is cancelled. Delivered calls also use a
   separate bounded control queue to notify the exact owning connection; a late
-  answer is suppressed. Advisory writes are fenced against later reuse of the
-  same request ID. Local completion does not prove upstream work stopped.
+  answer is suppressed. The advisory keeps the original notification parameters
+  and carries the parsed ID to the lane, where the write gate checks for reuse.
+  Local completion does not prove upstream work stopped.
 - Everything else that is not a `tools/call` goes to home.
 
 Resolution shells out to `git rev-parse --show-toplevel`, so successful answers
-are memoized per path and directory. One resolver worker gives filesystem
-resolution a 10 s budget, shared by all paths in a call. Pathless calls and path
-memo hits bypass that worker. A separate reader admits calls into a bounded
-64-message routing queue and handles cancellation immediately, even while a
-lookup is stuck. Ordinary routing and sticky updates remain in wire order.
+are memoized per path and directory. Cache misses submit directly to the shared
+owner's filesystem worker. All paths in a call share a 10 s lookup budget,
+including the wait for that worker, capped by the remaining ingress budget.
+Pathless calls and complete memo hits need no filesystem lookup to route. A
+separate reader admits calls into a bounded 64-message routing queue and handles
+cancellation immediately, even while a lookup is stuck. Ordinary routing and
+sticky updates remain in wire order.
 Ingress queueing, routing and delivery share a 40 s ceiling; delivery additionally
-has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker.
+has its own 30 s ceiling.
 
 ## What the bridge handles for you
 
 - **One handshake.** Your client initializes once, with home. Every gopls opened
   later is initialized behind the client's back.
-- **Each gopls is told its own worktree as its root**, which is what makes it
-  watch that tree and notice files created after it started. Your client need
-  not advertise the optional `roots` capability — the bridge adds it and answers
+- **Each gopls gets roots covering its own worktree after directory filtering.**
+  This lets it notice files created after it started within those roots. The
+  bridge adds the optional `roots` capability when missing and answers
   `roots/list` itself. Any other server-initiated request is refused with
   `method not found`. Replies have a 30 s write ceiling (or the shorter remaining
   handshake deadline); a failed reply closes that connection and fails its calls.
@@ -266,7 +274,8 @@ has its own 30 s ceiling. A stuck filesystem syscall occupies at most one worker
 - **Outstanding calls have separate limits:** 128 per worktree and 1024 per
   session by default. A server accepting writes but never answering cannot evade
   those limits by draining its delivery queue.
-- **Delivered operations retain a separate credit until an upstream response.**
+- **Delivered operations retain a separate credit until a definitive upstream
+  response or confirmed exit of the generation.**
   Local cancellation, execution timeout and connection failure release client
   tracking but retain that credit. Both sets use the outstanding limits above;
   the owner also retains credits across frontend teardown. A cancellation-ignoring
@@ -337,8 +346,10 @@ to flush after request cleanup. Blocked stderr can retain that one worker,
 while session shutdown returns. Other synchronous CLI/maintenance diagnostics
 require writable stderr. MCP stdout stays protocol-only. The status command reports RSS in KiB
 only when the process identity matches; one bounded ps snapshot covers the
-recorded PIDs. Missing values and active-client counts are null rather than
-guessed. Status never signals a process or rewrites the map.
+recorded PIDs. Missing values and active-client counts are null. The owner
+snapshot reports queued credits separately from upstream operations. Each
+generation's operation count includes caller and server-control operations that
+still hold credit. Status never signals a process or rewrites the map.
 
 ### Open-file budget
 
@@ -354,6 +365,8 @@ how many trees are watched at once.
 gopls is told to watch the worktree minus what its filters exclude: the `ignore`
 directives of the worktree's `go.mod` (and of the modules its `go.work` uses),
 then GOPLS_MANAGER_DIRECTORY_FILTERS, with gopls `directoryFilters` semantics.
+Planning and freshness checks apply the same rule order and resource ceilings
+to the current module metadata.
 `.git`, and every other directory gopls' watcher skips (`.*`, `_*`, `testdata`),
 is never watched. With nothing excluded the root is the worktree, as before.
 Otherwise the roots are the directories covering the rest, so the entries
@@ -376,9 +389,9 @@ The persistent owner checks stale watches and deleted worktrees every 30 seconds
 Admission and retirement share a lock: queued or active work protects its
 generation, and a draining generation cannot accept a new write. A replacement
 waits for confirmed exit. FD reservations and kernel quotas enforce descriptor
-admission before spawn; lsof observations remain diagnostic. Legacy pending-file
-and popularity-based sweep helpers remain for explicit management/tests and do
-not authorize owner cleanup. [SPEC.md](SPEC.md#persistent-owner-contract) describes current ownership.
+admission before spawn. The `lsof` observations are diagnostic. The persistent owner
+uses completion time and retained work to decide retirement.
+[SPEC.md](SPEC.md#persistent-owner-contract) describes current ownership.
 
 ## State on disk
 
@@ -461,7 +474,7 @@ Root files group related responsibilities:
 | `routing.go` | Admission, routing decisions and bounded resolution |
 | `paths.go` | Path/worktree resolution, canonicalization and memos |
 | `lane.go`, `requests.go` | Per-worktree delivery, cancellation, and request/operation accounting |
-| `registry.go` | Configuration, port selection, bounded durable registry storage |
+| `registry.go` | Manager construction, port selection, bounded durable registry storage |
 | `process.go` | Readiness and read-only process/descriptor diagnostics |
 | `status.go` | Status snapshots and explicit log trimming |
 
@@ -557,9 +570,10 @@ quiescent heap/goroutine profiles outside the repository:
 GOPLS_MANAGER_AUDIT_PROFILES=/tmp/gopls-audit-profiles go test -race -v -run '^TestAuditSessionChurn$' .
 ```
 
-Production roots planning and resolution share one owner-wide filesystem worker,
-and callers share their reply deadline with planning. Uncancellable filesystem
-calls retain that worker without replacement. Planning fails explicitly on
+Worktree lookup, roots planning, FD estimation, and managed toolchain checks
+share one owner-wide filesystem worker. Roots planning and FD estimation submit
+separate jobs under the reply deadline. An uncancellable call can occupy the
+worker after its caller stops waiting. Planning fails explicitly on
 oversized/nonregular metadata, I/O errors or exhausted aggregate budgets; symlinks
 to regular metadata files remain supported. Defaults cap 100000 entries,
 32 MiB paths/names, depth 128, 4096 roots, 16384 partial snapshots, 256 metadata
@@ -571,8 +585,7 @@ These limits do not bound total decoded heap or shared gopls RSS. Managed logs
 have aggregate retention. Loopback listeners and existing private state directories are
 trusted: the service does not authenticate a TCP listener to its recorded child.
 
-The bridge tests run under `testing/synctest`, whose clock only moves once every
-goroutine in the bubble has blocked, which makes timeouts free and exact: a test
-waits out the shipped 30 s budget instantly, and a write told to lose a race
-loses it on every run. A test stays outside a bubble when it does something that
-clock cannot account for — a child process, a real listener, or a real timeout.
+In-memory bridge, HTTP, and transport tests use `testing/synctest` to advance
+deadlines without wall-clock waiting. They use channel handshakes and
+`synctest.Wait` to verify ordering and quiescence. Native socket, subprocess,
+and real-time integration tests run with the system clock.
