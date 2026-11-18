@@ -44,6 +44,8 @@ cover owner-crash/restart windows; legacy records prevent migration.
 PID disappearance, an empty/incomplete census, or missing initial ancestry is
 not exit proof. A valid census includes the observer in its actual process group;
 later observations cannot erase missing initial ancestry evidence.
+If the initial census fails after its one-second deadline, the retained
+manifest reports the timeout and the subprocess error.
 → `TestGuardianSnapshotRequiresObserverIdentity`,
 `TestGuardianFailedInitialObservationRetainsUncertainty`
 
@@ -91,9 +93,12 @@ worktree counters; disconnect abandons remote work without refunding credits.
 `TestConfirmedExitRestoresLongSessionCapacity`,
 `TestUnconfirmedExitRetainsRouterOperationCredits`
 
-O8. **Coordinated restart.** Drain queued, active and buffered work while
-cancellation and frontend admission remain live. Once quiet, close admission
-and pause private traffic at message boundaries. Racing work, unconfirmed
+O8. **Coordinated restart.** Wait for queued, active and buffered work, including
+generation startup and upstream writes, while cancellation and frontend admission
+remain live. Check all retained generations before pausing. Once quiet, close
+admission and pause private traffic at message boundaries. After HTTP backend
+teardown, recheck cancellation, the operation ledger and all generations
+under the owner mutex before fencing any generation. Racing work, unconfirmed
 abandonment, uncertain exit or failed durable cleanup aborts restart. Sent
 requests are never replayed. `restart` replaces retained gopls generations.
 `restart --hot` and `reload` also fork/exec a compatible owner with the listener,
@@ -129,6 +134,10 @@ transfer and EOF.
 → `TestRestartPeerPreservesMessagesAcrossRepeatedPauses`,
 `TestRestartRestoresInitializedStickySession`,
 `TestRestartRefusesUnconfirmedWorkAndResumesClients`,
+`TestRestartPreflightLeavesHealthyGenerationsReady`,
+`TestRestartWaitsForStartingGeneration`,
+`TestRestartWaitsForUpstreamWriteWithoutCredit`,
+`TestRestartRechecksAfterHTTPBackendTeardown`,
 `TestRestartReopensAdmissionAfterPeerResumeSettles`,
 `TestRestartNativeForkExecPreservesAttachmentAndLock`,
 `TestRestartHandoffFailsWithoutPreviousOwnerExit`,

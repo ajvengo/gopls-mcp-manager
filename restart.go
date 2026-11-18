@@ -16,7 +16,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -273,14 +275,10 @@ func (s *supervisor) restartHTTPBlocked() bool {
 func (s *supervisor) restartQuiescent() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, operations := range s.operationMaps() {
-		for _, operation := range operations {
-			if !operation.abandoned.IsZero() {
-				return false, fmt.Errorf("unconfirmed abandoned work prevents restart")
-			}
-		}
+	if ready, err := s.restartDrainReadyLocked(); !ready {
+		return false, err
 	}
-	if s.operationUsageLocked() != 0 || len(s.frontends.http) != 0 {
+	if len(s.frontends.http) != 0 {
 		return false, nil
 	}
 	s.frontends.mu.Lock()
@@ -296,6 +294,69 @@ func (s *supervisor) restartQuiescent() (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+func (s *supervisor) restartDrainReadyLocked() (bool, error) {
+	if s.operationUsageLocked() != 0 {
+		for _, operations := range s.operationMaps() {
+			for _, operation := range operations {
+				if !operation.abandoned.IsZero() {
+					return false, fmt.Errorf("unconfirmed abandoned work prevents restart")
+				}
+			}
+		}
+		return false, nil
+	}
+	ready := true
+	var blocked []string
+	for _, g := range s.generations {
+		switch g.state {
+		case generationStarting:
+			ready = false
+		case generationReady:
+			// A Write can outlive its credit in the ledger.
+			ready = ready && g.writes == 0
+		default:
+			blocked = append(blocked, fmt.Sprintf("%q (%s)", g.worktree, g.state))
+		}
+	}
+	if len(blocked) == 0 {
+		return ready, nil
+	}
+	slices.Sort(blocked)
+	return false, fmt.Errorf("generations cannot be safely drained: %s", strings.Join(blocked, ", "))
+}
+
+func (s *supervisor) drainRestartGenerations(ctx context.Context) ([]string, error) {
+	type target struct {
+		generation  *ownedGeneration
+		connections []*ownedUpstream
+	}
+	// Recheck under the same lock that fences the entire set of generations.
+	s.mu.Lock()
+	ready, err := s.restartDrainReadyLocked()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		ready, err = false, ctxErr
+	}
+	if !ready {
+		s.mu.Unlock()
+		if err == nil {
+			err = fmt.Errorf("new work arrived before generation drain; retry restart when clients are quiet")
+		}
+		return nil, err
+	}
+	targets := make([]target, 0, len(s.generations))
+	for _, g := range s.generations {
+		targets = append(targets, target{generation: g, connections: markDrainingLocked(g, "operator restart")})
+	}
+	s.mu.Unlock()
+	worktrees := make([]string, 0, len(targets))
+	for _, target := range targets {
+		closeSupervisedConnections(target.connections)
+		go s.terminate(target.generation)
+		worktrees = append(worktrees, target.generation.worktree)
+	}
+	return worktrees, nil
 }
 
 func (s *supervisor) frontendAdmission() (func(), bool) {
@@ -488,18 +549,9 @@ func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (re
 	for home, entry := range backends {
 		s.closeHTTPBackend(home, entry)
 	}
-	s.mu.Lock()
-	generations := make([]*ownedGeneration, 0, len(s.generations))
-	for _, generation := range s.generations {
-		generations = append(generations, generation)
-	}
-	s.mu.Unlock()
-	worktrees := make([]string, 0, len(generations))
-	for _, generation := range generations {
-		if !s.drain(generation, "operator restart", false) {
-			return restartReceipt{}, fmt.Errorf("generation %s cannot be safely drained", generation.worktree)
-		}
-		worktrees = append(worktrees, generation.worktree)
+	worktrees, err := s.drainRestartGenerations(ctx)
+	if err != nil {
+		return restartReceipt{}, err
 	}
 	if err := restartWait(ctx, func() (bool, error) {
 		s.mu.Lock()

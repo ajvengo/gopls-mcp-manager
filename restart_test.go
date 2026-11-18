@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -464,6 +465,149 @@ func TestRestartRefusesUnconfirmedWorkAndResumesClients(t *testing.T) {
 		require.False(t, s.restartStatus().Active)
 		require.Len(t, s.operations, 1)
 	})
+}
+
+func TestRestartPreflightLeavesHealthyGenerationsReady(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		s := stateSupervisor(t)
+		s.initializeFrontends()
+		healthy := readyTestGeneration(t, s, testHome)
+		upstream := readyTestConnection(t, s, healthy).(*ownedUpstream)
+		first := readyTestGeneration(t, s, "/uncertain")
+		second := readyTestGeneration(t, s, "/draining")
+		first.state, second.state = generationTerminating, generationDraining
+		conn, remote := net.Pipe()
+		peer := newRestartPeer(s.ctx, conn, conn, 1024, false)
+		defer func() { _ = peer.Close(); _ = remote.Close() }()
+		defer s.registerRestartSession(&restartSession{peer: peer})()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		_, err := s.restartAll(ctx, restartRequest{})
+		require.ErrorContains(t, err, `"/draining" (draining), "/uncertain" (terminating)`)
+		require.Zero(t, peer.sequence, "preflight must run before pausing the frontend")
+		require.False(t, s.restartStatus().Active)
+
+		worktrees, err := s.drainRestartGenerations(ctx)
+		require.ErrorContains(t, err, "cannot be safely drained")
+		require.Empty(t, worktrees)
+		require.Equal(t, generationReady, supervisorGenerationState(s, healthy))
+		require.True(t, upstream.available())
+	})
+}
+
+func TestRestartWaitsForStartingGeneration(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		s := stateSupervisor(t)
+		s.initializeFrontends()
+		g := readyTestGeneration(t, s, testHome)
+		g.state = generationStarting
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		checked := make(chan error, 1)
+		go func() { checked <- restartWait(ctx, s.restartQuiescent) }()
+		synctest.Wait()
+		requireBlocked(t, checked, "restart should wait for startup")
+
+		s.mu.Lock()
+		g.state = generationReady
+		s.mu.Unlock()
+		require.NoError(t, <-checked)
+	})
+}
+
+func TestRestartWaitsForUpstreamWriteWithoutCredit(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		s := stateSupervisor(t)
+		s.initializeFrontends()
+		g := readyTestGeneration(t, s, testHome)
+		healthy := readyTestGeneration(t, s, testWorktree)
+		entered, release := make(chan struct{}), make(chan struct{})
+		raw := newFakeConn()
+		raw.onWrite = func(ctx context.Context, _ jsonrpc.Message) error {
+			close(entered)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		conn, err := s.connection(raw, g.record, t.Context(), func() {})
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		written := make(chan error, 1)
+		go func() { written <- conn.Write(ctx, &jsonrpc.Request{Method: "notifications/cancelled"}) }()
+		<-entered
+		require.Zero(t, s.snapshot().Operations)
+
+		checked := make(chan error, 1)
+		go func() { checked <- restartWait(ctx, s.restartQuiescent) }()
+		synctest.Wait()
+		requireBlocked(t, checked, "restart should wait for the write to return")
+		_, err = s.drainRestartGenerations(ctx)
+		require.ErrorContains(t, err, "new work arrived before generation drain")
+		require.Equal(t, generationReady, supervisorGenerationState(s, healthy))
+
+		close(release)
+		require.NoError(t, <-written)
+		require.NoError(t, <-checked)
+	})
+}
+
+func TestRestartRechecksAfterHTTPBackendTeardown(t *testing.T) {
+	for _, name := range []string{"cancelled", "abandoned control"} {
+		t.Run(name, func(t *testing.T) {
+			bubble(t, func(t *testing.T) {
+				s := stateSupervisor(t)
+				s.initializeFrontends()
+				s.m.limits.Idle = time.Millisecond
+				healthy := readyTestGeneration(t, s, testHome)
+				other := readyTestGeneration(t, s, testWorktree)
+				conn := readyTestConnection(t, s, other)
+				defer func() { _ = conn.Close() }()
+				backend := newHTTPBackend(t.Context(), s, testHome)
+				closing, ready := make(chan struct{}), make(chan struct{})
+				close(ready)
+				cancelBackend := backend.cancel
+				backend.cancel = func() {
+					cancelBackend()
+					close(closing)
+				}
+				s.frontends.backends[testHome] = &supervisorHTTPBackend{backend: backend, ready: ready}
+				finishClose := sync.OnceFunc(func() { close(backend.done) })
+				defer finishClose()
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				restarted := make(chan error, 1)
+				go func() {
+					_, err := s.restartAll(ctx, restartRequest{})
+					restarted <- err
+				}()
+				mustRecv(t, closing, "restart to begin HTTP backend teardown")
+				if name == "cancelled" {
+					cancel()
+				} else {
+					require.NoError(t, s.serverControl(operationKey{conn, mustID(t, "late-roots")}, other))
+					require.NoError(t, conn.Close())
+					time.Sleep(s.m.limits.Idle)
+				}
+				finishClose()
+
+				err := <-restarted
+				if name == "cancelled" {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					require.ErrorContains(t, err, "unconfirmed abandoned work")
+					require.Equal(t, 1, s.snapshot().Operations)
+				}
+				require.Equal(t, generationReady, supervisorGenerationState(s, healthy))
+				require.Equal(t, generationReady, supervisorGenerationState(s, other))
+			})
+		})
+	}
 }
 
 func TestRestartHTTPGateWaitsForEveryActiveRequest(t *testing.T) {

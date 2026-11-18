@@ -313,11 +313,13 @@ func guardianRemoveRecord(path string) error {
 
 type guardianRow struct{ pid, parent, group int }
 
+const guardianSnapshotTimeout = time.Second
+
 // A process snapshot is bounded by bytes and time. It establishes group
 // membership only; it cannot discover a descendant that already escaped and
 // reparented before the snapshot. That limitation is material on Darwin.
 func guardianSnapshot() ([]guardianRow, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), guardianSnapshotTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=,pgid=")
 	// Keep the observer outside the watched group, otherwise it counts itself.
@@ -326,6 +328,9 @@ func guardianSnapshot() ([]guardianRow, error) {
 	var output guardianOutput
 	command.Stdout = &output
 	if err := command.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("process census exceeded %s: %w (%w)", guardianSnapshotTimeout, ctxErr, err)
+		}
 		return nil, err
 	}
 	rows, err := guardianParseSnapshot(string(output.bytes))
