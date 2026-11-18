@@ -110,25 +110,27 @@ func ConnectSSE(ctx context.Context, endpoint string, maxBytes int, budget *Budg
 		_ = c.Close()
 		return nil, err
 	}
-	go func() {
-		defer func() { _ = c.Close() }()
-		for {
-			frame, err := c.readFrame(reader)
-			select {
-			case c.incoming <- sseResult{frame, err}:
-			case <-c.done:
-				budget.release(cap(frame))
-				return
-			case <-ctx.Done():
-				budget.release(cap(frame))
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	go c.readStream(reader)
 	return c, nil
+}
+
+func (c *sseConn) readStream(reader *bufio.Reader) {
+	defer func() { _ = c.Close() }()
+	for {
+		frame, err := c.readFrame(reader)
+		select {
+		case c.incoming <- sseResult{frame, err}:
+		case <-c.done:
+			c.budget.release(cap(frame))
+			return
+		case <-c.ctx.Done():
+			c.budget.release(cap(frame))
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (c *sseConn) SessionID() string { return "" }

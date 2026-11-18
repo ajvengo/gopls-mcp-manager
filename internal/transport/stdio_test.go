@@ -2,7 +2,6 @@ package transport
 
 import (
 	"bytes"
-	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"io"
@@ -10,7 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
+	"testing/synctest"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -33,16 +32,18 @@ func TestStdioMessageLimitAndReadAhead(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			conn := NewStdio(io.NopCloser(strings.NewReader(tc.input)), io.Discard, tc.limit)
-			defer func() { _ = conn.Close() }()
-			for range tc.count {
-				_, err := conn.Read(t.Context())
-				if tc.oversize {
-					require.ErrorIsf(t, err, ErrMessageTooLarge, "error = %v, want byte limit", err)
-				} else {
-					require.NoError(t, err)
+			synctest.Test(t, func(t *testing.T) {
+				conn := NewStdio(io.NopCloser(strings.NewReader(tc.input)), io.Discard, tc.limit)
+				defer func() { _ = conn.Close() }()
+				for range tc.count {
+					_, err := conn.Read(t.Context())
+					if tc.oversize {
+						require.ErrorIsf(t, err, ErrMessageTooLarge, "error = %v, want byte limit", err)
+					} else {
+						require.NoError(t, err)
+					}
 				}
-			}
+			})
 		})
 	}
 }
@@ -68,22 +69,23 @@ func TestStdioMatchesSDK(t *testing.T) {
 	} {
 		t.Run(wire[:min(70, len(wire))], func(t *testing.T) {
 			t.Parallel()
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-			sdk, err := (&mcp.IOTransport{Reader: io.NopCloser(strings.NewReader(wire + "\n")), Writer: writerOnly{io.Discard}}).Connect(ctx)
-			require.NoError(t, err)
-			defer func() { _ = sdk.Close() }()
-			fast := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
-			defer func() { _ = fast.Close() }()
-			want, wantErr := sdk.Read(ctx)
-			got, gotErr := fast.Read(ctx)
-			require.Truef(t, (wantErr == nil) == (gotErr == nil), "error mismatch: SDK %v, fast %v", wantErr, gotErr)
-			if gotErr != nil {
-				return
-			}
-			wantWire, _ := jsonrpc.EncodeMessage(want)
-			gotWire, _ := jsonrpc.EncodeMessage(got)
-			require.Equalf(t, wantWire, gotWire, "got %s, want %s", gotWire, wantWire)
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				sdk, err := (&mcp.IOTransport{Reader: io.NopCloser(strings.NewReader(wire + "\n")), Writer: writerOnly{io.Discard}}).Connect(ctx)
+				require.NoError(t, err)
+				defer func() { _ = sdk.Close() }()
+				fast := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
+				defer func() { _ = fast.Close() }()
+				want, wantErr := sdk.Read(ctx)
+				got, gotErr := fast.Read(ctx)
+				require.Truef(t, (wantErr == nil) == (gotErr == nil), "error mismatch: SDK %v, fast %v", wantErr, gotErr)
+				if gotErr != nil {
+					return
+				}
+				wantWire, _ := jsonrpc.EncodeMessage(want)
+				gotWire, _ := jsonrpc.EncodeMessage(got)
+				require.Equalf(t, wantWire, gotWire, "got %s, want %s", gotWire, wantWire)
+			})
 		})
 	}
 }
@@ -97,10 +99,12 @@ func TestStdioRejectsAmbiguousJSON(t *testing.T) {
 	} {
 		t.Run(wire, func(t *testing.T) {
 			t.Parallel()
-			conn := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
-			defer func() { _ = conn.Close() }()
-			_, err := conn.Read(t.Context())
-			require.Error(t, err)
+			synctest.Test(t, func(t *testing.T) {
+				conn := NewStdio(io.NopCloser(strings.NewReader(wire+"\n")), io.Discard, defaultTestLimit)
+				defer func() { _ = conn.Close() }()
+				_, err := conn.Read(t.Context())
+				require.Error(t, err)
+			})
 		})
 	}
 }
@@ -120,37 +124,38 @@ func TestStdioPreservesBatchResponses(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			var output bytes.Buffer
-			second := strings.NewReplacer(`"a"`, `"a2"`, `"b"`, `"b2"`).Replace(tc.wire)
-			c := NewStdio(io.NopCloser(strings.NewReader(tc.wire+"\n"+second+"\n")), &output, defaultTestLimit)
-			defer func() { _ = c.Close() }()
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-			for range 2 {
-				var ids []jsonrpc.ID
-				for range tc.messages {
-					msg, err := c.Read(ctx)
-					require.NoError(t, err)
-					if id := msg.(*jsonrpc.Request).ID; id.IsValid() {
-						ids = append(ids, id)
+			synctest.Test(t, func(t *testing.T) {
+				var output bytes.Buffer
+				second := strings.NewReplacer(`"a"`, `"a2"`, `"b"`, `"b2"`).Replace(tc.wire)
+				c := NewStdio(io.NopCloser(strings.NewReader(tc.wire+"\n"+second+"\n")), &output, defaultTestLimit)
+				defer func() { _ = c.Close() }()
+				ctx := t.Context()
+				for range 2 {
+					var ids []jsonrpc.ID
+					for range tc.messages {
+						msg, err := c.Read(ctx)
+						require.NoError(t, err)
+						if id := msg.(*jsonrpc.Request).ID; id.IsValid() {
+							ids = append(ids, id)
+						}
 					}
-				}
-				require.Len(t, ids, tc.replies)
-				for i, id := range slices.Backward(ids) {
-					require.NoError(t, c.Write(ctx, &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
-					if i > 0 {
-						require.Zero(t, output.Len(), "partial batch response escaped")
+					require.Len(t, ids, tc.replies)
+					for i, id := range slices.Backward(ids) {
+						require.NoError(t, c.Write(ctx, &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
+						if i > 0 {
+							require.Zero(t, output.Len(), "partial batch response escaped")
+						}
 					}
+					if tc.replies == 0 {
+						require.Zero(t, output.Len())
+						continue
+					}
+					var responses []jsontext.Value
+					require.NoError(t, json.Unmarshal(output.Bytes(), &responses), "notifications stranded the batch response")
+					require.Len(t, responses, tc.replies)
+					output.Reset()
 				}
-				if tc.replies == 0 {
-					require.Zero(t, output.Len())
-					continue
-				}
-				var responses []jsontext.Value
-				require.NoError(t, json.Unmarshal(output.Bytes(), &responses), "notifications stranded the batch response")
-				require.Len(t, responses, tc.replies)
-				output.Reset()
-			}
+			})
 		})
 	}
 }
@@ -168,35 +173,38 @@ func FuzzStdioNotificationBatches(f *testing.F) {
 		}
 		wire, err := json.Marshal(batch)
 		require.NoError(t, err)
-		var output bytes.Buffer
-		c := NewStdio(io.NopCloser(bytes.NewReader(append(wire, '\n'))), &output, defaultTestLimit)
-		defer func() { _ = c.Close() }()
-		for range len(batch) {
-			_, err := c.Read(t.Context())
-			require.NoError(t, err)
-		}
-		id, _ := jsonrpc.MakeID("call")
-		require.NoError(t, c.Write(t.Context(), &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
-		var responses []jsontext.Value
-		require.NoError(t, json.Unmarshal(output.Bytes(), &responses))
-		require.Len(t, responses, 1)
+		synctest.Test(t, func(t *testing.T) {
+			var output bytes.Buffer
+			c := NewStdio(io.NopCloser(bytes.NewReader(append(wire, '\n'))), &output, defaultTestLimit)
+			defer func() { _ = c.Close() }()
+			for range len(batch) {
+				_, err := c.Read(t.Context())
+				require.NoError(t, err)
+			}
+			id, _ := jsonrpc.MakeID("call")
+			require.NoError(t, c.Write(t.Context(), &jsonrpc.Response{ID: id, Result: jsontext.Value(`{}`)}))
+			var responses []jsontext.Value
+			require.NoError(t, json.Unmarshal(output.Bytes(), &responses))
+			require.Len(t, responses, 1)
+		})
 	})
 }
 
 func TestStdioCloseUnblocksRead(t *testing.T) {
 	t.Parallel()
-	reader, writer := io.Pipe()
-	defer func() { _ = writer.Close() }()
-	c := NewStdio(reader, io.Discard, defaultTestLimit)
-	done := make(chan error, 1)
-	go func() { _, err := c.Read(t.Context()); done <- err }()
-	require.NoError(t, c.Close())
-	select {
-	case err := <-done:
-		require.Error(t, err, "closed read succeeded")
-	case <-time.After(time.Second):
-		require.FailNow(t, "closed stdio read remained blocked")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer func() { _ = writer.Close() }()
+		c := NewStdio(reader, io.Discard, defaultTestLimit)
+		done := make(chan error, 1)
+		go func() { _, err := c.Read(t.Context()); done <- err }()
+		synctest.Wait()
+		require.Empty(t, done, "read returned before Close")
+		require.NoError(t, c.Close())
+		synctest.Wait()
+		require.Len(t, done, 1, "closed stdio read remained blocked")
+		require.ErrorIs(t, <-done, io.EOF)
+	})
 }
 
 func FuzzDecodeScalarMatchesSDK(f *testing.F) {

@@ -26,9 +26,8 @@ import (
 // successful call, uncertain-write reconnect, cancelled unresolved call and
 // shutdown against one manager.
 func TestAuditSessionChurn(t *testing.T) {
-	m := routerTestOwner(t, nil)
 	profileDir := os.Getenv("GOPLS_MANAGER_AUDIT_PROFILES")
-	snapshot := func(batch int) {
+	snapshot := func(t *testing.T, batch int) {
 		t.Helper()
 		runtime.GC()
 		// Heap profiles may lag reclamation by a collection. Also clear pool
@@ -49,88 +48,87 @@ func TestAuditSessionChurn(t *testing.T) {
 			require.NoError(t, f.Close())
 		}
 	}
-	snapshot(0)
-	for batch := 1; batch <= 10; batch++ {
-		for range 100 {
-			ctx, cancel := context.WithCancel(t.Context())
-			b := newHTTPBackend(ctx, m, testHome)
-			b.r.plan = func(worktree string, _ []string) watchPlan { return watchPlan{roots: []string{worktree}} }
-			dials := 0
-			executed := make(chan struct{}, 1)
-			b.r.dial = func(context.Context, string, int) (mcp.Connection, error) {
-				dials++
-				generation := dials
-				conn := &fakeConn{reads: make(chan jsonrpc.Message, 4)}
-				conn.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
-					req, ok := msg.(*jsonrpc.Request)
-					if !ok || !req.ID.IsValid() {
-						return nil
+	synctest.Test(t, func(t *testing.T) {
+		m := routerTestOwner(t, nil)
+		snapshot(t, 0)
+		for batch := 1; batch <= 10; batch++ {
+			for range 100 {
+				ctx, cancel := context.WithCancel(t.Context())
+				b := newHTTPBackend(ctx, m, testHome)
+				b.r.plan = func(worktree string, _ []string) watchPlan { return watchPlan{roots: []string{worktree}} }
+				dials := 0
+				executed := make(chan struct{}, 1)
+				b.r.dial = func(context.Context, string, int) (mcp.Connection, error) {
+					dials++
+					generation := dials
+					conn := &fakeConn{reads: make(chan jsonrpc.Message, 4)}
+					conn.onWrite = func(ctx context.Context, msg jsonrpc.Message) error {
+						req, ok := msg.(*jsonrpc.Request)
+						if !ok || !req.ID.IsValid() {
+							return nil
+						}
+						if req.Method == "tools/call" && !strings.Contains(string(req.Params), `"reply"`) {
+							executed <- struct{}{}
+							return nil
+						}
+						if generation == 1 && req.Method == "tools/list" {
+							return io.ErrUnexpectedEOF
+						}
+						result := jsontext.Value(`{}`)
+						if req.Method == "initialize" {
+							conn.reads <- &jsonrpc.Request{ID: initID, Method: "roots/list"}
+						}
+						select {
+						case conn.reads <- &jsonrpc.Response{ID: req.ID, Result: result}:
+							return nil
+						case <-ctx.Done():
+							return ctx.Err()
+						}
 					}
-					if req.Method == "tools/call" && !strings.Contains(string(req.Params), `"reply"`) {
-						executed <- struct{}{}
-						return nil
-					}
-					if generation == 1 && req.Method == "tools/list" {
-						return io.ErrUnexpectedEOF
-					}
-					result := jsontext.Value(`{}`)
-					if req.Method == "initialize" {
-						conn.reads <- &jsonrpc.Request{ID: initID, Method: "roots/list"}
-					}
-					select {
-					case conn.reads <- &jsonrpc.Response{ID: req.ID, Result: result}:
-						return nil
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+					return conn, nil
 				}
-				return conn, nil
+				b.start()
+				_, err := b.initialize(ctx)
+				require.NoError(t, err)
+				require.ErrorContains(t, b.call(ctx, "tools/list", map[string]any{}, new(jsontext.Value)), "may have executed")
+				// A later distinct request may reconnect; the failed one is never replayed.
+				require.NoError(t, b.call(ctx, "tools/list", map[string]any{}, new(jsontext.Value)))
+				require.Equal(t, 2, dials, "cycle did not reconnect")
+				require.NoError(t, b.call(ctx, "tools/call", map[string]any{"mode": "reply"}, new(jsontext.Value)))
+				// Expiring delivered work retains its operation until confirmed process exit.
+				callCtx, stopCall := context.WithCancel(ctx)
+				done := make(chan error, 1)
+				go func() { done <- b.call(callCtx, "tools/call", map[string]any{}, new(jsontext.Value)) }()
+				mustRecv(t, executed, "unanswered call reached upstream")
+				require.Equal(t, 2, b.r.requestUsage().UpstreamOperations)
+				stopCall()
+				require.ErrorIs(t, <-done, context.Canceled)
+				b.close()
+				cancel()
+				require.Equal(t, 2, b.r.requestUsage().UpstreamOperations, "disconnect cannot release remote credits")
+				m.mu.Lock()
+				g := m.generations[testHome]
+				m.mu.Unlock()
+				require.NoError(t, g.child.Signal(syscall.SIGTERM))
+				<-g.exited
+				require.Zero(t, b.r.requestUsage().UpstreamOperations)
 			}
-			b.start()
-			_, err := b.initialize(ctx)
-			require.NoError(t, err)
-			require.ErrorContains(t, b.call(ctx, "tools/list", map[string]any{}, new(jsontext.Value)), "may have executed")
-			// A later distinct request may reconnect; the failed one is never replayed.
-			require.NoError(t, b.call(ctx, "tools/list", map[string]any{}, new(jsontext.Value)))
-			require.Equal(t, 2, dials, "cycle did not reconnect")
-			require.NoError(t, b.call(ctx, "tools/call", map[string]any{"mode": "reply"}, new(jsontext.Value)))
-			// Expiring delivered work retains its operation until confirmed process exit.
-			callCtx, stopCall := context.WithCancel(ctx)
-			done := make(chan error, 1)
-			go func() { done <- b.call(callCtx, "tools/call", map[string]any{}, new(jsontext.Value)) }()
-			require.Eventually(t, func() bool { return b.r.requestUsage().UpstreamOperations == 2 }, time.Second, time.Millisecond)
-			mustRecv(t, executed, "unanswered call reached upstream")
-			stopCall()
-			require.ErrorIs(t, <-done, context.Canceled)
-			b.close()
-			cancel()
-			require.Equal(t, 2, b.r.requestUsage().UpstreamOperations, "disconnect cannot release remote credits")
-			m.mu.Lock()
-			g := m.generations[testHome]
-			m.mu.Unlock()
-			require.NoError(t, g.child.Signal(syscall.SIGTERM))
-			<-g.exited
-			require.Zero(t, b.r.requestUsage().UpstreamOperations)
-		}
-		require.Eventually(t, func() bool {
+			synctest.Wait()
 			var stacks bytes.Buffer
 			_ = pprof.Lookup("goroutine").WriteTo(&stacks, 2)
 			for _, symbol := range []string{"(*httpBackend).start.func", "(*router).readFromUpstream", "(*router).answerRootsAsks", "(*lane).runControls", "(*router).planRoots.func"} {
-				if strings.Contains(stacks.String(), symbol) {
-					return false
-				}
+				require.NotContains(t, stacks.String(), symbol, "session-owned goroutine survived shutdown")
 			}
-			return true
-		}, 2*time.Second, time.Millisecond, "session-owned goroutines survived shutdown")
-		snapshot(batch)
-	}
+			snapshot(t, batch)
+		}
+	})
 }
 
 func TestAuditDecodedBackpressure(t *testing.T) {
 	runtime.GC()
 	var before, full, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	func() {
+	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		r := newRouter(ctx, routerTestOwner(t, nil), testHome)
@@ -141,18 +139,16 @@ func TestAuditDecodedBackpressure(t *testing.T) {
 		}
 		done := make(chan struct{})
 		go func() { defer close(done); r.readFromUpstream(testConnection(r, conn, testHome), testHome) }()
-		require.Eventually(t, func() bool { return len(r.out) == cap(r.out) }, time.Second, time.Millisecond)
+		synctest.Wait()
+		require.Len(t, r.out, cap(r.out))
 		runtime.GC()
 		runtime.ReadMemStats(&full)
 		used, _ := r.sseBudget.Snapshot()
 		require.Zero(t, used, "decoded output retention is outside the SSE wire budget")
 		cancel()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			require.FailNow(t, "backpressured reader survived shutdown")
-		}
-	}()
+		synctest.Wait()
+		mustRecv(t, done, "backpressured reader survived shutdown")
+	})
 	// A second collection also clears pool victims and avoids attributing a
 	// just-completed collection's profile lag to retained session messages.
 	runtime.GC()

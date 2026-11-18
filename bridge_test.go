@@ -792,13 +792,8 @@ func bubble(t *testing.T, fn func(t *testing.T)) {
 	synctest.Test(t, fn)
 }
 
-// testWait bounds every wait in this file, all of which are inside a bubble. A
-// bridge that never makes the progress a test is waiting for is a bug, and an
-// unbounded channel operation leaves synctest to report it — as a bare deadlock
-// panic naming no expectation. Getting there first is the whole job.
-//
-// It costs nothing on a passing run: this timer can only come due once every
-// goroutine is already blocked, which is the hang itself.
+// testWait bounds channel waits so failures name the expected event. Inside a
+// bubble it uses fake time and can come due once every goroutine is blocked.
 const testWait = 10 * time.Second
 
 // recvWithin takes the next value from ch, reporting a timeout rather than
@@ -1710,22 +1705,21 @@ func TestServeSwallowsTheEndOfTheClientAndReportsAnythingElse(t *testing.T) {
 	broken := errors.New("stdin fell over")
 	for _, tc := range []struct {
 		name string
-		conn mcp.Connection
 		want error
 	}{
-		{name: "client closed", conn: deadConn(), want: nil},
-		{name: "transport broke", conn: &brokenConn{fakeConn: deadConn(), err: broken}, want: broken},
+		{name: "client closed"},
+		{name: "transport broke", want: broken},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			// Serve returning at all is half of what this asserts: it waits for its
-			// reader and closes every lane, so a shutdown that ordered those wrongly
-			// would hang here rather than answer. The context is the test's own and
-			// is never cancelled — serve derives what it cancels, so a session that
-			// leaned on the caller for that would hang here too.
-			err := serve(t.Context(), routerTestOwner(t, nil), testHome, tc.conn)
-			require.ErrorIsf(t, err, tc.want, "serve() = %v, want %v", err, tc.want)
+			bubble(t, func(t *testing.T) {
+				fake := deadConn()
+				var conn mcp.Connection = fake
+				if tc.want != nil {
+					conn = &brokenConn{fakeConn: fake, err: tc.want}
+				}
+				err := serve(t.Context(), routerTestOwner(t, nil), testHome, conn)
+				require.ErrorIsf(t, err, tc.want, "serve() = %v, want %v", err, tc.want)
+			})
 		})
 	}
 }
@@ -1735,23 +1729,24 @@ func TestServeSwallowsTheEndOfTheClientAndReportsAnythingElse(t *testing.T) {
 // stopping is what lets serve exit; spinning on a transport that is gone would
 // burn a core for as long as the client stayed dead.
 func TestWriteToClientReportsAFailedWriteOnce(t *testing.T) {
-	t.Parallel()
-	r := newTestRouter(t, testHome)
-	writes := 0
-	conn := &fakeConn{onWrite: func(context.Context, jsonrpc.Message) error {
-		writes++
-		return io.ErrClosedPipe
-	}}
-	// Two queued, so that a writer which kept going after the failure would take
-	// the second one and be caught doing it.
-	r.out <- &jsonrpc.Response{ID: mustID(t, float64(1)), Result: jsontext.Value(`{}`)}
-	r.out <- &jsonrpc.Response{ID: mustID(t, float64(2)), Result: jsontext.Value(`{}`)}
+	bubble(t, func(t *testing.T) {
+		r := newTestRouter(t, testHome)
+		writes := 0
+		conn := &fakeConn{onWrite: func(context.Context, jsonrpc.Message) error {
+			writes++
+			return io.ErrClosedPipe
+		}}
+		// Two queued, so that a writer which kept going after the failure would take
+		// the second one and be caught doing it.
+		r.out <- &jsonrpc.Response{ID: mustID(t, float64(1)), Result: jsontext.Value(`{}`)}
+		r.out <- &jsonrpc.Response{ID: mustID(t, float64(2)), Result: jsontext.Value(`{}`)}
 
-	r.writeToClient(conn) // returns, or this test times out
+		r.writeToClient(conn)
 
-	err := <-r.errs
-	require.ErrorIsf(t, err, io.ErrClosedPipe, "writeToClient() reported %v, want the write's own error", err)
-	require.Equalf(t, 1, writes, "writeToClient() attempted %d writes after the first one failed, want it to stop at 1", writes)
+		err := <-r.errs
+		require.ErrorIsf(t, err, io.ErrClosedPipe, "writeToClient() reported %v, want the write's own error", err)
+		require.Equalf(t, 1, writes, "writeToClient() attempted %d writes after the first one failed, want it to stop at 1", writes)
+	})
 }
 
 // The session ending is the other way out, and it is the ordinary one: serve
