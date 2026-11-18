@@ -36,38 +36,59 @@ const tlapsAssets: Record<string, { id: number; hash: string }> = {
     hash: '1fcb037a300929d4bed8539511f65073fc19762abd9cea5260fe91d0f2d617df',
   },
 };
-const modelSources: Record<string, string> = {
-  "OperationSafety.cfg": "CONSTANTS\n    Clients = {bridgeA, bridgeB}\n    Connections = {old, retry}\n    MaxRequest = 2\n    Credits = 2\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
-  "LifecycleSafety.cfg": "CONSTANTS\n    Trees = {home}\n    Clients = {bridgeA, bridgeB}\n    Generations = {first, second}\n    Capacity = 1\n    OperationCapacity = 2\n    IdleTicks = 2\n    MaxBoot = 2\n    CooperativeExit = TRUE\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
-  "RetirementSafety.cfg": "CONSTANTS\n    Generations = {first, second}\n    Clients = {bridgeA, bridgeB}\n    Capacity = 1\n    OperationCapacity = 2\n    IdleTicks = 2\n    CooperativeExit = TRUE\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
-  "RestartHandoffSafety.cfg": "CONSTANTS\n    Frontends = {stdio, http}\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
-  "PayloadSafety.cfg": "CONSTANTS\n    Calls = {first, second, third}\n    Capacity = 3\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+type TLCConfig = { model: string; config: string };
+type TLCOutcome = 'pass' | 'safety' | 'liveness';
+type TLCCase = TLCConfig & { name: string; expected: TLCOutcome };
+
+const lifecycle = {
+  model: 'SupervisorLifecycle.tla',
+  config: "CONSTANTS\n    Trees = {home}\n    Clients = {bridgeA, bridgeB}\n    Generations = {first, second}\n    Capacity = 1\n    OperationCapacity = 2\n    IdleTicks = 2\n    MaxBoot = 2\n    CooperativeExit = TRUE\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
 };
-for (const [name, base, replacements] of [
-  ['LifecyclePureIdle', 'LifecycleSafety',
-    [['SPECIFICATION Spec', 'SPECIFICATION FairSpec'],
-     ['CHECK_DEADLOCK', 'PROPERTY PureIdleReclaims\nCHECK_DEADLOCK']]],
-  ['LifecycleLiveness', 'LifecycleSafety',
-    [['SPECIFICATION Spec', 'SPECIFICATION ResponseFairSpec'],
-     ['CHECK_DEADLOCK', 'PROPERTY QuiescenceReclaims\nCHECK_DEADLOCK']]],
-  ['OperationThreeClients', 'OperationSafety',
-    [['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, http}']]],
-  ['LifecycleMultiTree', 'LifecycleSafety',
-    [['Trees = {home}', 'Trees = {home, worktree}'],
-     ['Generations = {first, second}', 'Generations = {first}'],
-     ['Capacity = 1', 'Capacity = 2'], ['MaxBoot = 2', 'MaxBoot = 1']]],
-  ['LifecycleThreeClients', 'LifecycleSafety',
-    [['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, http}'],
-     ['MaxBoot = 2', 'MaxBoot = 1']]],
-  ['RetirementLiveness', 'RetirementSafety',
-    [['SPECIFICATION Spec', 'SPECIFICATION FairSpec'],
-     ['CHECK_DEADLOCK', 'PROPERTY AbandonedReclaims\nCHECK_DEADLOCK']]],
-  ['RetirementThreeClients', 'RetirementSafety',
-    [['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, bridgeC}']]],
-  ['RestartHandoffLiveness', 'RestartHandoffSafety',
-    [['SPECIFICATION Spec', 'SPECIFICATION FairSpec'],
-     ['CHECK_DEADLOCK', 'PROPERTY Settles\nCHECK_DEADLOCK']]],
-] as const) modelSources[`${name}.cfg`] = configText(`${base}.cfg`, replacements);
+const operation = {
+  model: 'OperationAccounting.tla',
+  config: "CONSTANTS\n    Clients = {bridgeA, bridgeB}\n    Connections = {old, retry}\n    MaxRequest = 2\n    Credits = 2\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+};
+const retirement = {
+  model: 'AbandonedRetirement.tla',
+  config: "CONSTANTS\n    Generations = {first, second}\n    Clients = {bridgeA, bridgeB}\n    Capacity = 1\n    OperationCapacity = 2\n    IdleTicks = 2\n    CooperativeExit = TRUE\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+};
+const handoff = {
+  model: 'RestartHandoff.tla',
+  config: "CONSTANTS\n    Frontends = {stdio, http}\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+};
+const payload = {
+  model: 'PayloadAccounting.tla',
+  config: "CONSTANTS\n    Calls = {first, second, third}\n    Capacity = 3\n    Mutation = \"none\"\nSPECIFICATION Spec\nINVARIANTS TypeOK Safety\nCHECK_DEADLOCK FALSE\n",
+};
+
+const pureIdle = livenessCase('LifecyclePureIdle', lifecycle, 'PureIdleReclaims');
+const retirementLiveness = livenessCase('RetirementLiveness', retirement, 'AbandonedReclaims');
+const handoffLiveness = livenessCase('RestartHandoffLiveness', handoff, 'Settles');
+const modelCases = [
+  tlcCase('LifecycleSafety', lifecycle),
+  livenessCase('LifecycleLiveness', lifecycle, 'QuiescenceReclaims', 'ResponseFairSpec'),
+  pureIdle,
+  tlcCase('LifecycleMultiTree', lifecycle, [
+    ['Trees = {home}', 'Trees = {home, worktree}'],
+    ['Generations = {first, second}', 'Generations = {first}'],
+    ['Capacity = 1', 'Capacity = 2'], ['MaxBoot = 2', 'MaxBoot = 1'],
+  ]),
+  tlcCase('LifecycleThreeClients', lifecycle, [
+    ['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, http}'],
+    ['MaxBoot = 2', 'MaxBoot = 1'],
+  ]),
+  tlcCase('OperationSafety', operation),
+  tlcCase('OperationThreeClients', operation, [['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, http}']]),
+  tlcCase('RetirementSafety', retirement),
+  retirementLiveness,
+  tlcCase('RetirementThreeClients', retirement, [['Clients = {bridgeA, bridgeB}', 'Clients = {bridgeA, bridgeB, bridgeC}']]),
+  tlcCase('RestartHandoffSafety', handoff),
+  handoffLiveness,
+  tlcCase('PayloadSafety', payload),
+];
+const modelSources: Record<string, string> = Object.fromEntries(
+  modelCases.map(({ name, config }) => [`${name}.cfg`, config]),
+);
 for await (const name of new Bun.Glob('*.tla').scan(sourceDir)) {
   modelSources[name] = await Bun.file(join(sourceDir, name)).text();
 }
@@ -156,11 +177,10 @@ async function run(name: string, command: string[], expected: string): Promise<R
   return result;
 }
 
-async function tlc(name: string, model: string, config: string,
-                   expected: 'pass' | 'safety' | 'liveness'): Promise<void> {
+async function tlc({ name, model, expected }: TLCCase): Promise<void> {
   const result = await run(name, ['java', '-Xmx512m', '-cp', jar, 'tlc2.TLC',
     '-workers', '1', '-fp', '0', '-seed', '1', '-noGenerateSpecTE',
-    '-metadir', join(evidenceDir, `${name}-states`), '-config', config, model], expected);
+    '-metadir', join(evidenceDir, `${name}-states`), '-config', `${name}.cfg`, model], expected);
   const correct = expected === 'pass'
     ? result.exitCode === 0 && result.output.includes('Model checking completed. No error has been found.')
     : expected === 'safety'
@@ -169,21 +189,27 @@ async function tlc(name: string, model: string, config: string,
   if (!correct) throw new Error(`Unexpected ${expected} result in ${name}; inspect ${evidenceDir}`);
 }
 
-function configText(base: string, replacements: readonly (readonly [string, string])[]): string {
-  let text = modelSources[base];
-  if (text === undefined) throw new Error(`Unknown model configuration: ${base}`);
+function tlcCase(name: string, base: TLCConfig, replacements: [string, string][] = [],
+                 expected: TLCOutcome = 'pass'): TLCCase {
+  let { config } = base;
   for (const [oldValue, newValue] of replacements) {
-    if (text.split(oldValue).length !== 2) throw new Error(`Nonunique config field: ${oldValue}`);
-    text = text.replace(oldValue, newValue);
+    if (config.split(oldValue).length !== 2) throw new Error(`${name}: nonunique config field: ${oldValue}`);
+    config = config.replace(oldValue, newValue);
   }
-  return text;
+  return { name, model: base.model, config, expected };
 }
 
-async function configVariant(name: string, base: string,
-                             replacements: [string, string][]): Promise<string> {
-  const path = join(evidenceDir, `${name}.cfg`);
-  await Bun.write(path, configText(base, replacements));
-  return path;
+function livenessCase(name: string, base: TLCConfig, property: string, spec = 'FairSpec'): TLCCase {
+  return tlcCase(name, base, [
+    ['SPECIFICATION Spec', `SPECIFICATION ${spec}`],
+    ['CHECK_DEADLOCK', `PROPERTY ${property}\nCHECK_DEADLOCK`],
+  ]);
+}
+
+function mutationCases(base: TLCConfig, prefix: string, mutations: string[],
+                       expected: 'safety' | 'liveness' = 'safety'): TLCCase[] {
+  return mutations.map(mutation => tlcCase(`mutation-${prefix}${mutation}`, base,
+    [['Mutation = "none"', `Mutation = "${mutation}"`]], expected));
 }
 
 if (mode !== 'proofs') {
@@ -191,69 +217,24 @@ if (mode !== 'proofs') {
     'https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar', jarHash);
 }
 if (mode === 'all' || mode === 'models') {
-  for (const [name, model] of [
-    ['LifecycleSafety', 'SupervisorLifecycle.tla'],
-    ['LifecycleLiveness', 'SupervisorLifecycle.tla'],
-    ['LifecyclePureIdle', 'SupervisorLifecycle.tla'],
-    ['LifecycleMultiTree', 'SupervisorLifecycle.tla'],
-    ['LifecycleThreeClients', 'SupervisorLifecycle.tla'],
-    ['OperationSafety', 'OperationAccounting.tla'],
-    ['OperationThreeClients', 'OperationAccounting.tla'],
-    ['RetirementSafety', 'AbandonedRetirement.tla'],
-    ['RetirementLiveness', 'AbandonedRetirement.tla'],
-    ['RetirementThreeClients', 'AbandonedRetirement.tla'],
-    ['RestartHandoffSafety', 'RestartHandoff.tla'],
-    ['RestartHandoffLiveness', 'RestartHandoff.tla'],
-    ['PayloadSafety', 'PayloadAccounting.tla'],
-  ] as const) await tlc(name, model, `${name}.cfg`, 'pass');
+  for (const check of modelCases) await tlc(check);
 }
 if (mode === 'all' || mode === 'mutations') {
-  for (const mutation of ['busy-drain', 'early-slot', 'stale-token', 'unowned-signal', 'early-idle']) {
-    const name = `mutation-${mutation}`;
-    const config = await configVariant(name, 'LifecycleSafety.cfg',
-      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
-    await tlc(name, 'SupervisorLifecycle.tla', config, 'safety');
-  }
-  for (const mutation of ['cancel-releases', 'disconnect-releases',
-      'wrong-completion', 'id-reuse', 'wrong-credit']) {
-    const name = `mutation-${mutation}`;
-    const config = await configVariant(name, 'OperationSafety.cfg',
-      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
-    await tlc(name, 'OperationAccounting.tla', config, 'safety');
-  }
-  const disabled = await configVariant('mutation-never-drain', 'LifecyclePureIdle.cfg',
-    [['Mutation = "none"', 'Mutation = "never-drain"']]);
-  await tlc('mutation-never-drain', 'SupervisorLifecycle.tla', disabled, 'liveness');
-  const stuck = await configVariant('noncooperative-exit', 'LifecyclePureIdle.cfg',
-    [['CooperativeExit = TRUE', 'CooperativeExit = FALSE']]);
-  await tlc('noncooperative-exit', 'SupervisorLifecycle.tla', stuck, 'liveness');
-  for (const mutation of ['active-retire', 'early-abandon', 'retire-releases', 'early-slot']) {
-    const name = `mutation-retirement-${mutation}`;
-    const config = await configVariant(name, 'RetirementSafety.cfg',
-      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
-    await tlc(name, 'AbandonedRetirement.tla', config, 'safety');
-  }
-  const noRetirement = await configVariant('mutation-never-retire', 'RetirementLiveness.cfg',
-    [['Mutation = "none"', 'Mutation = "never-retire"']]);
-  await tlc('mutation-never-retire', 'AbandonedRetirement.tla', noRetirement, 'liveness');
-  const stuckRetirement = await configVariant('noncooperative-retirement', 'RetirementLiveness.cfg',
-    [['CooperativeExit = TRUE', 'CooperativeExit = FALSE']]);
-  await tlc('noncooperative-retirement', 'AbandonedRetirement.tla', stuckRetirement, 'liveness');
-  for (const mutation of ['commit-refunds', 'commit-starts', 'commit-opens-http',
-      'commit-resumes', 'failure-opens-admission', 'early-admission']) {
-    const name = `mutation-handoff-${mutation}`;
-    const config = await configVariant(name, 'RestartHandoffSafety.cfg',
-      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
-    await tlc(name, 'RestartHandoff.tla', config, 'safety');
-  }
-  const stalledHandoff = await configVariant('mutation-handoff-never-settles', 'RestartHandoffLiveness.cfg',
-    [['Mutation = "none"', 'Mutation = "never-settles"']]);
-  await tlc('mutation-handoff-never-settles', 'RestartHandoff.tla', stalledHandoff, 'liveness');
-  for (const mutation of ['overbook', 'refund-cancel', 'refund-dequeue', 'refund-writer']) {
-    const name = `mutation-payload-${mutation}`;
-    const config = await configVariant(name, 'PayloadSafety.cfg',
-      [['Mutation = "none"', `Mutation = "${mutation}"`]]);
-    await tlc(name, 'PayloadAccounting.tla', config, 'safety');
+  for (const check of [
+    ...mutationCases(lifecycle, '', ['busy-drain', 'early-slot', 'stale-token', 'unowned-signal', 'early-idle']),
+    ...mutationCases(operation, '', ['cancel-releases', 'disconnect-releases', 'wrong-completion', 'id-reuse', 'wrong-credit']),
+    ...mutationCases(pureIdle, '', ['never-drain'], 'liveness'),
+    tlcCase('noncooperative-exit', pureIdle, [['CooperativeExit = TRUE', 'CooperativeExit = FALSE']], 'liveness'),
+    ...mutationCases(retirement, 'retirement-', ['active-retire', 'early-abandon', 'retire-releases', 'early-slot']),
+    ...mutationCases(retirementLiveness, '', ['never-retire'], 'liveness'),
+    tlcCase('noncooperative-retirement', retirementLiveness, [['CooperativeExit = TRUE', 'CooperativeExit = FALSE']], 'liveness'),
+    ...mutationCases(handoff, 'handoff-', ['commit-refunds', 'commit-starts', 'commit-opens-http',
+      'commit-resumes', 'failure-opens-admission', 'early-admission']),
+    ...mutationCases(handoffLiveness, 'handoff-', ['never-settles'], 'liveness'),
+    ...mutationCases(payload, 'payload-', ['overbook', 'refund-cancel', 'refund-dequeue', 'refund-writer']),
+  ]) {
+    await Bun.write(join(evidenceDir, `${check.name}.cfg`), check.config);
+    await tlc(check);
   }
 }
 if (mode === 'all' || mode === 'proofs') {
