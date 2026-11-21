@@ -124,7 +124,7 @@ func routerTestOwner(tb testing.TB, m *manager) *supervisor {
 		stop := func(os.Signal) error { once.Do(func() { close(done) }); return nil }
 		return &guardianChild{Process: &os.Process{Pid: 123}, ConfirmedDone: done, Signal: stop, CloseOwner: func() error { return stop(syscall.SIGTERM) }}, nil
 	}
-	s.ready = func(context.Context, int) error { return nil }
+	s.ready = func(context.Context, int, int) error { return nil }
 	useMemoryRegistry(s)
 	return s
 }

@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -239,7 +240,7 @@ func TestAuditRealGoplsFailedStartReapsChild(t *testing.T) {
 		child, err = start(ctx, worktree, port, quota)
 		return child, err
 	}
-	owner.ready = func(context.Context, int) error { return context.DeadlineExceeded }
+	owner.ready = func(context.Context, int, int) error { return context.DeadlineExceeded }
 	_, err := owner.ensureRecord(t.Context(), root)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.NotNil(t, child)
@@ -381,7 +382,7 @@ func TestGuardianRealGoplsTelemetrySuppressed(t *testing.T) {
 			assert.Fail(t, "real gopls group did not exit")
 		}
 	})
-	require.NoError(t, awaitReady(ctx, port))
+	require.NoError(t, awaitReady(ctx, port, child.Process.Pid))
 	out, err := exec.CommandContext(ctx, lsof, "-n", "-P", "-F", "n", "-p", strconv.Itoa(child.Process.Pid)).Output()
 	require.NoError(t, err)
 	require.NotContains(t, string(out), "/telemetry/", "counter files must not be opened")
@@ -417,6 +418,26 @@ func TestGuardianRealGoPrivateTelemetryMode(t *testing.T) {
 }
 
 func TestAuditRealGoplsHotRestart(t *testing.T) {
+	auditRealGoplsHotRestart(t, "", "")
+}
+
+func TestAuditRealGoplsReleaseUpgrade(t *testing.T) {
+	original := os.Getenv("GOPLS_MANAGER_RELEASE_BINARY")
+	if original == "" {
+		t.Skip("set GOPLS_MANAGER_RELEASE_BINARY to a shipped manager executable")
+	}
+	require.True(t, filepath.IsAbs(original))
+	auditRealGoplsHotRestart(t, original, "")
+}
+
+func TestAuditRealGoplsHandoffProcessDeaths(t *testing.T) {
+	for _, point := range []string{"before-successor-ready", "after-owner-commit", "after-successor-commit"} {
+		t.Run(point, func(t *testing.T) { auditRealGoplsHotRestart(t, "", point) })
+	}
+}
+
+func auditRealGoplsHotRestart(t *testing.T, original, crash string) {
+	t.Helper()
 	binary, err := exec.LookPath(goplsBinary)
 	require.NoError(t, err)
 	require.NoError(t, guardianCheckGopls(binary))
@@ -430,38 +451,25 @@ func TestAuditRealGoplsHotRestart(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	original, updated := filepath.Join(binDir, "old"), filepath.Join(binDir, "new")
-	mainPath, err := filepath.Abs("main.go")
-	require.NoError(t, err)
-	mainSource, err := os.ReadFile(mainPath)
-	require.NoError(t, err)
-	// A killed test runner cannot run Cleanup. Bound the disposable binaries,
-	// including forked successors, without adding a production watchdog.
-	watchdogSource := "\nfunc init() { go func() { ctx, cancel := context.WithTimeout(context.Background(), 300_000_000_000); defer cancel(); <-ctx.Done(); os.Exit(124) }() }\n"
-	overlayMain := filepath.Join(binDir, "watchdog-main.go")
-	require.NoError(t, os.WriteFile(overlayMain, append(mainSource, watchdogSource...), 0o600))
-	overlay, err := json.Marshal(map[string]any{"Replace": map[string]string{mainPath: overlayMain}})
-	require.NoError(t, err)
-	overlayPath := filepath.Join(binDir, "overlay.json")
-	require.NoError(t, os.WriteFile(overlayPath, overlay, 0o600))
-	for _, build := range []struct {
-		path  string
-		flags []string
-	}{{original, nil}, {updated, []string{"-ldflags=-s -w"}}} {
-		args := append([]string{"build", "-overlay=" + overlayPath, "-o", build.path}, build.flags...)
-		out, err := exec.CommandContext(ctx, "go", append(args, ".")...).CombinedOutput()
-		require.NoError(t, err, "%s", out)
+	var hooks []auditHook
+	switch crash {
+	case "before-successor-ready":
+		hooks = []auditHook{{"restart.go", "if _, err := inherit.ready.Write(", `auditCrash("before-successor-ready")`}}
+	case "after-owner-commit":
+		hooks = []auditHook{{"restart.go", "committed = true", `auditCrash("after-owner-commit")`}}
+	case "after-successor-commit":
+		hooks = []auditHook{{"restart.go", "inherit.activated = true", `auditCrash("after-successor-commit")`}}
 	}
-	cacheJSON, err := exec.CommandContext(ctx, "go", "env", "-json", "GOCACHE", "GOMODCACHE", "GOPATH").Output()
-	require.NoError(t, err)
-	var cacheEnvironment map[string]string
-	require.NoError(t, json.Unmarshal(cacheJSON, &cacheEnvironment))
-	for name, value := range cacheEnvironment {
-		t.Setenv(name, value)
+	if original == "" {
+		original = filepath.Join(binDir, "old")
+		buildRuntimeAuditBinary(t, ctx, original, hooks)
 	}
-	t.Setenv("HOME", home)
-	m, err := newManager()
-	require.NoError(t, err)
+	updated := filepath.Join(binDir, "new")
+	buildRuntimeAuditBinary(t, ctx, updated, hooks, "-ldflags=-s -w")
+	marker := filepath.Join(home, "audit-crash")
+	t.Setenv("GOPLS_AUDIT_CRASH", crash)
+	t.Setenv("GOPLS_AUDIT_MARKER", marker)
+	m := useAuditHome(t, home)
 	owner := exec.CommandContext(ctx, original, "supervisor")
 	require.NoError(t, owner.Start())
 	ownerDone := make(chan error, 1)
@@ -547,12 +555,55 @@ func TestAuditRealGoplsHotRestart(t *testing.T) {
 	require.NoError(t, err)
 	_, err = input.Write(data[:len(data)/2])
 	require.NoError(t, err)
-	out, err := exec.CommandContext(ctx, updated, "reload", "--timeout=60s").CombinedOutput()
-	require.NoError(t, err, "%s", out)
+	timeout := "--timeout=60s"
+	if crash == "after-successor-commit" {
+		timeout = "--timeout=10s"
+	}
+	out, err := exec.CommandContext(ctx, updated, "reload", timeout).CombinedOutput()
 	var receipt restartReceipt
-	require.NoError(t, json.Unmarshal(out, &receipt))
-	require.NotEqual(t, owner.Process.Pid, receipt.PID)
-	require.NoError(t, <-ownerDone)
+	switch crash {
+	case "before-successor-ready":
+		require.Error(t, err)
+		require.Contains(t, string(out), "replacement failed before readiness")
+	case "after-owner-commit":
+		require.Error(t, err, "old owner died before sending a receipt")
+		require.Error(t, <-ownerDone)
+		require.Equal(t, 93, owner.ProcessState.ExitCode())
+		require.Eventually(t, func() bool {
+			snapshot, err := auditSnapshot(ctx, m)
+			if err != nil || snapshot.Restart.Active {
+				return false
+			}
+			receipt = restartReceipt{PID: snapshot.PID, Boot: snapshot.Boot}
+			return receipt.PID != owner.Process.Pid
+		}, 15*time.Second, 20*time.Millisecond)
+	case "after-successor-commit":
+		require.Error(t, err, "successor died after receiving commit")
+		require.NoError(t, <-ownerDone)
+	default:
+		require.NoError(t, err, "%s", out)
+		require.NoError(t, json.Unmarshal(out, &receipt))
+		require.NoError(t, <-ownerDone)
+	}
+	if crash != "" {
+		hit, err := os.ReadFile(marker)
+		require.NoError(t, err)
+		require.Equal(t, crash, string(hit))
+	}
+	if crash == "after-successor-commit" {
+		readCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		defer stop()
+		_, err := first.Read(readCtx)
+		require.Error(t, err)
+		require.False(t, errors.Is(err, context.DeadlineExceeded), "frontend remained paused")
+		require.Eventually(t, func() bool {
+			return withSupervisorSingleton(ctx, m, func() error { return nil }) == nil
+		}, 2*time.Second, 20*time.Millisecond, "handoff left the singleton locked")
+		expectAuditCleanup(t, m)
+		startAuditOwner(t, ctx, updated, m)
+		require.NoError(t, auditEnsure(ctx, m, root))
+		return
+	}
 	_, err = input.Write(append(data[len(data)/2:], '\n'))
 	require.NoError(t, err)
 	message, err := first.Read(ctx)
@@ -567,6 +618,14 @@ func TestAuditRealGoplsHotRestart(t *testing.T) {
 	require.Equal(t, int32(1), dials.Load(), "public HTTP connection was replaced")
 	after := mustReadMap(t, m.mapPath)
 	require.Len(t, after, 2)
+	if crash == "before-successor-ready" {
+		// The old owner has already drained and can start fresh generations.
+		snapshot, err := auditSnapshot(ctx, m)
+		require.NoError(t, err)
+		require.Equal(t, owner.Process.Pid, snapshot.PID)
+		return
+	}
+	require.NotEqual(t, owner.Process.Pid, receipt.PID)
 	for _, prior := range before {
 		for _, next := range after {
 			if prior.Worktree == next.Worktree {

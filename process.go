@@ -73,7 +73,10 @@ func (m *manager) logPath(worktree string) string {
 	return filepath.Join(filepath.Dir(m.mapPath), "gopls-mcp-logs", fmt.Sprintf("%x.log", hash[:8]))
 }
 
-func awaitReady(ctx context.Context, port int) error {
+func awaitReady(ctx context.Context, port, pid int) error {
+	if pid <= 0 {
+		return errors.New("cannot verify readiness without an owned child PID")
+	}
 	ctx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
 	// Backed off rather than polled flat: a gopls that binds 15ms after the fork
@@ -82,13 +85,49 @@ func awaitReady(ctx context.Context, port int) error {
 	// a handful of extra probes on a slow start and nothing on a failed one.
 	for wait := 10 * time.Millisecond; ctx.Err() == nil; wait = min(2*wait, 100*time.Millisecond) {
 		if alive, _ := endpointProbe(ctx, port); alive {
-			return nil
+			owned, err := ownsMCPListener(ctx, port, pid)
+			if err != nil {
+				return fmt.Errorf("verify gopls listener on %s: %w", mcpAddress(port), err)
+			}
+			if owned {
+				return nil
+			}
+			return fmt.Errorf("gopls child %d does not own the MCP listener on %s", pid, mcpAddress(port))
 		}
 		if err := waitContext(ctx, wait); err != nil {
 			break
 		}
 	}
 	return fmt.Errorf("gopls did not become ready on %s: %w", mcpAddress(port), ctx.Err())
+}
+
+func requireListenerCensus() error {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		return fmt.Errorf("lsof is required to verify the gopls listener: %w", err)
+	}
+	return nil
+}
+
+func ownsMCPListener(ctx context.Context, port, pid int) (bool, error) {
+	identity := strconv.Itoa(pid)
+	output, err := boundedCommandOutput(ctx, 4096, "lsof", "-n", "-P", "-w", "-a",
+		"-p", identity, "-iTCP@"+mcpAddress(port), "-sTCP:LISTEN", "-Fpf")
+	if err != nil {
+		var exit *exec.ExitError
+		if ctx.Err() == nil && !errors.Is(err, errCommandOutputLimit) && errors.As(err, &exit) &&
+			exit.ExitCode() == 1 && len(output) == 0 && len(exit.Stderr) == 0 {
+			return false, nil
+		}
+		return false, err
+	}
+	counts, err := parseOpenFiles(string(output))
+	if err != nil {
+		return false, err
+	}
+	if len(counts) != 1 || counts[pid] == 0 {
+		return false, errors.New("unexpected listener census")
+	}
+	return true, nil
 }
 
 const (

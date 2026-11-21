@@ -323,6 +323,13 @@ func TestRestartWireRejectsInvalidAndOversizedFrames(t *testing.T) {
 	}
 }
 
+func TestRestartCheckRequiresListenerCensus(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	var output bytes.Buffer
+	require.ErrorContains(t, runRestartCheck(&output), "lsof is required")
+	require.Empty(t, output.String())
+}
+
 func TestRestartCommandGrammarAndHTTPValidation(t *testing.T) {
 	t.Parallel()
 	for _, args := range [][]string{{"--timeout=0"}, {"--timeout=2h"}, {"--binary=/tmp/no"}, {"extra"}, {"--unknown"}} {

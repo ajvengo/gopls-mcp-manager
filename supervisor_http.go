@@ -96,6 +96,9 @@ func runSupervisor(ctx context.Context, m *manager) error {
 		if _, err := supervisorConfig(m); err != nil {
 			return err
 		}
+		if err := requireListenerCensus(); err != nil {
+			return err
+		}
 		if err := guardianRecovery(ctx, guardianStateDir(m)); err != nil {
 			return err
 		}

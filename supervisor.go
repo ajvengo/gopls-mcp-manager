@@ -335,7 +335,7 @@ type supervisor struct {
 	estimateQuota     func(context.Context, watchPlan, int) watchFDQuota
 	validateToolchain func(context.Context, string) error
 	start             func(context.Context, string, int, int) (*guardianChild, error)
-	ready             func(context.Context, int) error
+	ready             func(context.Context, int, int) error
 	updateRecords     func(context.Context, func([]record) ([]record, error)) ([]record, error)
 	portBusy          func(int) bool
 	restart           restartState
@@ -744,7 +744,7 @@ func (s *supervisor) prepareGeneration(ctx context.Context, g *ownedGeneration) 
 		return err
 	}
 	defer s.m.timed("readiness", time.Now())
-	return s.ready(ctx, g.record.Port)
+	return s.ready(ctx, g.record.Port, g.record.PID)
 }
 
 func (s *supervisor) observeGeneration(g *ownedGeneration) {

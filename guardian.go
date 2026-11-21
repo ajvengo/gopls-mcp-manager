@@ -303,16 +303,7 @@ func guardianRemoveRecord(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return syncGuardianDirectory(path)
-}
-
-func syncGuardianDirectory(path string) error {
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = dir.Close() }()
-	return dir.Sync()
+	return syncStateDirectory(filepath.Dir(path))
 }
 
 type guardianRow struct{ pid, parent, group int }
@@ -1122,11 +1113,8 @@ func guardianWriteRecord(path string, record guardianRecord) error {
 	if len(data) > guardianFrameBytes {
 		return errors.New("guardian record exceeds frame limit")
 	}
-	if err := replaceStateFile(path, ".guardian-*", func(file *os.File) error {
+	return replaceStateFile(path, ".guardian-*", func(file *os.File) error {
 		_, err := file.Write(data)
 		return err
-	}); err != nil {
-		return err
-	}
-	return syncGuardianDirectory(path)
+	})
 }

@@ -612,7 +612,7 @@ func TestSupervisorStartupFailureCleanup(t *testing.T) {
 				}
 				return &guardianChild{Process: &os.Process{Pid: 123}, ConfirmedDone: proof, Signal: func(os.Signal) error { signals.Add(1); close(proof); return nil }}, nil
 			}
-			s.ready = func(context.Context, int) error {
+			s.ready = func(context.Context, int, int) error {
 				if failure == "readiness" {
 					return io.ErrClosedPipe
 				}
@@ -690,7 +690,7 @@ func TestSupervisorConcurrentStartsReserveDistinctPorts(t *testing.T) {
 		stop := func(os.Signal) error { stopped.Do(func() { close(done) }); return nil }
 		return &guardianChild{Process: &os.Process{Pid: 123}, ConfirmedDone: done, Signal: stop, CloseOwner: func() error { return stop(syscall.SIGTERM) }}, nil
 	}
-	s.ready = func(context.Context, int) error { return nil }
+	s.ready = func(context.Context, int, int) error { return nil }
 	records := make(chan record, 3)
 	failures := make(chan error, 3)
 	for _, root := range []string{roots[0], roots[1], roots[0]} {
@@ -814,7 +814,7 @@ func TestSupervisorShutdownDuringStartCannotPublishReady(t *testing.T) {
 		<-release
 		return &guardianChild{Process: &os.Process{Pid: 123}, ConfirmedDone: proof, Signal: func(os.Signal) error { close(proof); return nil }}, nil
 	}
-	s.ready = func(context.Context, int) error { return nil }
+	s.ready = func(context.Context, int, int) error { return nil }
 	result := make(chan error, 1)
 	go func() { _, err := s.ensureRecord(t.Context(), t.TempDir()); result <- err }()
 	mustRecv(t, entered, "in-progress guardian start")
@@ -846,7 +846,7 @@ func TestSupervisorCancelledWaiterCannotCancelSharedStart(t *testing.T) {
 		<-release
 		return &guardianChild{Process: &os.Process{Pid: 123}, ConfirmedDone: proof, Signal: stop, CloseOwner: func() error { return stop(syscall.SIGTERM) }}, nil
 	}
-	s.ready = func(context.Context, int) error { return nil }
+	s.ready = func(context.Context, int, int) error { return nil }
 	waiter, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	first := make(chan error, 1)

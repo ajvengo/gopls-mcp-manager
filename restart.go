@@ -765,6 +765,9 @@ func (s *supervisor) forkReplacement(ctx context.Context, binary string, session
 }
 
 func runRestartCheck(output io.Writer) error {
+	if err := requireListenerCensus(); err != nil {
+		return err
+	}
 	m, err := newManager()
 	if err != nil {
 		return err

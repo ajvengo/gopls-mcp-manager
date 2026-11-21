@@ -285,7 +285,19 @@ func replaceStateFile(path, pattern string, write func(*os.File) error) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncStateDirectory(dir)
+}
+
+func syncStateDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	return dir.Sync()
 }
 
 func withFileLock(ctx context.Context, path string, fn func() error) error {
@@ -357,7 +369,8 @@ func (m *manager) withMap(ctx context.Context, body func([]record) ([]record, er
 			return err
 		}
 		if intact && slices.Equal(stored, updated) {
-			return nil
+			// A prior rename can be visible even if its directory sync failed.
+			return syncStateDirectory(filepath.Dir(m.mapPath))
 		}
 		return writeMap(m.mapPath, updated)
 	})
