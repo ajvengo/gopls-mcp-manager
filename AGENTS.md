@@ -8,7 +8,7 @@ This Go module provides one MCP endpoint backed by a gopls process per Git workt
 
 ## Build, Test, and Development Commands
 
-Use Go 1.27 as specified in `go.mod`. Runtime requires Git, Go and a Go-built gopls v0.23.0 or newer on `PATH`. CI exercises gopls v0.23.0 and v0.24.0 on Linux. Dependency hashes do not gate gopls startup. Selected Go toolchains must pass the private telemetry-off checks in SPEC P5.
+Use Go 1.27 as specified in `go.mod`. Runtime requires Git, Go, `lsof`, and a Go-built gopls v0.23.0 or newer on `PATH`. CI exercises gopls v0.23.0 and v0.24.0 on Linux. Dependency hashes do not gate gopls startup. Selected Go toolchains must pass the private telemetry-off checks in SPEC P5.
 
 - `go build .` builds the local command.
 - `go run . http 127.0.0.1:6099 /absolute/path/to/repo` starts the loopback HTTP MCP endpoint at `/mcp`.

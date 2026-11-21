@@ -111,7 +111,7 @@ func countWatchDescriptors(ctx context.Context, dir string, depth int, budget *w
 	if depth > maxWatchDepth {
 		return fmt.Errorf("FD preflight directory depth exceeds %d", maxWatchDepth)
 	}
-	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	f, err := os.OpenFile(dir, watchDirectoryOpenFlags, 0)
 	if err != nil {
 		return err
 	}
@@ -329,13 +329,13 @@ type supervisor struct {
 	closing           bool
 	filesystem        chan ownerFilesystemJob
 	sseBudget         *transport.Budget
-	frontends         *supervisorFrontends
+	frontends         supervisorFrontends
 	fdReserved        int
 	retainedBytes     int
 	estimateQuota     func(context.Context, watchPlan, int) watchFDQuota
 	validateToolchain func(context.Context, string) error
 	start             func(context.Context, string, int, int) (*guardianChild, error)
-	ready             func(context.Context, int) error
+	ready             func(context.Context, int, int) error
 	updateRecords     func(context.Context, func([]record) ([]record, error)) ([]record, error)
 	portBusy          func(int) bool
 	restart           restartState
@@ -356,7 +356,8 @@ func newSupervisor(ctx context.Context, m *manager) *supervisor {
 	ctx, abort := context.WithCancelCause(ctx)
 	s := &supervisor{ctx: ctx, m: m, boot: ownerNonce(), now: time.Now,
 		generations: make(map[string]*ownedGeneration), queued: make(map[*callState]ownerReservation),
-		operations: make(map[remoteKey]ownerOperation), controls: make(map[remoteKey]ownerOperation), filesystem: make(chan ownerFilesystemJob)}
+		operations: make(map[remoteKey]ownerOperation), controls: make(map[remoteKey]ownerOperation), filesystem: make(chan ownerFilesystemJob),
+		frontends: newSupervisorFrontends(m.limits)}
 	s.restart.abort = abort
 	s.sseBudget = transport.NewBudget(m.limits.SSEBytes)
 	s.fdReserved, _ = supervisorFDAllowance(m.limits) // Production validates before constructing the owner.
@@ -379,6 +380,11 @@ func newSupervisor(ctx context.Context, m *manager) *supervisor {
 		}
 	}()
 	return s
+}
+
+func newSupervisorFrontends(limits config.Limits) supervisorFrontends {
+	return supervisorFrontends{sessions: make(map[*restartSession]struct{}), backends: make(map[string]*supervisorHTTPBackend),
+		http: make(chan struct{}, min(limits.Session, limits.HTTPBytes/limits.MessageBytes))}
 }
 
 // An uncancellable filesystem syscall can retain this one global worker, never
@@ -738,7 +744,7 @@ func (s *supervisor) prepareGeneration(ctx context.Context, g *ownedGeneration) 
 		return err
 	}
 	defer s.m.timed("readiness", time.Now())
-	return s.ready(ctx, g.record.Port)
+	return s.ready(ctx, g.record.Port, g.record.PID)
 }
 
 func (s *supervisor) observeGeneration(g *ownedGeneration) {

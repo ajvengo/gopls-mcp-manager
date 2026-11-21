@@ -343,7 +343,7 @@ func TestReadinessProbeHonoursCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	err := awaitReady(ctx, silentPort(t))
+	err := awaitReady(ctx, silentPort(t), os.Getpid())
 	require.ErrorIsf(t, err, context.DeadlineExceeded, "readiness returned %v, want deadline exceeded", err)
 	elapsed := time.Since(start)
 	require.Lessf(t, elapsed, time.Second, "cancelled readiness took %s", elapsed)
@@ -984,6 +984,19 @@ func TestProbeDoesNotFollowRedirects(t *testing.T) {
 	require.Zero(t, reached.Load(), "readiness probe left its recorded endpoint")
 	require.False(t, alive)
 	require.False(t, conclusive, "a redirect is not proof that the shared process is gone")
+}
+
+func TestReadinessRequiresTheOwnedListener(t *testing.T) {
+	t.Parallel()
+	listener, port := listenLocal(t)
+	serveEndpoint(t, listener, 0)
+	child := exec.CommandContext(t.Context(), "/bin/sleep", "10")
+	require.NoError(t, child.Start())
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.ErrorContains(t, awaitReady(ctx, port, child.Process.Pid), "does not own the MCP listener")
+	require.NoError(t, awaitReady(ctx, port, os.Getpid()))
 }
 
 func TestProcessIdentityRejectsSubstringMatches(t *testing.T) {

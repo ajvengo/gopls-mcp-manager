@@ -184,13 +184,20 @@ func TestEndToEndHTTPServerLifecycle(t *testing.T) {
 
 func TestHTTPServerStartupErrors(t *testing.T) {
 	t.Parallel()
-	m := newTestManager(t)
-	owner := routerTestOwner(t, &m)
-	for _, address := range []string{"invalid", "0.0.0.0:0", "127.0.0.1:0"} {
-		t.Run(address, func(t *testing.T) {
+	owner := routerTestOwner(t, nil)
+	startError := errors.New("home gopls failed to start")
+	owner.start = func(context.Context, string, int, int) (*guardianChild, error) {
+		return nil, startError
+	}
+	for _, tc := range []struct{ address, want string }{
+		{"invalid", "missing port in address"},
+		{"0.0.0.0:0", "must listen on a loopback address"},
+		{"127.0.0.1:0", startError.Error()},
+	} {
+		t.Run(tc.address, func(t *testing.T) {
 			t.Parallel()
-			err := serveHTTP(t.Context(), owner, testHome, address, io.Discard)
-			require.Error(t, err, "invalid address or missing home server accepted")
+			err := serveHTTP(t.Context(), owner, testHome, tc.address, io.Discard)
+			require.ErrorContains(t, err, tc.want)
 		})
 	}
 }
@@ -278,7 +285,6 @@ func sseFixture(t testing.TB, worktrees ...string) (*supervisor, map[string]stri
 		listener, port := listenInAllocationRange(t, worktree)
 		upstream.Listener = listener
 		upstream.Start()
-		t.Cleanup(upstream.Close)
 		endpoints[worktree] = upstream.URL
 		ready, exited, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		close(ready)
@@ -291,11 +297,6 @@ func sseFixture(t testing.TB, worktrees ...string) (*supervisor, map[string]stri
 		go owner.observeGeneration(g)
 		records = append(records, g.record)
 	}
-	t.Cleanup(func() {
-
-		owner.shutdown()
-		require.Eventually(t, func() bool { return len(owner.snapshot().Generations) == 0 }, 5*time.Second, time.Millisecond)
-	})
 	mustWriteMap(t, m.mapPath, records)
 	return owner, endpoints, started, cancelled
 }

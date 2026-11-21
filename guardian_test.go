@@ -411,13 +411,16 @@ func TestGuardianStartFailureReleasesProvenUnstartedReservation(t *testing.T) {
 }
 
 func TestGuardianRecoveryDoesNotGuessFromDeadPIDs(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	require.NoError(t, guardianWriteRecord(filepath.Join(dir, "guardian-uncertain.json"), guardianRecord{Version: guardianProtocol}))
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
-	require.Error(t, guardianRecovery(ctx, dir))
-	require.NoError(t, guardianRecovery(t.Context(), filepath.Join(dir, "missing")))
+	bubble(t, func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, guardianWriteRecord(filepath.Join(dir, "guardian-uncertain.json"), guardianRecord{Version: guardianProtocol}))
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer cancel()
+		require.ErrorContains(t, guardianRecovery(ctx, dir), "reservation retained")
+		require.Zero(t, time.Since(start))
+		require.NoError(t, guardianRecovery(t.Context(), filepath.Join(dir, "missing")))
+	})
 }
 
 func TestGuardianConfigAndTelemetryPolicy(t *testing.T) {
@@ -591,22 +594,27 @@ func TestGuardianRecoveryKeepsPositivePIDAndLegacyUncertainty(t *testing.T) {
 	for _, test := range []struct {
 		name                           string
 		version, guardianPID, childPID int
+		wantError                      string
+		wait                           time.Duration
 	}{
-		{"guardian only", guardianProtocol, 1, 0},
-		{"child only", guardianProtocol, 0, 1},
-		{"legacy no lease", 1, 0, 0},
+		{"guardian only", guardianProtocol, 1, 0, "exit is unconfirmed", 20 * time.Millisecond},
+		{"child only", guardianProtocol, 0, 1, "exit is unconfirmed", 20 * time.Millisecond},
+		{"legacy no lease", 1, 0, 0, "reservation retained", 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			dir, token := t.TempDir(), rand.Text()
-			path := filepath.Join(dir, "guardian-"+token+".json")
-			require.NoError(t, guardianWriteRecord(path, guardianRecord{Version: test.version,
-				Token: token, Worktree: dir, Port: firstPort, MaxOpenFiles: 512,
-				GuardianPID: test.guardianPID, ChildPID: test.childPID}))
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-			defer cancel()
-			require.Error(t, guardianRecovery(ctx, dir))
-			require.FileExists(t, path, "no age or PID-liveness guess permits cleanup")
+			bubble(t, func(t *testing.T) {
+				dir, token := t.TempDir(), rand.Text()
+				path := filepath.Join(dir, "guardian-"+token+".json")
+				require.NoError(t, guardianWriteRecord(path, guardianRecord{Version: test.version,
+					Token: token, Worktree: dir, Port: firstPort, MaxOpenFiles: 512,
+					GuardianPID: test.guardianPID, ChildPID: test.childPID}))
+				start := time.Now()
+				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+				defer cancel()
+				require.ErrorContains(t, guardianRecovery(ctx, dir), test.wantError)
+				require.Equal(t, test.wait, time.Since(start))
+				require.FileExists(t, path, "no age or PID-liveness guess permits cleanup")
+			})
 		})
 	}
 }

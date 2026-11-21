@@ -96,6 +96,9 @@ func runSupervisor(ctx context.Context, m *manager) error {
 		if _, err := supervisorConfig(m); err != nil {
 			return err
 		}
+		if err := requireListenerCensus(); err != nil {
+			return err
+		}
 		if err := guardianRecovery(ctx, guardianStateDir(m)); err != nil {
 			return err
 		}
@@ -228,14 +231,9 @@ type supervisorHTTPBackend struct {
 
 type supervisorFrontends struct {
 	mu       sync.Mutex
-	sessions map[net.Conn]struct{}
+	sessions map[*restartSession]struct{}
 	backends map[string]*supervisorHTTPBackend
 	http     chan struct{}
-}
-
-func (s *supervisor) initializeFrontends() {
-	s.frontends = &supervisorFrontends{sessions: make(map[net.Conn]struct{}), backends: make(map[string]*supervisorHTTPBackend),
-		http: make(chan struct{}, min(s.m.limits.Session, s.m.limits.HTTPBytes/s.m.limits.MessageBytes))}
 }
 
 func supervisorConfig(m *manager) (string, error) {
@@ -422,7 +420,6 @@ func serveSupervisor(ctx context.Context, m *manager, listener net.Listener) err
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := newSupervisor(ctx, m)
-	s.initializeFrontends()
 	s.bindListener(listener)
 	if err := s.restoreRestartSessions(); err != nil {
 		return err
@@ -465,10 +462,10 @@ func (s *supervisor) serve() error {
 }
 
 func (s *supervisor) handler() http.Handler {
+	fingerprint, configErr := supervisorConfig(s.m)
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w = &httpReplyWriter{ResponseWriter: w}
-		fingerprint, err := supervisorConfig(s.m)
-		if err != nil {
+		if configErr != nil {
 			http.Error(w, "supervisor configuration cannot be encoded", http.StatusInternalServerError)
 			return
 		}
@@ -579,14 +576,13 @@ func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, ho
 		http.Error(w, "global supervisor session capacity reached", http.StatusServiceUnavailable)
 		return
 	}
-	// Reserve before initialization; replace the placeholder only after hijack.
-	reservation := &sessionReservationConn{}
-	s.frontends.sessions[reservation] = struct{}{}
+	session := &restartSession{home: home}
+	s.frontends.sessions[session] = struct{}{}
 	s.frontends.mu.Unlock()
 	defer func() {
-		s.frontends.mu.Lock()
-		delete(s.frontends.sessions, reservation)
-		s.frontends.mu.Unlock()
+		if session.peer == nil {
+			s.removeFrontend(session)
+		}
 	}()
 	if err := s.validateHome(req.Context(), home); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -608,30 +604,21 @@ func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, ho
 	if err := buffered.Flush(); err != nil {
 		return
 	}
-	s.frontends.mu.Lock()
-	delete(s.frontends.sessions, reservation)
-	s.frontends.sessions[conn] = struct{}{}
-	s.frontends.mu.Unlock()
-	defer func() {
-		s.frontends.mu.Lock()
-		delete(s.frontends.sessions, conn)
-		s.frontends.mu.Unlock()
-	}()
-	session := &restartSession{peer: newRestartPeer(s.ctx, conn, buffered.Reader, s.m.limits.MessageBytes, false), home: home}
 	if req.URL.Path != "/http-frontend" {
 		session.router = newRouter(s.ctx, s, home)
 	}
-	unregister := s.registerRestartSession(session)
-	defer unregister()
+	s.frontends.mu.Lock()
+	session.peer = newRestartPeer(s.ctx, conn, buffered.Reader, s.m.limits.MessageBytes, false)
+	s.frontends.mu.Unlock()
 	release()
 	s.runRestartSession(session)
 }
 
-// Unique comparable identity for an admission in progress, without allocating
-// an OS descriptor. Never used for I/O.
-type sessionReservationConn struct{ net.Conn }
-
-func (*sessionReservationConn) Close() error { return nil }
+func (s *supervisor) removeFrontend(session *restartSession) {
+	s.frontends.mu.Lock()
+	delete(s.frontends.sessions, session)
+	s.frontends.mu.Unlock()
+}
 
 func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string) {
 	s.frontends.mu.Lock()
@@ -642,10 +629,7 @@ func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string)
 		return
 	}
 	if entry != nil && entry.failed() {
-		retire := entry.active == 0
-		if retire {
-			entry.retiring = true
-		}
+		retire := entry.active == 0 && entry.claimRetirement(nil)
 		s.frontends.mu.Unlock()
 		if retire {
 			go s.closeHTTPBackend(home, entry)
@@ -672,10 +656,7 @@ func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string)
 		if !failed {
 			entry.lastUsed = s.now()
 		}
-		retire := failed && entry.active == 0 && !entry.retiring
-		if retire {
-			entry.retiring = true
-		}
+		retire := failed && entry.active == 0 && entry.claimRetirement(nil)
 		s.frontends.mu.Unlock()
 		if retire {
 			go s.closeHTTPBackend(home, entry)
@@ -699,21 +680,23 @@ func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string)
 	}
 }
 
-// Backend publication is synchronized by ready. A canceled router cannot be
-// revived by refreshing the entry's idle timestamp with another failed request.
-func (entry *supervisorHTTPBackend) failed() bool {
+func (entry *supervisorHTTPBackend) published() bool {
 	select {
 	case <-entry.ready:
-		return entry.err != nil || entry.backend != nil && entry.backend.r.ctx != nil && entry.backend.r.ctx.Err() != nil
+		return true
 	default:
 		return false
 	}
 }
 
+func (entry *supervisorHTTPBackend) failed() bool {
+	return entry.published() && (entry.err != nil || entry.backend != nil && entry.backend.r.ctx != nil && entry.backend.r.ctx.Err() != nil)
+}
+
 func (s *supervisor) initializeHTTPBackend(home string, entry *supervisorHTTPBackend) {
+	defer close(entry.ready)
 	if err := s.validateHome(s.ctx, home); err != nil {
 		entry.err = err
-		close(entry.ready)
 		return
 	}
 	b := newHTTPBackend(s.ctx, s, home)
@@ -725,24 +708,37 @@ func (s *supervisor) initializeHTTPBackend(home string, entry *supervisorHTTPBac
 		entry.err = err
 		b.close()
 	}
-	close(entry.ready)
 }
 
 func (s *supervisor) retireHTTPBackends() {
 	s.frontends.mu.Lock()
+	retired := s.claimHTTPBackendsLocked(func(entry *supervisorHTTPBackend) bool {
+		return entry.active == 0 && (entry.failed() || s.now().Sub(entry.lastUsed) >= s.m.limits.Idle)
+	})
+	s.frontends.mu.Unlock()
+	s.closeHTTPBackends(retired)
+}
+
+// Frontends.mu serializes the claim with other retirement and admission paths.
+func (entry *supervisorHTTPBackend) claimRetirement(eligible func(*supervisorHTTPBackend) bool) bool {
+	if entry.retiring || !entry.published() || eligible != nil && !eligible(entry) {
+		return false
+	}
+	entry.retiring = true
+	return true
+}
+
+func (s *supervisor) claimHTTPBackendsLocked(eligible func(*supervisorHTTPBackend) bool) map[string]*supervisorHTTPBackend {
 	retired := make(map[string]*supervisorHTTPBackend)
 	for home, entry := range s.frontends.backends {
-		select {
-		case <-entry.ready:
-		default:
-			continue
-		}
-		if !entry.retiring && entry.active == 0 && (entry.failed() || s.now().Sub(entry.lastUsed) >= s.m.limits.Idle) {
-			entry.retiring = true
+		if entry.claimRetirement(eligible) {
 			retired[home] = entry
 		}
 	}
-	s.frontends.mu.Unlock()
+	return retired
+}
+
+func (s *supervisor) closeHTTPBackends(retired map[string]*supervisorHTTPBackend) {
 	for home, entry := range retired {
 		s.closeHTTPBackend(home, entry)
 	}
@@ -764,27 +760,17 @@ func (s *supervisor) closeHTTPBackend(home string, entry *supervisorHTTPBackend)
 func (s *supervisor) closeFrontends() {
 	s.frontends.mu.Lock()
 	connections := make([]net.Conn, 0, len(s.frontends.sessions))
-	for conn := range s.frontends.sessions {
-		connections = append(connections, conn)
-	}
-	backends := make(map[string]*supervisorHTTPBackend)
-	for home, entry := range s.frontends.backends {
-		select {
-		case <-entry.ready:
-			if !entry.retiring {
-				entry.retiring = true
-				backends[home] = entry
-			}
-		default:
+	for session := range s.frontends.sessions {
+		if session.peer != nil {
+			connections = append(connections, session.peer.conn)
 		}
 	}
+	backends := s.claimHTTPBackendsLocked(nil)
 	s.frontends.mu.Unlock()
 	for _, conn := range connections {
 		_ = conn.Close()
 	}
-	for home, entry := range backends {
-		s.closeHTTPBackend(home, entry)
-	}
+	s.closeHTTPBackends(backends)
 }
 
 func (s *supervisor) maintenance() {

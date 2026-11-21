@@ -109,9 +109,10 @@ inherited descriptors so guardians and gopls cannot retain the singleton lock.
 
 The checkpoint is bounded to 8 MiB. Public stdio framing, partial input and batch
 correlation remain in persistent frontend relays; home, initialization and sticky
-routing are restored in the successor. HTTP frontend listeners remain open, and
-their idle private HTTP connections are discarded before transfer. New calls
-can wait through the pause under their original deadlines.
+routing are restored in the successor. In-progress attachments hold capacity and
+must publish a live peer or release their reservation before the restart snapshot.
+HTTP frontend listeners remain open. Idle private HTTP connections are
+discarded before transfer. New calls keep their original deadlines.
 
 A hot restart reserves both owner footprints and descriptor-transfer headroom.
 An inherited pipe whose write descriptor remains live until old-process exit
@@ -135,6 +136,7 @@ transfer and EOF.
 `TestRestartRestoresInitializedStickySession`,
 `TestRestartRefusesUnconfirmedWorkAndResumesClients`,
 `TestRestartPreflightLeavesHealthyGenerationsReady`,
+`TestRestartWaitsForPendingFrontendReservation`,
 `TestRestartWaitsForStartingGeneration`,
 `TestRestartWaitsForUpstreamWriteWithoutCredit`,
 `TestRestartRechecksAfterHTTPBackendTeardown`,
@@ -463,8 +465,11 @@ owner metadata parse but require offline reconciliation (O6); they are not
 adopted. `Uses` and `UsedAt` are retained legacy fields, unused for admission or
 retirement.
 
-M1. Set mode 0600 on a same-directory temporary file, write and fsync it, then
-rename atomically.
+M1. Set mode 0600 on a same-directory temporary file, write and fsync it, rename
+atomically, then fsync the containing directory. A post-rename sync failure may
+leave new contents visible. An unchanged transaction also syncs the directory
+before reporting success so it can complete an earlier failed publication.
+→ `TestAuditRealGoplsRegistryCrashBoundaries`
 
 M2. Registry transactions use exclusive `<map>.lock` flock with cancellable,
 nonblocking acquisition; a separate lifetime lock excludes competing owners.
@@ -547,10 +552,14 @@ read. Strict JSON and manifest identity validation run before reconciliation.
 → `TestGuardianLeaseAndManifestFIFOsAreRefused`,
 `TestGuardianPreForkCrashReconcilesOnlyAfterLeaseRelease`
 
-P2. Readiness polls for up to ten seconds, backing off 10–100 ms, outside owner mutex
-and registry lock. Callers for one worktree share the same start; cancelling a
-waiter cannot cancel it or signal another caller's process.
+P2. Readiness polls for an SSE response for up to ten seconds, backing off
+10–100 ms, outside the owner mutex and registry lock. A bounded `lsof` census
+must then show that the launched child listens on the assigned loopback port.
+Failure or a different listener fences the generation before admission.
+Callers for one worktree share the same start. Cancelling a waiter leaves the
+shared start running.
 → `TestReadinessProbeHonoursCancellation`,
+`TestReadinessRequiresTheOwnedListener`,
 `TestSupervisorTwoBridgesAndHTTPShareAndReconnectAfterIdle`
 
 P2a. Spawned generations failing publication/readiness clean up through the
@@ -618,9 +627,10 @@ worker before write. Global telemetry, HOME and GOTOOLCHAIN are preserved.
 - Ignored SIGTERM leaves a visible record and blocks that worktree's replacement.
   Only owned failed-child cleanup has bounded escalation; signals use guardians.
 - Loopback clients/listeners and private state/ancestors are trusted.
-  Bind-and-close port selection does not authenticate the eventual listener, and
-  diagnostic command lines can be spoofed. Arbitrary escaped descendants cannot
-  be universally contained by POSIX process groups.
+  The listener census checks ownership at readiness. Later dials use the
+  trusted loopback address. The guardian can signal the anchored group and
+  recognize census-visible escapes. Already reparented descendants can evade
+  the census.
 - Old binaries ignore Terminating. Upgrade all writers sharing the map before
   relying on termination retention; mixed-version safety is not promised.
 - Paths must be valid UTF-8 to round-trip through JSON. → `FuzzMapRoundTrip`
@@ -784,7 +794,7 @@ before the resources they used are released.
 | SSE frames | Shared 64 MiB allocated capacity; 4 MiB complete event/POST | Frame release/Close | Decoded results transfer to retained-message accounting; decoder/GC peaks are additional |
 | FDs | Owner transport/control formula; watched-tree count +256 child +64 guardian/observer headroom per generation | Clean unstarted failure or confirmed retirement; owner/child RLIMIT_NOFILE | No universal descendant/RSS/watch-memory bound; exhaustion fails admission |
 | Watch plans | ≤generation-cap keys; 100k entries, 32 MiB names/paths, depth 128, 4096 roots, 16384 partials; metadata 256 files/16 MiB; filters 1024/1 MiB | Replacement per generation; prune on confirmed exit; never publish an incomplete plan | Mutation may invalidate views; uncertainty preserves generation until a complete verdict |
-| Registry | One read/temp FD per operation; 4 MiB/4001 lines/64 KiB scanner token | Close/unlink/atomic rename; failure preserves prior contents and forbids uncertain-row probing/signals | fsync/rename may block; crash may leave temp inode; ancestors trusted |
+| Registry | One read/temp FD per operation; 4 MiB/4001 lines/64 KiB scanner token | Atomic rename and directory sync; failures retain generation/FD charges | A post-rename failure can leave a visible update; crash may leave a temp inode; ancestors are trusted |
 | Locks/manifests | Stable lifetime/action names over 4001 ports; bounded recovery scan | FD close; retain lock inodes; remove manifests only on proof | Old lock/temp files need offline cleanup; no PID/age fallback |
 | Logs | One global worker; 128 jobs/≤1 MiB allocated queued+active payload; owner 64 MiB disk/≤server-cap+1 files | Bounded retention, serialized append, confirmed release; one terminal failure channel | Active-append counters approximate; mutation checks cover touched files; sole managed writer required |
 | Helpers | Stdout 64 KiB/4 MiB, stderr 64 KiB, derived deadline, 250 ms pipe-wait delay | Cancel/reap direct child on error/overflow; reject partial snapshots | Escaped grandchildren need OS containment |
@@ -797,6 +807,5 @@ lock waits. Boundary tests cover corrupt/nonregular input and uncertain process
 identity. See the [verification plan](README.md#verify-correctness) and
 [runtime conformance mapping](formal/README.md#runtime-conformance).
 
-Record native Linux/macOS results and owner coverage against the source revision.
-Default-duration zero-client checks and 24h/72h soaks remain pending. Keep audit
-artifacts under `~/.codex/artifacts/gopls-audit/`.
+Record default-duration idle, Linux suspend and 24h/72h soak results by
+revision. See the [native audit commands](README.md#native-runtime-audits).

@@ -46,6 +46,9 @@ const (
 	watchDirectoryBatch   = 128
 )
 
+// Filtered and quota walks must refuse directories replaced by FIFO or symlink.
+const watchDirectoryOpenFlags = os.O_RDONLY | syscall.O_NONBLOCK | syscall.O_DIRECTORY | syscall.O_NOFOLLOW
+
 var errWatchLimit = errors.New("roots planning resource limit exceeded")
 
 type watchLimits struct {
@@ -95,21 +98,11 @@ func (b *watchBudget) readDir(dir, rel string, depth int) ([]os.DirEntry, error)
 	if depth > b.remaining.depth {
 		return nil, fmt.Errorf("%w: directory depth", errWatchLimit)
 	}
-	// The enumerated directory may have become a FIFO or symlink before
-	// recursion. Check the opened descriptor, with flags that cannot park on
-	// a FIFO and cannot follow a replacement out of the enumerated tree.
-	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(dir, watchDirectoryOpenFlags, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() {
-		return nil, syscall.ENOTDIR
-	}
 	var entries []os.DirEntry
 	for {
 		batch, err := f.ReadDir(watchDirectoryBatch)
@@ -199,8 +192,11 @@ func pathIncludeFunc(rules []string) (func(string) bool, error) {
 			return nil, err
 		}
 	}
-	matchers := make([]*regexp.Regexp, 0, len(rules))
-	included := make([]bool, 0, len(rules))
+	type matcher struct {
+		pattern *regexp.Regexp
+		include bool
+	}
+	matchers := make([]matcher, 0, len(rules))
 	for _, rule := range rules {
 		if !usableFilterRule(rule) {
 			continue
@@ -220,22 +216,20 @@ func pathIncludeFunc(rules []string) (func(string) bool, error) {
 			}
 			pattern = b.String()
 		}
-		matcher, err := regexp.Compile(pattern)
+		compiled, err := regexp.Compile(pattern)
 		if err != nil {
 			continue
 		}
-		matchers = append(matchers, matcher)
-		included = append(included, rule[0] == '+')
+		matchers = append(matchers, matcher{pattern: compiled, include: rule[0] == '+'})
 	}
 	return func(rel string) bool {
 		rel = "/" + strings.Trim(rel, "/") + "/"
-		include := true
-		for i, m := range matchers {
-			if m.MatchString(rel) {
-				include = included[i]
+		for _, rule := range slices.Backward(matchers) {
+			if rule.pattern.MatchString(rel) {
+				return rule.include
 			}
 		}
-		return include
+		return true
 	}, nil
 }
 

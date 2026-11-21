@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -90,7 +91,6 @@ type restartState struct {
 	closed        bool // refuses new frontend attachments and /ensure
 	admissions    int
 	failure       string
-	sessions      map[net.Conn]*restartSession
 	listener      net.Listener
 	slots         chan struct{}
 	committed     chan struct{}
@@ -100,7 +100,7 @@ type restartState struct {
 }
 
 type restartSession struct {
-	peer   *restartPeer
+	peer   *restartPeer // nil until the charged attachment completes the hijack
 	router *router
 	home   string
 }
@@ -284,12 +284,7 @@ func (s *supervisor) restartQuiescent() (bool, error) {
 	s.frontends.mu.Lock()
 	defer s.frontends.mu.Unlock()
 	for _, entry := range s.frontends.backends {
-		select {
-		case <-entry.ready:
-		default:
-			return false, nil
-		}
-		if entry.active != 0 || entry.retiring {
+		if !entry.published() || entry.active != 0 || entry.retiring {
 			return false, nil
 		}
 	}
@@ -369,17 +364,8 @@ func (s *supervisor) frontendAdmission() (func(), bool) {
 	return func() { s.restart.mu.Lock(); s.restart.admissions--; s.restart.mu.Unlock() }, true
 }
 
-func (s *supervisor) registerRestartSession(session *restartSession) func() {
-	s.restart.mu.Lock()
-	if s.restart.sessions == nil {
-		s.restart.sessions = make(map[net.Conn]*restartSession)
-	}
-	s.restart.sessions[session.peer.conn] = session
-	s.restart.mu.Unlock()
-	return func() { s.restart.mu.Lock(); delete(s.restart.sessions, session.peer.conn); s.restart.mu.Unlock() }
-}
-
 func (s *supervisor) runRestartSession(session *restartSession) {
+	defer s.removeFrontend(session)
 	peer := session.peer
 	peer.start()
 	defer func() { _ = peer.Close() }()
@@ -508,11 +494,10 @@ func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (re
 	if err := restartWait(ctx, s.restartQuiescent); err != nil {
 		return restartReceipt{}, err
 	}
-	s.restart.mu.Lock()
-	for _, session := range s.restart.sessions {
-		sessions = append(sessions, session)
-	}
-	s.restart.mu.Unlock()
+	// Closed admission and zero in-flight admissions make every entry live.
+	s.frontends.mu.Lock()
+	sessions = slices.Collect(maps.Keys(s.frontends.sessions))
+	s.frontends.mu.Unlock()
 	quiet := func() error {
 		ready, err := s.restartQuiescent()
 		if err == nil && !ready {
@@ -534,21 +519,15 @@ func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (re
 	// HTTP has no public session state. Retire its idle internal routers before
 	// stopping generations, so no retained cache can race the checkpoint.
 	s.frontends.mu.Lock()
-	backends := make(map[string]*supervisorHTTPBackend)
 	for _, entry := range s.frontends.backends {
-		if entry.active != 0 || entry.retiring {
+		if !entry.published() || entry.active != 0 || entry.retiring {
 			s.frontends.mu.Unlock()
 			return restartReceipt{}, fmt.Errorf("HTTP backend is still active or retiring")
 		}
 	}
-	for home, entry := range s.frontends.backends {
-		entry.retiring = true
-		backends[home] = entry
-	}
+	backends := s.claimHTTPBackendsLocked(nil)
 	s.frontends.mu.Unlock()
-	for home, entry := range backends {
-		s.closeHTTPBackend(home, entry)
-	}
+	s.closeHTTPBackends(backends)
 	worktrees, err := s.drainRestartGenerations(ctx)
 	if err != nil {
 		return restartReceipt{}, err
@@ -785,6 +764,9 @@ func (s *supervisor) forkReplacement(ctx context.Context, binary string, session
 }
 
 func runRestartCheck(output io.Writer) error {
+	if err := requireListenerCensus(); err != nil {
+		return err
+	}
 	m, err := newManager()
 	if err != nil {
 		return err
@@ -926,8 +908,9 @@ func (s *supervisor) restoreRestartSessions() error {
 			}
 			session.router = r
 		}
-		s.frontends.sessions[conn] = struct{}{}
-		s.registerRestartSession(session)
+		s.frontends.mu.Lock()
+		s.frontends.sessions[session] = struct{}{}
+		s.frontends.mu.Unlock()
 		sessions = append(sessions, session)
 	}
 	inherit.checkpoint.Sessions, inherit.files = nil, nil
@@ -949,7 +932,7 @@ func (s *supervisor) restoreRestartSessions() error {
 	s.restart.active, s.restart.closed, s.restart.blockHTTP = true, true, true
 	s.restart.mu.Unlock()
 	for _, session := range sessions {
-		go s.runRestoredSession(session)
+		go s.runRestartSession(session)
 	}
 	previous := s.awaitPreviousOwner(reserve)
 	go func() {
@@ -980,18 +963,6 @@ func (s *supervisor) restoreRestartSessions() error {
 		s.resumeAfterRestart(sessions, err, true)
 	}()
 	return nil
-}
-
-func (s *supervisor) runRestoredSession(session *restartSession) {
-	defer func() {
-		s.restart.mu.Lock()
-		delete(s.restart.sessions, session.peer.conn)
-		s.restart.mu.Unlock()
-		s.frontends.mu.Lock()
-		delete(s.frontends.sessions, session.peer.conn)
-		s.frontends.mu.Unlock()
-	}()
-	s.runRestartSession(session)
 }
 
 func (r *router) startUpstreamReader(conn mcp.Connection, worktree string) {

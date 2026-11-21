@@ -36,6 +36,7 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - run: sudo apt-get update && sudo apt-get install -y lsof
       - name: Install pinned GitButler CLI for native fixtures
         run: |
           curl --fail --silent --show-error --location https://gitbutler.com/install.sh --output "${{ runner.temp }}/install-but.sh"
@@ -50,9 +51,12 @@ jobs:
       - run: python3 scripts/check_coverage.py "${{ runner.temp }}/coverage.out" --minimum 85
       - name: Verify supported gopls releases
         run: |
+          GOBIN="${{ runner.temp }}/manager-release" go install github.com/ajvengo/gopls-mcp-manager@v0.2.2
+          export GOPLS_MANAGER_RELEASE_BINARY="${{ runner.temp }}/manager-release/gopls-mcp-manager"
+          export GOPLS_MANAGER_RUNTIME_AUDIT=smoke
           for version in v0.23.0 v0.24.0; do
             go install "golang.org/x/tools/gopls@$version"
-            go test -race -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
+            go test -race -count=1 -tags=integration -run '^Test(EndToEndRealGopls|AuditRealGopls.*|GuardianReal.*)$' -timeout=3m .
           done
 
   lint:

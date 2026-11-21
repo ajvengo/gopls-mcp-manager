@@ -214,11 +214,11 @@ those boundaries. The checked refinements relate models to each other.
 | Signals require owned identity; TERM is not exit | `startOwnedGuardian`, `guardianChild.Signal`, `guardianController`, `runGuardian`, `supervisor.terminate`, `fenceUncertain` | Guardian OS tests and `TestGuardianCleanupProofDoesNotReleaseBeforeGuardianExit` distinguish child/group proof from guardian Wait. Unexpected guardian EOF/death is uncertainty |
 | No slot/FD refund while startup ownership uncertain | `guardianStartError.Released`, stable port lifetime lease, `startOwnedGuardian`, `supervisor.maintenanceSweep`, `confirmExited` | `TestGuardianPartialStartReturnsRetainedCapacityContract`, `TestGuardianPreForkCrashReconcilesOnlyAfterLeaseRelease`, `TestGuardianInheritedLifetimeLeaseSurvivesParentCopyClosing` |
 | Boot/session fencing and conservative restart | `ownerNonce`, `startGeneration`, `connection`, `available`; private versioned Unix owner endpoint; `withSupervisorSingleton`, `guardianRecovery`, `validateOwnerRegistry` | `TestSupervisorProtocolAndConfigMismatchFailBeforeAllocation`, `TestGuardianRecoveryKeepsPositivePIDAndLegacyUncertainty`; a complete two-owner stale-session/crash-window runtime matrix remains a separate integration obligation |
-| Storage errors cannot erase reservations | `supervisor.terminate` persists matching boot/generation before signal; `confirmExited` retains generation/FD quota until registry removal succeeds | `TestSupervisorCorruptRegistryNeverLosesReservations` covers malformed storage. Native injected failures at every registry/manifest fsync/rename boundary are not established by TLC stuttering |
+| Storage errors cannot erase reservations | `supervisor.terminate` persists matching boot/generation before signal; `confirmExited` retains generation/FD quota until registry removal and directory sync succeed | `TestSupervisorCorruptRegistryNeverLosesReservations` covers malformed storage. `TestAuditRealGoplsRegistryCrashBoundaries` and `TestAuditRealGoplsLifecycleCrashBoundaries` cover process death and a failed directory-sync retry |
 | Finite FD allocation | `supervisorFDAllowance`, `reserveGenerationFDs`, `countWatchDescriptors`, child RLIMIT and guardian allowance | Runtime budget/OS pressure tests must establish the concrete bounds; `ReservationCore` proves only abstract retained-slot containment |
 | Payload and ID ownership independent of operation credits | `validOwnerID`, `reserveMessageBytes`, `retainMessage`, `releaseMessage`, `releaseRetainedMessages`, `writeToClient` | `FuzzRetainedPayloadAccounting` compares actual queue credits and bytes with an ownership ledger. `TestSupervisorCancellationDoesNotRefundQueuedPayload`, `TestSupervisorBlockedWriterKeepsPayloadChargedAcrossChurn` and `TestSupervisorOpaqueIDBoundaryAndControls` check production boundaries |
 | HTTP cold-queue teardown releases retained payloads | `httpBackend.start`, `httpBackend.close` | `TestHTTPBackendShutdownReleasesColdQueue` checks cancel and discard of active and queued cold calls before backend close returns |
-| Hot restart exit proof and admission fence | `restoreRestartSessions`, `awaitPreviousOwner`, `resumeAfterRestart`, `frontendAdmission`, `restartHTTPBlocked` | `TestRestartPreviousOwnerReservationRequiresEOF` and `TestRestartHandoffFailsWithoutPreviousOwnerExit` check EOF and fail-closed handoff. `TestRestartReopensAdmissionAfterPeerResumeSettles` checks resume order and `TestRestartNativeForkExecPreservesAttachmentAndLock` checks native transfer |
+| Hot restart exit proof and admission fence | `restoreRestartSessions`, `awaitPreviousOwner`, `resumeAfterRestart`, `frontendAdmission`, `restartHTTPBlocked` | `TestRestartWaitsForPendingFrontendReservation` checks the attachment snapshot fence. `TestRestartPreviousOwnerReservationRequiresEOF` and `TestRestartHandoffFailsWithoutPreviousOwnerExit` check EOF and fail-closed handoff. `TestRestartReopensAdmissionAfterPeerResumeSettles` checks resume order and `TestRestartNativeForkExecPreservesAttachmentAndLock` checks native transfer |
 | Server requests/handshakes share protection/accounting | `supervisor.serverControl`, `ownedUpstream.Write`, `Read` | `TestSupervisorOpaqueIDBoundaryAndControls`, `TestSupervisorUnknownOrFailedControlCannotRefreshIdle`; finite accounting model omits these message classes |
 | One bounded shared filesystem worker | `ownerFilesystemCall`, `supervisor.filesystem`, `router.lookupWorktrees`, `router.planRoots`, `router.answerRoots`, `ownedUpstream.Write` | `TestSupervisorSharedFilesystemWorkerSurvivesSessionChurnBoundedly` and `TestRoutingBudgetDoesNotMultiplyOrGrowWorkers` simulate a worker held by an uncancellable syscall |
 
@@ -261,13 +261,12 @@ intervals and critical sections that implement the abstract actions.
   must cover resource arithmetic, decoded amplification, blocked workers and
   long-run map, log, inode, heap and goroutine retention.
 
-Runtime release checks still need native FD/process pressure, crash injection
-at every durable boundary, and a default-idle run beyond 70 minutes including
-suspend/resume. The named regressions cover active-work and grace boundaries.
-Ignored TERM with early slot reuse, delayed responses through replacement,
-and crash/storage interleavings need broader runtime coverage. Conformance is
-reviewed against code and tests. The runner does not replay runtime traces
-against the models.
+[Native audits](../README.md#native-runtime-audits) cover resource pressure and
+process death at registry, generation and hot handoff checkpoints. Registry
+tests leave the filesystem online. Power loss, broader crash/storage
+interleavings and delayed responses through replacement need runtime evidence.
+Record default-idle, suspend and 24h/72h results by revision. The formal runner
+checks model traces. Runtime conformance is reviewed against code and tests.
 
 ## Tool pins and observed verification
 
