@@ -9,8 +9,9 @@ process per Git worktree. The manager starts processes on demand.
 go install github.com/ajvengo/gopls-mcp-manager@latest
 ```
 
-Building requires Go 1.27 or newer. Runtime requires Git, Go, and a Go-built
-`gopls` v0.23.0 or newer on `PATH`. CI exercises v0.23.0 and v0.24.0 on Linux.
+Building requires Go 1.27 or newer. Runtime requires Git, Go, `lsof`, and a
+Go-built `gopls` v0.23.0 or newer on `PATH`. CI exercises gopls v0.23.0 and
+v0.24.0 on Linux and tests hot upgrade from manager v0.2.2.
 The manager checks gopls' package identity and declared module version,
 without a dependency allowlist. Missing, invalid and `(devel)` versions fail.
 `list` and `status` do not need gopls to inspect retained state.
@@ -359,3 +360,28 @@ GOPLS_MANAGER_AUDIT_PROFILES=/tmp/gopls-audit-profiles go test -race -v -run '^T
 ```
 
 For worker, watch-plan and descriptor ceilings, see the [resource ledger](SPEC.md#resource-ledger).
+
+### Native runtime audits
+
+Use an absolute path to a shipped manager binary to test an upgrade. The audit
+suite also covers process death during handoff, registry writes and generation
+startup/cleanup, and native FD, socket and process pressure. Fixtures use private
+homes, sockets and repositories.
+
+```sh
+GOPLS_MANAGER_RELEASE_BINARY=/absolute/path/to/released-manager \
+  go test -race -count=1 -tags=integration -v -run '^TestAuditRealGopls' -timeout=3m .
+```
+
+Run extended trials on a disposable host or VM. Select `smoke` for seconds of
+traffic and same-owner restarts, `idle-smoke` for a two-second idle threshold
+with the native maintenance sweep, `idle` for 70+ minutes at the default idle
+threshold, or `24h` / `72h` for sustained traffic, restarts, and FD/RSS samples. `suspend`
+runs the idle trial on Linux and requires at least five seconds of actual
+host/VM suspension, detected through boot uptime. The harness leaves power
+control to the operator. Set the Go test deadline beyond the trial duration.
+
+```sh
+GOPLS_MANAGER_RUNTIME_AUDIT=smoke \
+  go test -race -tags=integration -v -run '^TestAuditRealGoplsSoak$' -timeout=3m .
+```
