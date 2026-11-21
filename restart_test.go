@@ -329,7 +329,6 @@ func TestRestartCommandGrammarAndHTTPValidation(t *testing.T) {
 		require.Error(t, restartCommand(args, false, io.Discard))
 	}
 	s := stateSupervisor(t)
-	s.initializeFrontends()
 	for _, body := range []string{"!", "{}", strings.Repeat("x", 4097), `{"Hot":true,"Binary":"relative","Timeout":1}`} {
 		req := httptest.NewRequest(http.MethodPost, "/restart", strings.NewReader(body))
 		require.NoError(t, ownerHeaders(req, s.m, ""))
@@ -450,7 +449,6 @@ func TestRestartRefusesUnconfirmedWorkAndResumesClients(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		g := readyTestGeneration(t, s, testHome)
 		conn := readyTestConnection(t, s, g)
 		r := newRouter(t.Context(), s, testHome)
@@ -470,7 +468,6 @@ func TestRestartRefusesUnconfirmedWorkAndResumesClients(t *testing.T) {
 func TestRestartPreflightLeavesHealthyGenerationsReady(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		healthy := readyTestGeneration(t, s, testHome)
 		upstream := readyTestConnection(t, s, healthy).(*ownedUpstream)
 		first := readyTestGeneration(t, s, "/uncertain")
@@ -499,7 +496,6 @@ func TestRestartPreflightLeavesHealthyGenerationsReady(t *testing.T) {
 func TestRestartWaitsForPendingFrontendReservation(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		running, unblock := make(chan struct{}), make(chan struct{})
 		defer close(unblock)
 		go func() {
@@ -543,7 +539,6 @@ func TestRestartWaitsForPendingFrontendReservation(t *testing.T) {
 func TestRestartWaitsForStartingGeneration(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		g := readyTestGeneration(t, s, testHome)
 		g.state = generationStarting
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -563,7 +558,6 @@ func TestRestartWaitsForStartingGeneration(t *testing.T) {
 func TestRestartWaitsForUpstreamWriteWithoutCredit(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		g := readyTestGeneration(t, s, testHome)
 		healthy := readyTestGeneration(t, s, testWorktree)
 		entered, release := make(chan struct{}), make(chan struct{})
@@ -606,7 +600,6 @@ func TestRestartRechecksAfterHTTPBackendTeardown(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			bubble(t, func(t *testing.T) {
 				s := stateSupervisor(t)
-				s.initializeFrontends()
 				s.m.limits.Idle = time.Millisecond
 				healthy := readyTestGeneration(t, s, testHome)
 				other := readyTestGeneration(t, s, testWorktree)
@@ -709,7 +702,6 @@ func TestRestartReopensAdmissionAfterPeerResumeSettles(t *testing.T) {
 func TestRestartCheckpointRefusesUnsupportedListener(t *testing.T) {
 	t.Parallel()
 	s := stateSupervisor(t)
-	s.initializeFrontends()
 	_, err := s.forkReplacement(t.Context(), "unused", nil, nil)
 	require.ErrorContains(t, err, "Unix listener")
 	a, b := net.Pipe()
@@ -791,7 +783,6 @@ func TestRestartPreviousOwnerReservationRequiresEOF(t *testing.T) {
 func TestRestartRefusesInsufficientHandoffBudget(t *testing.T) {
 	t.Parallel()
 	s := stateSupervisor(t)
-	s.initializeFrontends()
 	base, err := supervisorFDAllowance(s.m.limits)
 	require.NoError(t, err)
 	s.m.limits.OpenFiles = base
@@ -828,7 +819,6 @@ func TestRestartNativeForkExecPreservesAttachmentAndLock(t *testing.T) {
 		require.NoError(t, err)
 		defer m.closeRestartListener(listener, path)
 		s := newSupervisor(ctx, m)
-		s.initializeFrontends()
 		defer s.shutdown()
 		serveDone := make(chan error, 1)
 		s.bindListener(listener)
@@ -880,7 +870,6 @@ func TestRestartNativeForkExecPreservesAttachmentAndLock(t *testing.T) {
 func TestRestartFailedResumeReleasesPausedSession(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		a, b := net.Pipe()
 		owner := newRestartPeer(s.ctx, a, a, 4096, false)
 		frontend := newRestartPeer(s.ctx, b, b, 4096, true)
@@ -942,7 +931,6 @@ func TestRestartCommandRetriesStatusConnectionClosedDuringHandoff(t *testing.T) 
 func TestServeReportsUncommittedListenerClose(t *testing.T) {
 	t.Parallel()
 	s := stateSupervisor(t)
-	s.initializeFrontends()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	s.bindListener(listener)
@@ -964,7 +952,7 @@ func TestRestartHandoffFailsWithoutPreviousOwnerExit(t *testing.T) {
 				starts.Add(1)
 				return nil, errors.New("no gopls may start before previous-owner exit")
 			}
-			s.initializeFrontends()
+
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
 			defer func() { _ = listener.Close() }()
@@ -1012,7 +1000,6 @@ func TestRestartHandoffFailsWithoutPreviousOwnerExit(t *testing.T) {
 func TestServeReturnsAbortCause(t *testing.T) {
 	t.Parallel()
 	s := stateSupervisor(t)
-	s.initializeFrontends()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	s.bindListener(listener)

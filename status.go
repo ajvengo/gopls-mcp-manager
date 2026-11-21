@@ -67,11 +67,9 @@ func (s *supervisor) snapshot() supervisorSnapshot {
 		result.Generations = append(result.Generations, item)
 	}
 	s.mu.Unlock()
-	if s.frontends != nil {
-		s.frontends.mu.Lock()
-		result.Sessions = len(s.frontends.sessions) + len(s.frontends.backends)
-		s.frontends.mu.Unlock()
-	}
+	s.frontends.mu.Lock()
+	result.Sessions = len(s.frontends.sessions) + len(s.frontends.backends)
+	s.frontends.mu.Unlock()
 	if s.m.ownerLogs != nil {
 		logs := s.m.ownerLogs.Snapshot()
 		result.Logs = &logs

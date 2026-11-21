@@ -40,9 +40,9 @@ func TestSupervisorRetiringBackendKeepsCapacityUntilCloseCompletes(t *testing.T)
 		defer cancel()
 		m := &manager{limits: config.Default()}
 		m.limits.OwnerSessions = 1
-		s := &supervisor{ctx: ctx, m: m, now: time.Now, filesystem: make(chan ownerFilesystemJob)}
+		s := &supervisor{ctx: ctx, m: m, now: time.Now, filesystem: make(chan ownerFilesystemJob),
+			frontends: newSupervisorFrontends(m.limits)}
 
-		s.initializeFrontends()
 		closing, release, retired := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		var closes atomic.Int32
 		backend := &httpBackend{cancel: func() { closes.Add(1); close(closing) }, done: release, r: &router{}}
@@ -141,7 +141,6 @@ func TestSupervisorProxyExecutionFollowsCallerBudget(t *testing.T) {
 func TestSupervisorFailedHTTPBackendRetiresDespiteRecentUse(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		backend := newHTTPBackend(s.ctx, s, testHome)
 		backend.start()
 		backend.cancel()
@@ -159,7 +158,6 @@ func TestSupervisorFailedHTTPBackendRetiresDespiteRecentUse(t *testing.T) {
 func TestSupervisorFailedHTTPBackendKeepsCapacityUntilActiveHandlersFinish(t *testing.T) {
 	bubble(t, func(t *testing.T) {
 		s := stateSupervisor(t)
-		s.initializeFrontends()
 		backend := newHTTPBackend(s.ctx, s, testHome)
 		backend.start()
 		ready := make(chan struct{})
@@ -301,7 +299,9 @@ func TestSupervisorConfigurationEncodingErrorNeverProducesFingerprintOrTraffic(t
 	s.handler().ServeHTTP(response, req)
 	require.Equal(t, http.StatusInternalServerError, response.Code)
 	require.Nil(t, s.generations)
-	require.Nil(t, s.frontends)
+	require.Nil(t, s.frontends.http)
+	require.Nil(t, s.frontends.sessions)
+	require.Nil(t, s.frontends.backends)
 }
 
 // Real Unix/HTTP/SSE transports and SDK sessions, with a synthetic owned child
@@ -342,7 +342,7 @@ func supervisorTransportFixture(t testing.TB, m *manager, configure ...func(*mcp
 		}
 		return &guardianChild{Process: &os.Process{Pid: os.Getpid()}, ConfirmedDone: done, Signal: stop, CloseOwner: func() error { return stop(syscall.SIGTERM) }}, nil
 	}
-	owner.initializeFrontends()
+
 	require.NoError(t, os.MkdirAll(filepath.Dir(m.mapPath), 0o700))
 	path, err := supervisorSocket(m)
 	require.NoError(t, err)
@@ -489,7 +489,7 @@ func TestSupervisorSocketUsesShortStablePrivateIdentity(t *testing.T) {
 func TestSupervisorProtocolAndConfigMismatchFailBeforeAllocation(t *testing.T) {
 	t.Parallel()
 	s := testSupervisor(t)
-	s.initializeFrontends()
+
 	for _, version := range []string{"", "old"} {
 		req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1/mcp", strings.NewReader("{}"))
 		require.NoError(t, err)

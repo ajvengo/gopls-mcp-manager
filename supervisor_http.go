@@ -233,11 +233,6 @@ type supervisorFrontends struct {
 	http     chan struct{}
 }
 
-func (s *supervisor) initializeFrontends() {
-	s.frontends = &supervisorFrontends{sessions: make(map[*restartSession]struct{}), backends: make(map[string]*supervisorHTTPBackend),
-		http: make(chan struct{}, min(s.m.limits.Session, s.m.limits.HTTPBytes/s.m.limits.MessageBytes))}
-}
-
 func supervisorConfig(m *manager) (string, error) {
 	// JSONv2 deliberately has no default time.Duration encoding. Encode every
 	// duration as integer nanoseconds while retaining the complete Limits struct,
@@ -422,7 +417,6 @@ func serveSupervisor(ctx context.Context, m *manager, listener net.Listener) err
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := newSupervisor(ctx, m)
-	s.initializeFrontends()
 	s.bindListener(listener)
 	if err := s.restoreRestartSessions(); err != nil {
 		return err
@@ -465,10 +459,10 @@ func (s *supervisor) serve() error {
 }
 
 func (s *supervisor) handler() http.Handler {
+	fingerprint, configErr := supervisorConfig(s.m)
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w = &httpReplyWriter{ResponseWriter: w}
-		fingerprint, err := supervisorConfig(s.m)
-		if err != nil {
+		if configErr != nil {
 			http.Error(w, "supervisor configuration cannot be encoded", http.StatusInternalServerError)
 			return
 		}
