@@ -184,13 +184,19 @@ func TestEndToEndHTTPServerLifecycle(t *testing.T) {
 
 func TestHTTPServerStartupErrors(t *testing.T) {
 	t.Parallel()
-	m := newTestManager(t)
-	owner := routerTestOwner(t, &m)
+	owner := routerTestOwner(t, nil)
+	startError := errors.New("home gopls failed to start")
+	owner.start = func(context.Context, string, int, int) (*guardianChild, error) {
+		return nil, startError
+	}
 	for _, address := range []string{"invalid", "0.0.0.0:0", "127.0.0.1:0"} {
 		t.Run(address, func(t *testing.T) {
 			t.Parallel()
 			err := serveHTTP(t.Context(), owner, testHome, address, io.Discard)
 			require.Error(t, err, "invalid address or missing home server accepted")
+			if address == "127.0.0.1:0" {
+				require.ErrorContains(t, err, startError.Error())
+			}
 		})
 	}
 }

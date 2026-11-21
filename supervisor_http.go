@@ -632,10 +632,7 @@ func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string)
 		return
 	}
 	if entry != nil && entry.failed() {
-		retire := entry.active == 0
-		if retire {
-			entry.retiring = true
-		}
+		retire := entry.active == 0 && entry.claimRetirement(nil)
 		s.frontends.mu.Unlock()
 		if retire {
 			go s.closeHTTPBackend(home, entry)
@@ -662,10 +659,7 @@ func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string)
 		if !failed {
 			entry.lastUsed = s.now()
 		}
-		retire := failed && entry.active == 0 && !entry.retiring
-		if retire {
-			entry.retiring = true
-		}
+		retire := failed && entry.active == 0 && entry.claimRetirement(nil)
 		s.frontends.mu.Unlock()
 		if retire {
 			go s.closeHTTPBackend(home, entry)
@@ -689,21 +683,23 @@ func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string)
 	}
 }
 
-// Backend publication is synchronized by ready. A canceled router cannot be
-// revived by refreshing the entry's idle timestamp with another failed request.
-func (entry *supervisorHTTPBackend) failed() bool {
+func (entry *supervisorHTTPBackend) published() bool {
 	select {
 	case <-entry.ready:
-		return entry.err != nil || entry.backend != nil && entry.backend.r.ctx != nil && entry.backend.r.ctx.Err() != nil
+		return true
 	default:
 		return false
 	}
 }
 
+func (entry *supervisorHTTPBackend) failed() bool {
+	return entry.published() && (entry.err != nil || entry.backend != nil && entry.backend.r.ctx != nil && entry.backend.r.ctx.Err() != nil)
+}
+
 func (s *supervisor) initializeHTTPBackend(home string, entry *supervisorHTTPBackend) {
+	defer close(entry.ready)
 	if err := s.validateHome(s.ctx, home); err != nil {
 		entry.err = err
-		close(entry.ready)
 		return
 	}
 	b := newHTTPBackend(s.ctx, s, home)
@@ -715,24 +711,37 @@ func (s *supervisor) initializeHTTPBackend(home string, entry *supervisorHTTPBac
 		entry.err = err
 		b.close()
 	}
-	close(entry.ready)
 }
 
 func (s *supervisor) retireHTTPBackends() {
 	s.frontends.mu.Lock()
+	retired := s.claimHTTPBackendsLocked(func(entry *supervisorHTTPBackend) bool {
+		return entry.active == 0 && (entry.failed() || s.now().Sub(entry.lastUsed) >= s.m.limits.Idle)
+	})
+	s.frontends.mu.Unlock()
+	s.closeHTTPBackends(retired)
+}
+
+// Frontends.mu serializes the claim with other retirement and admission paths.
+func (entry *supervisorHTTPBackend) claimRetirement(eligible func(*supervisorHTTPBackend) bool) bool {
+	if entry.retiring || !entry.published() || eligible != nil && !eligible(entry) {
+		return false
+	}
+	entry.retiring = true
+	return true
+}
+
+func (s *supervisor) claimHTTPBackendsLocked(eligible func(*supervisorHTTPBackend) bool) map[string]*supervisorHTTPBackend {
 	retired := make(map[string]*supervisorHTTPBackend)
 	for home, entry := range s.frontends.backends {
-		select {
-		case <-entry.ready:
-		default:
-			continue
-		}
-		if !entry.retiring && entry.active == 0 && (entry.failed() || s.now().Sub(entry.lastUsed) >= s.m.limits.Idle) {
-			entry.retiring = true
+		if entry.claimRetirement(eligible) {
 			retired[home] = entry
 		}
 	}
-	s.frontends.mu.Unlock()
+	return retired
+}
+
+func (s *supervisor) closeHTTPBackends(retired map[string]*supervisorHTTPBackend) {
 	for home, entry := range retired {
 		s.closeHTTPBackend(home, entry)
 	}
@@ -759,24 +768,12 @@ func (s *supervisor) closeFrontends() {
 			connections = append(connections, session.peer.conn)
 		}
 	}
-	backends := make(map[string]*supervisorHTTPBackend)
-	for home, entry := range s.frontends.backends {
-		select {
-		case <-entry.ready:
-			if !entry.retiring {
-				entry.retiring = true
-				backends[home] = entry
-			}
-		default:
-		}
-	}
+	backends := s.claimHTTPBackendsLocked(nil)
 	s.frontends.mu.Unlock()
 	for _, conn := range connections {
 		_ = conn.Close()
 	}
-	for home, entry := range backends {
-		s.closeHTTPBackend(home, entry)
-	}
+	s.closeHTTPBackends(backends)
 }
 
 func (s *supervisor) maintenance() {

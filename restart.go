@@ -283,12 +283,7 @@ func (s *supervisor) restartQuiescent() (bool, error) {
 	s.frontends.mu.Lock()
 	defer s.frontends.mu.Unlock()
 	for _, entry := range s.frontends.backends {
-		select {
-		case <-entry.ready:
-		default:
-			return false, nil
-		}
-		if entry.active != 0 || entry.retiring {
+		if !entry.published() || entry.active != 0 || entry.retiring {
 			return false, nil
 		}
 	}
@@ -525,21 +520,15 @@ func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (re
 	// HTTP has no public session state. Retire its idle internal routers before
 	// stopping generations, so no retained cache can race the checkpoint.
 	s.frontends.mu.Lock()
-	backends := make(map[string]*supervisorHTTPBackend)
 	for _, entry := range s.frontends.backends {
-		if entry.active != 0 || entry.retiring {
+		if !entry.published() || entry.active != 0 || entry.retiring {
 			s.frontends.mu.Unlock()
 			return restartReceipt{}, fmt.Errorf("HTTP backend is still active or retiring")
 		}
 	}
-	for home, entry := range s.frontends.backends {
-		entry.retiring = true
-		backends[home] = entry
-	}
+	backends := s.claimHTTPBackendsLocked(nil)
 	s.frontends.mu.Unlock()
-	for home, entry := range backends {
-		s.closeHTTPBackend(home, entry)
-	}
+	s.closeHTTPBackends(backends)
 	worktrees, err := s.drainRestartGenerations(ctx)
 	if err != nil {
 		return restartReceipt{}, err

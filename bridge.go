@@ -105,9 +105,7 @@ func serveRouter(r *router, stdio mcp.Connection) error {
 	cancel()
 	_ = stdio.Close()
 	<-readerDone
-	r.closeLanes()
-	r.awaitLanes()
-	r.clearRequests()
+	r.stopRouting()
 	r.releaseRetainedMessages()
 	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, mcp.ErrConnectionClosed) {
 		return nil
@@ -163,11 +161,13 @@ func (r *router) closeLanes() {
 	}
 }
 
-// After closeLanes, wait for in-progress cleanup before exiting.
-func (r *router) awaitLanes() {
+// The routing producer must have stopped before closing the lanes.
+func (r *router) stopRouting() {
+	r.closeLanes()
 	for _, l := range r.lanes {
 		<-l.done
 	}
+	r.clearRequests()
 }
 
 func (r *router) writeToClient(stdio mcp.Connection) {

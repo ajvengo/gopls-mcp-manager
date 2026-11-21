@@ -76,25 +76,19 @@ func (b *httpBackend) start() {
 	}()
 	go func() {
 		defer close(b.done)
-		defer b.r.releaseRetainedMessages()
 		defer func() {
+			close(cold)
+			<-coldDone
+			b.r.stopRouting()
 			b.mu.Lock()
-			defer b.mu.Unlock()
-			for {
-				select {
-				case call := <-b.queue:
-					call.cancel()
-					releaseMessage(call.req)
-				default:
-					return
-				}
+			for len(b.queue) != 0 {
+				call := <-b.queue
+				call.cancel()
+				releaseMessage(call.req)
 			}
+			b.mu.Unlock()
+			b.r.releaseRetainedMessages()
 		}()
-		defer b.r.clearRequests()
-		defer b.r.awaitLanes()
-		defer b.r.closeLanes()
-		// Cancelled calls stop waiting for filesystem work even if a syscall is stuck.
-		defer func() { close(cold); <-coldDone }()
 		for {
 			select {
 			case <-b.r.ctx.Done():
