@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -21,24 +24,46 @@ import (
 )
 
 func TestAuditResourceCancelledLockWaitReleasesDescriptors(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "registry")
-	err := withFileLock(t.Context(), path, func() error {
-		before := auditResourceFDCount(t)
-		for range 64 {
-			ctx, cancel := context.WithCancel(t.Context())
-			// Cancellation happens after open but while waiting on the held lock.
-			done := make(chan error, 1)
-			go func() {
-				done <- withFileLock(ctx, path, func() error { return errors.New("contended lock unexpectedly acquired") })
-			}()
-			require.Eventually(t, func() bool { return auditResourceFDCount(t) > before }, time.Second, time.Millisecond)
-			cancel()
-			require.ErrorIs(t, <-done, context.Canceled)
-		}
-		require.LessOrEqual(t, auditResourceFDCount(t), before, "cancelled lock wait retained descriptors")
-		return nil
+	synctest.Test(t, func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "registry")
+		err := withFileLock(t.Context(), path, func() error {
+			var lock syscall.Stat_t
+			require.NoError(t, syscall.Stat(path+".lock", &lock))
+			for range 64 {
+				ctx, cancel := context.WithCancel(t.Context())
+				t.Cleanup(cancel)
+				done := make(chan error, 1)
+				go func() {
+					done <- withFileLock(ctx, path, func() error { return errors.New("contended lock unexpectedly acquired") })
+				}()
+				synctest.Wait()
+				require.Equal(t, 2, lockDescriptorCount(t, lock), "holder and waiter must each have the lock file open")
+				cancel()
+				require.ErrorIs(t, mustRecv(t, done, "cancelled lock wait to return"), context.Canceled)
+			}
+			require.Equal(t, 1, lockDescriptorCount(t, lock), "cancelled lock waits retained descriptors")
+			return nil
+		})
+		require.NoError(t, err)
 	})
+}
+
+func lockDescriptorCount(t *testing.T, lock syscall.Stat_t) int {
+	t.Helper()
+	entries, err := os.ReadDir("/dev/fd")
 	require.NoError(t, err)
+	count := 0
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		var opened syscall.Stat_t
+		if syscall.Fstat(fd, &opened) == nil && opened.Dev == lock.Dev && opened.Ino == lock.Ino {
+			count++
+		}
+	}
+	return count
 }
 
 func TestCancellationNumericIDDoesNotAliasAnotherRequest(t *testing.T) {
