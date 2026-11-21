@@ -53,9 +53,7 @@ and waits 10 s. Unconfirmed exit or failed cleanup retains capacity.
 [Owner contract](SPEC.md#persistent-owner-contract)
 
 Frontends must match the owner's private protocol and resource configuration.
-The selected Go toolchain must report the exact private telemetry directory and
-mode `off` before spawn and each ID-bearing upstream write.
-[gopls and toolchain requirements](SPEC.md#9-spawning)
+[gopls and private telemetry requirements](SPEC.md#9-spawning)
 
 ### Restart and binary reload
 
@@ -81,11 +79,8 @@ launch commands for future starts. Reload waits for the successor to finish
 restarting and prints a JSON receipt. Both restart modes require a running owner
 and accept a positive `--timeout` up to `1h` (default `5m`).
 
-Admitted calls drain before frontends pause at message boundaries. Work racing
-the pause can abort the restart. New calls retain their original deadlines,
-and sent requests are never replayed. A hot successor resumes traffic after
-confirmed old-owner exit. The [restart contract](SPEC.md#persistent-owner-contract)
-lists capacity checks, refusal conditions and resume order.
+Admitted calls drain before the pause. Racing work can abort the restart.
+New calls keep their deadlines. [Restart and recovery rules](SPEC.md#persistent-owner-contract)
 
 Reload preserves public connections and existing frontend binaries. Restart
 the service normally to update frontends, change configuration, or upgrade an
@@ -121,17 +116,9 @@ Cancel the HTTP request to cancel its internal call. Separate cancellation
 POSTs have no cross-request effect. The owner completes cancellation locally
 and may notify the owning SSE connection.
 
-Cache misses use a separate 64-message queue. Warm and pathless calls can
-route during a cold lookup. Delivery may still wait for toolchain validation
-on the same filesystem worker.
-
-Each HTTP exchange reserves a maximum-size body allowance through response
-completion, including slow or chunked requests. The default cap is 16
-exchanges. Excess requests receive 503. Defaults are 4 MiB per body, 5 s for
-headers, 30 s for body reads and 30 s from first response output for writes.
-Tool execution uses the optional execution timeout. Failed backends retire
-after active handlers and queue cleanup. A later request can open a replacement.
-[HTTP contract](SPEC.md#stateless-http-frontend)
+The default limit is 16 concurrent exchanges. Excess requests receive 503.
+Tool execution uses the optional execution timeout. A later request can replace
+a failed backend after it retires. [HTTP limits and failure rules](SPEC.md#stateless-http-frontend)
 
 ## Routing
 
@@ -239,10 +226,6 @@ sharing managers and stop them before manually removing historical lock files.
 | `~/.local/share/gopls-mcp-guardians/` | Guardian manifests, stable lifetime leases and private `telemetry-off/` state |
 | `~/.local/share/gopls-mcp-logs/<hash>.log` | Bounded stdout+stderr log for that worktree |
 
-The map is written atomically (temp file, `fsync`, rename) with mode `0600`.
-Ports are picked from 61100–65100, seeded by a hash of the worktree path so the
-same tree tends to get the same port, then probed forward until one is free.
-
 `status` reports per-record log sizes and aggregate bytes, largest file, file
 count and oversized count, including logs left after a record disappears.
 The owner automatically retains managed logs within its aggregate byte/file cap.
@@ -256,9 +239,7 @@ unlinking. Output reports sizes
 observed before trimming and bytes observed in files cleared; concurrent writes
 make these snapshots approximate. No archives are retained.
 
-The registry rejects malformed records, symlinks and nonregular files.
-Reads are capped at 4 MiB, 4001 lines and a 64 KiB scanner token. Repair corrupt
-state offline after reconciling its reservations.
+Repair corrupt registry state offline after reconciling its reservations.
 [Registry format and failure rules](SPEC.md#6-port-map-file)
 
 ## Legacy migration

@@ -109,9 +109,10 @@ inherited descriptors so guardians and gopls cannot retain the singleton lock.
 
 The checkpoint is bounded to 8 MiB. Public stdio framing, partial input and batch
 correlation remain in persistent frontend relays; home, initialization and sticky
-routing are restored in the successor. HTTP frontend listeners remain open, and
-their idle private HTTP connections are discarded before transfer. New calls
-can wait through the pause under their original deadlines.
+routing are restored in the successor. In-progress attachments hold capacity and
+must publish a live peer or release their reservation before the restart snapshot.
+HTTP frontend listeners remain open. Idle private HTTP connections are
+discarded before transfer. New calls keep their original deadlines.
 
 A hot restart reserves both owner footprints and descriptor-transfer headroom.
 An inherited pipe whose write descriptor remains live until old-process exit
@@ -135,6 +136,7 @@ transfer and EOF.
 `TestRestartRestoresInitializedStickySession`,
 `TestRestartRefusesUnconfirmedWorkAndResumesClients`,
 `TestRestartPreflightLeavesHealthyGenerationsReady`,
+`TestRestartWaitsForPendingFrontendReservation`,
 `TestRestartWaitsForStartingGeneration`,
 `TestRestartWaitsForUpstreamWriteWithoutCredit`,
 `TestRestartRechecksAfterHTTPBackendTeardown`,
