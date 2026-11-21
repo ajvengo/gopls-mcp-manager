@@ -303,6 +303,10 @@ func guardianRemoveRecord(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	return syncGuardianDirectory(path)
+}
+
+func syncGuardianDirectory(path string) error {
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -1118,30 +1122,11 @@ func guardianWriteRecord(path string, record guardianRecord) error {
 	if len(data) > guardianFrameBytes {
 		return errors.New("guardian record exceeds frame limit")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := replaceStateFile(path, ".guardian-*", func(file *os.File) error {
+		_, err := file.Write(data)
+		return err
+	}); err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".guardian-*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close(); _ = os.Remove(file.Name()) }()
-	if _, err := file.Write(data); err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(file.Name(), path); err != nil {
-		return err
-	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = dir.Close() }()
-	return dir.Sync()
+	return syncGuardianDirectory(path)
 }

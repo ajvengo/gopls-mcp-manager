@@ -234,50 +234,49 @@ func writeMap(path string, records []record) error {
 	if len(records) > portCount {
 		return fmt.Errorf("write %s: registry exceeds %d records", path, portCount)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	return replaceStateFile(path, ".gopls-ports.map-*", func(tmp *os.File) error {
+		// CreateTemp applies the caller's umask. The registry requires exact mode 0600.
+		if err := tmp.Chmod(0o600); err != nil {
+			return err
+		}
+		w := bufio.NewWriter(&stateBudgetWriter{Writer: tmp, remaining: maxRegistryBytes})
+		for _, r := range records {
+			if r.Worktree == "" || r.PID <= 0 || r.PID > maxProcessID || r.Port < firstPort || r.Port > lastPort {
+				return fmt.Errorf("write %s: invalid registry fields", path)
+			}
+			if !utf8.ValidString(r.Worktree) {
+				return fmt.Errorf("worktree path is not valid UTF-8: %q", r.Worktree)
+			}
+			data, err := json.Marshal(r)
+			if err != nil {
+				return err
+			}
+			// Scanner needs space for the record and its newline.
+			if len(data) >= bufio.MaxScanTokenSize {
+				return fmt.Errorf("write %s: registry record exceeds %d bytes", path, bufio.MaxScanTokenSize-1)
+			}
+			if _, err := w.Write(data); err != nil {
+				return err
+			}
+			if err := w.WriteByte('\n'); err != nil {
+				return err
+			}
+		}
+		return w.Flush()
+	})
+}
+
+func replaceStateFile(path, pattern string, write func(*os.File) error) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".gopls-ports.map-*")
+	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	// Set 0600 explicitly because CreateTemp applies the caller's umask.
-	if err := tmp.Chmod(0o600); err != nil {
-		return err
-	}
-	// bufio.Writer latches its first write error and returns it from Flush, so
-	// that one check covers every line below.
-	w := bufio.NewWriter(&stateBudgetWriter{Writer: tmp, remaining: maxRegistryBytes})
-	for _, r := range records {
-		if r.Worktree == "" || r.PID <= 0 || r.PID > maxProcessID || r.Port < firstPort || r.Port > lastPort {
-			return fmt.Errorf("write %s: invalid registry fields", path)
-		}
-		// Require UTF-8 so the worktree key survives a JSON round trip.
-		if !utf8.ValidString(r.Worktree) {
-			return fmt.Errorf("worktree path is not valid UTF-8: %q", r.Worktree)
-		}
-		data, err := json.Marshal(r)
-		if err != nil {
-			return err
-		}
-		// Scanner must hold the full value and its newline simultaneously.
-		// Enforce its token boundary before committing a replacement, too.
-		if len(data) >= bufio.MaxScanTokenSize {
-			return fmt.Errorf("write %s: registry record exceeds %d bytes", path, bufio.MaxScanTokenSize-1)
-		}
-		if _, err := w.Write(data); err != nil {
-			return err
-		}
-		if err := w.WriteByte('\n'); err != nil {
-			return err
-		}
-	}
-	if err := w.Flush(); err != nil {
+	defer func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }()
+	if err := write(tmp); err != nil {
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
@@ -286,7 +285,7 @@ func writeMap(path string, records []record) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	return os.Rename(tmp.Name(), path)
 }
 
 func withFileLock(ctx context.Context, path string, fn func() error) error {
