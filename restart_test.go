@@ -51,9 +51,9 @@ func TestRestartRestoresInitializedStickySession(t *testing.T) {
 	require.ErrorContains(t, message.(*jsonrpc.Response).Error, "already initialized")
 	require.NoError(t, frontend.Close())
 	require.Eventually(t, func() bool {
-		owner.restart.mu.Lock()
-		defer owner.restart.mu.Unlock()
-		return len(owner.restart.sessions) == 0
+		owner.frontends.mu.Lock()
+		defer owner.frontends.mu.Unlock()
+		return len(owner.frontends.sessions) == 0
 	}, time.Second, time.Millisecond)
 	owner.mu.Lock()
 	require.Zero(t, owner.retainedBytes)
@@ -479,7 +479,7 @@ func TestRestartPreflightLeavesHealthyGenerationsReady(t *testing.T) {
 		conn, remote := net.Pipe()
 		peer := newRestartPeer(s.ctx, conn, conn, 1024, false)
 		defer func() { _ = peer.Close(); _ = remote.Close() }()
-		defer s.registerRestartSession(&restartSession{peer: peer})()
+		s.frontends.sessions[&restartSession{peer: peer}] = struct{}{}
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
 
@@ -493,6 +493,50 @@ func TestRestartPreflightLeavesHealthyGenerationsReady(t *testing.T) {
 		require.Empty(t, worktrees)
 		require.Equal(t, generationReady, supervisorGenerationState(s, healthy))
 		require.True(t, upstream.available())
+	})
+}
+
+func TestRestartWaitsForPendingFrontendReservation(t *testing.T) {
+	bubble(t, func(t *testing.T) {
+		s := stateSupervisor(t)
+		s.initializeFrontends()
+		running, unblock := make(chan struct{}), make(chan struct{})
+		defer close(unblock)
+		go func() {
+			_, _ = ownerFilesystemCall(t.Context(), s, func() struct{} {
+				close(running)
+				<-unblock
+				return struct{}{}
+			})
+		}()
+		<-running
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		req := httptest.NewRequestWithContext(ctx, http.MethodConnect, "/bridge", nil)
+		response, attached := httptest.NewRecorder(), make(chan struct{})
+		go func() {
+			defer close(attached)
+			s.attachFrontend(response, req, testHome)
+		}()
+		synctest.Wait()
+		require.Equal(t, 1, s.snapshot().Sessions)
+		s.closeFrontends() // The charged reservation has no socket to close.
+
+		restarted := make(chan error, 1)
+		go func() {
+			_, err := s.restartAll(t.Context(), restartRequest{})
+			restarted <- err
+		}()
+		synctest.Wait()
+		require.True(t, s.restart.closed)
+		require.Empty(t, restarted, "restart crossed a pending frontend admission")
+
+		cancel()
+		<-attached
+		require.Equal(t, http.StatusBadRequest, response.Code)
+		require.NoError(t, <-restarted)
+		require.Zero(t, s.snapshot().Sessions)
 	})
 }
 
@@ -795,7 +839,9 @@ func TestRestartNativeForkExecPreservesAttachmentAndLock(t *testing.T) {
 		client.start()
 		defer func() { _ = client.Close() }()
 		session := &restartSession{peer: newRestartPeer(ctx, serverConn, serverConn, m.limits.MessageBytes, false), home: t.TempDir()}
-		s.registerRestartSession(session)
+		s.frontends.mu.Lock()
+		s.frontends.sessions[session] = struct{}{}
+		s.frontends.mu.Unlock()
 		go s.runRestartSession(session)
 		binary, err := os.Executable()
 		require.NoError(t, err)
@@ -841,10 +887,9 @@ func TestRestartFailedResumeReleasesPausedSession(t *testing.T) {
 		defer func() { _ = owner.Close(); _ = frontend.Close(); synctest.Wait() }()
 		frontend.start()
 		session := &restartSession{peer: owner, home: "/fixture"}
-		s.frontends.sessions[a] = struct{}{}
-		s.registerRestartSession(session)
+		s.frontends.sessions[session] = struct{}{}
 		done := make(chan struct{})
-		go func() { defer close(done); s.runRestoredSession(session) }()
+		go func() { defer close(done); s.runRestartSession(session) }()
 		_, err := owner.pause(t.Context())
 		require.NoError(t, err)
 		require.NoError(t, frontend.Close())
@@ -855,7 +900,6 @@ func TestRestartFailedResumeReleasesPausedSession(t *testing.T) {
 		default:
 			t.Fatal("disconnected paused session remains registered")
 		}
-		require.Empty(t, s.restart.sessions)
 		require.Empty(t, s.frontends.sessions)
 	})
 }

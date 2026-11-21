@@ -228,13 +228,13 @@ type supervisorHTTPBackend struct {
 
 type supervisorFrontends struct {
 	mu       sync.Mutex
-	sessions map[net.Conn]struct{}
+	sessions map[*restartSession]struct{}
 	backends map[string]*supervisorHTTPBackend
 	http     chan struct{}
 }
 
 func (s *supervisor) initializeFrontends() {
-	s.frontends = &supervisorFrontends{sessions: make(map[net.Conn]struct{}), backends: make(map[string]*supervisorHTTPBackend),
+	s.frontends = &supervisorFrontends{sessions: make(map[*restartSession]struct{}), backends: make(map[string]*supervisorHTTPBackend),
 		http: make(chan struct{}, min(s.m.limits.Session, s.m.limits.HTTPBytes/s.m.limits.MessageBytes))}
 }
 
@@ -579,14 +579,13 @@ func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, ho
 		http.Error(w, "global supervisor session capacity reached", http.StatusServiceUnavailable)
 		return
 	}
-	// Reserve before initialization; replace the placeholder only after hijack.
-	reservation := &sessionReservationConn{}
-	s.frontends.sessions[reservation] = struct{}{}
+	session := &restartSession{home: home}
+	s.frontends.sessions[session] = struct{}{}
 	s.frontends.mu.Unlock()
 	defer func() {
-		s.frontends.mu.Lock()
-		delete(s.frontends.sessions, reservation)
-		s.frontends.mu.Unlock()
+		if session.peer == nil {
+			s.removeFrontend(session)
+		}
 	}()
 	if err := s.validateHome(req.Context(), home); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -608,30 +607,21 @@ func (s *supervisor) attachFrontend(w http.ResponseWriter, req *http.Request, ho
 	if err := buffered.Flush(); err != nil {
 		return
 	}
-	s.frontends.mu.Lock()
-	delete(s.frontends.sessions, reservation)
-	s.frontends.sessions[conn] = struct{}{}
-	s.frontends.mu.Unlock()
-	defer func() {
-		s.frontends.mu.Lock()
-		delete(s.frontends.sessions, conn)
-		s.frontends.mu.Unlock()
-	}()
-	session := &restartSession{peer: newRestartPeer(s.ctx, conn, buffered.Reader, s.m.limits.MessageBytes, false), home: home}
 	if req.URL.Path != "/http-frontend" {
 		session.router = newRouter(s.ctx, s, home)
 	}
-	unregister := s.registerRestartSession(session)
-	defer unregister()
+	s.frontends.mu.Lock()
+	session.peer = newRestartPeer(s.ctx, conn, buffered.Reader, s.m.limits.MessageBytes, false)
+	s.frontends.mu.Unlock()
 	release()
 	s.runRestartSession(session)
 }
 
-// Unique comparable identity for an admission in progress, without allocating
-// an OS descriptor. Never used for I/O.
-type sessionReservationConn struct{ net.Conn }
-
-func (*sessionReservationConn) Close() error { return nil }
+func (s *supervisor) removeFrontend(session *restartSession) {
+	s.frontends.mu.Lock()
+	delete(s.frontends.sessions, session)
+	s.frontends.mu.Unlock()
+}
 
 func (s *supervisor) http(w http.ResponseWriter, req *http.Request, home string) {
 	s.frontends.mu.Lock()
@@ -764,8 +754,10 @@ func (s *supervisor) closeHTTPBackend(home string, entry *supervisorHTTPBackend)
 func (s *supervisor) closeFrontends() {
 	s.frontends.mu.Lock()
 	connections := make([]net.Conn, 0, len(s.frontends.sessions))
-	for conn := range s.frontends.sessions {
-		connections = append(connections, conn)
+	for session := range s.frontends.sessions {
+		if session.peer != nil {
+			connections = append(connections, session.peer.conn)
+		}
 	}
 	backends := make(map[string]*supervisorHTTPBackend)
 	for home, entry := range s.frontends.backends {
