@@ -261,14 +261,12 @@ intervals and critical sections that implement the abstract actions.
   must cover resource arithmetic, decoded amplification, blocked workers and
   long-run map, log, inode, heap and goroutine retention.
 
-Native audits exercise FD, process and socket pressure, registry and generation
-crash points, and hot handoff deaths before readiness and after commit.
-Registry tests crash the writing process while the filesystem stays online.
-Power-loss persistence, broader crash/storage interleavings, and delayed
-responses through replacement remain separate runtime obligations. Record
-default-idle, suspend and 24h/72h evidence per revision. Runtime conformance is
-reviewed against code and tests. The formal runner checks model traces.
-[Native audit commands](../README.md#native-runtime-audits)
+[Native audits](../README.md#native-runtime-audits) cover resource pressure and
+process death at registry, generation and hot handoff checkpoints. Registry
+tests leave the filesystem online. Power loss, broader crash/storage
+interleavings and delayed responses through replacement need runtime evidence.
+Record default-idle, suspend and 24h/72h results by revision. The formal runner
+checks model traces. Runtime conformance is reviewed against code and tests.
 
 ## Tool pins and observed verification
 

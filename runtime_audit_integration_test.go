@@ -27,6 +27,17 @@ type auditOwnerProcess struct {
 
 func startAuditOwner(t *testing.T, ctx context.Context, binary string, m *manager) *auditOwnerProcess {
 	t.Helper()
+	t.Cleanup(func() {
+		assert.Eventually(t, func() bool {
+			count, err := guardianManifestCount(guardianStateDir(m))
+			return err == nil && count == 0
+		}, 15*time.Second, 20*time.Millisecond, "disposable guardian residue")
+	})
+	return startAuditOwnerProcess(t, ctx, binary, m)
+}
+
+func startAuditOwnerProcess(t *testing.T, ctx context.Context, binary string, m *manager) *auditOwnerProcess {
+	t.Helper()
 	path, err := supervisorSocket(m)
 	require.NoError(t, err)
 	p := &auditOwnerProcess{command: exec.Command(binary, "supervisor"), done: make(chan struct{})}
@@ -51,16 +62,6 @@ func startAuditOwner(t *testing.T, ctx context.Context, binary string, m *manage
 		return supervisorPing(ctx, m) == nil
 	}, 10*time.Second, 20*time.Millisecond)
 	return p
-}
-
-func expectAuditCleanup(t *testing.T, m *manager) {
-	t.Helper()
-	t.Cleanup(func() {
-		assert.Eventually(t, func() bool {
-			count, err := guardianManifestCount(guardianStateDir(m))
-			return err == nil && count == 0
-		}, 15*time.Second, 20*time.Millisecond, "disposable guardian residue")
-	})
 }
 
 func useAuditHome(t *testing.T, home string) *manager {
@@ -104,24 +105,19 @@ type auditHook struct {
 }
 
 // Instrument only disposable builds so release binaries have no crash switches.
-func buildRuntimeAuditBinary(t *testing.T, ctx context.Context, output string, hooks []auditHook, flags ...string) {
+func auditOverlayFlag(t *testing.T, hooks []auditHook) string {
 	t.Helper()
 	dir := t.TempDir()
-	files := map[string]string{}
-	read := func(name string) string {
-		if source, ok := files[name]; ok {
-			return source
-		}
-		source, err := os.ReadFile(name)
-		require.NoError(t, err)
-		return string(source)
-	}
+	files := map[string]string{"main.go": mustReadString(t, "main.go")}
 	for _, hook := range hooks {
-		source := read(hook.file)
+		source, ok := files[hook.file]
+		if !ok {
+			source = mustReadString(t, hook.file)
+		}
 		require.Equal(t, 1, strings.Count(source, hook.before), "ambiguous audit checkpoint in %s", hook.file)
 		files[hook.file] = strings.Replace(source, hook.before, hook.statement+"\n"+hook.before, 1)
 	}
-	files["main.go"] = read("main.go") + `
+	files["main.go"] += `
 func init() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 300_000_000_000)
@@ -176,13 +172,19 @@ func auditStateWrite() {
 	require.NoError(t, err)
 	overlayPath := filepath.Join(dir, "overlay.json")
 	require.NoError(t, os.WriteFile(overlayPath, overlay, 0o600))
-	args := append([]string{"build", "-overlay=" + overlayPath, "-o", output}, flags...)
+	return "-overlay=" + overlayPath
+}
+
+func buildAuditManager(t *testing.T, ctx context.Context, flags ...string) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "manager")
+	args := append([]string{"build", "-o", binary}, flags...)
 	out, err := exec.CommandContext(ctx, "go", append(args, ".")...).CombinedOutput()
 	require.NoError(t, err, "%s", out)
+	return binary
 }
 
 func TestAuditRealGoplsRegistryCrashBoundaries(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "manager")
 	hooks := []auditHook{
 		{"main.go", "if err := run(os.Args, os.Stdout);", "auditStateWrite()"},
 		{"registry.go", "if err := tmp.Sync();", `auditCrash("after-write")`},
@@ -200,7 +202,7 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-directory-sync" {
 	if err := dir.Sync(); err == nil { auditCrash("after-directory-sync") }
 }`},
 	}
-	buildRuntimeAuditBinary(t, t.Context(), binary, hooks)
+	binary := buildAuditManager(t, t.Context(), auditOverlayFlag(t, hooks))
 	for _, tc := range []struct{ point, worktree string }{
 		{"after-write", "/before"},
 		{"after-file-sync", "/before"},
@@ -218,9 +220,7 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-directory-sync" {
 			out, err := command.CombinedOutput()
 			require.Error(t, err, "%s", out)
 			require.Equal(t, 93, command.ProcessState.ExitCode(), "%s", out)
-			hit, err := os.ReadFile(marker)
-			require.NoError(t, err)
-			require.Equal(t, tc.point, string(hit))
+			require.Equal(t, tc.point, mustReadString(t, marker))
 			records, intact, err := readMap(path)
 			require.NoError(t, err)
 			require.True(t, intact)
@@ -231,7 +231,6 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-directory-sync" {
 }
 
 func TestAuditRealGoplsLifecycleCrashBoundaries(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "manager")
 	hooks := []auditHook{
 		{"guardian.go", "controlRead, controlWrite, err := os.Pipe()", `auditCrash("before-guardian-start")`},
 		{"guardian.go", "record.ChildPID = child.Process.Pid", `auditCrash("after-child-start")`},
@@ -246,7 +245,7 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-child-start" {
 		{"supervisor.go", `defer s.m.timed("readiness", time.Now())`, `auditCrash("after-registry-publication")`},
 		{"supervisor.go", "s.mu.Lock()\n\tdefer s.mu.Unlock()\n\tg.cleaning = false", `if err == nil { auditCrash("after-registry-cleanup") }`},
 	}
-	buildRuntimeAuditBinary(t, t.Context(), binary, hooks)
+	binary := buildAuditManager(t, t.Context(), auditOverlayFlag(t, hooks))
 	root, linked := auditWorktrees(t)
 	for _, point := range []string{"before-guardian-start", "after-child-start", "after-registry-publication", "after-registry-cleanup"} {
 		t.Run(point, func(t *testing.T) {
@@ -260,7 +259,7 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-child-start" {
 			marker := filepath.Join(home, "crash")
 			t.Setenv("GOPLS_AUDIT_MARKER", marker)
 			t.Setenv("GOPLS_AUDIT_CRASH", point)
-			owner := startAuditOwner(t, ctx, binary, m)
+			owner := startAuditOwnerProcess(t, ctx, binary, m)
 			if point == "after-registry-cleanup" {
 				require.NoError(t, auditEnsure(ctx, m, root))
 				out, err := exec.CommandContext(ctx, binary, "restart", "--timeout=15s").CombinedOutput()
@@ -268,9 +267,7 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-child-start" {
 			} else {
 				require.Error(t, auditEnsure(ctx, m, root))
 			}
-			hit, err := os.ReadFile(marker)
-			require.NoError(t, err)
-			require.Equal(t, point, string(hit))
+			require.Equal(t, point, mustReadString(t, marker))
 			if point == "after-child-start" {
 				require.Eventually(t, func() bool {
 					_, err := os.Stat(marker + ".child")
@@ -301,7 +298,6 @@ if os.Getenv("GOPLS_AUDIT_CRASH") == "after-child-start" {
 			}
 			require.NoError(t, guardianRecovery(ctx, guardianStateDir(m)))
 			t.Setenv("GOPLS_AUDIT_CRASH", "")
-			expectAuditCleanup(t, m)
 			startAuditOwner(t, ctx, binary, m)
 			require.NoError(t, auditEnsure(ctx, m, root))
 			after := mustReadMap(t, m.mapPath)

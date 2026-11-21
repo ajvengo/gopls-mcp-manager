@@ -4,7 +4,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json/jsontext"
@@ -447,7 +446,7 @@ func auditRealGoplsHotRestart(t *testing.T, original, crash string) {
 		mustWriteFile(t, filepath.Join(dir, "marker.go"), "package fixture\nconst "+marker+" = 1\n")
 		mustWriteFile(t, filepath.Join(dir, "fixture.go"), "package fixture\nvar _ = "+marker+"\n")
 	}
-	home, binDir := t.TempDir(), t.TempDir()
+	home := t.TempDir()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -460,12 +459,11 @@ func auditRealGoplsHotRestart(t *testing.T, original, crash string) {
 	case "after-successor-commit":
 		hooks = []auditHook{{"restart.go", "inherit.activated = true", `auditCrash("after-successor-commit")`}}
 	}
+	overlay := auditOverlayFlag(t, hooks)
 	if original == "" {
-		original = filepath.Join(binDir, "old")
-		buildRuntimeAuditBinary(t, ctx, original, hooks)
+		original = buildAuditManager(t, ctx, overlay)
 	}
-	updated := filepath.Join(binDir, "new")
-	buildRuntimeAuditBinary(t, ctx, updated, hooks, "-ldflags=-s -w")
+	updated := buildAuditManager(t, ctx, overlay, "-ldflags=-s -w")
 	marker := filepath.Join(home, "audit-crash")
 	t.Setenv("GOPLS_AUDIT_CRASH", crash)
 	t.Setenv("GOPLS_AUDIT_MARKER", marker)
@@ -479,12 +477,8 @@ func auditRealGoplsHotRestart(t *testing.T, original, crash string) {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cleanupCancel()
 		// The handoff may commit even if the CLI fails to receive its receipt.
-		var status bytes.Buffer
-		if querySupervisor(cleanupCtx, m, "/status", "", &status) == nil {
-			var snapshot supervisorSnapshot
-			if json.Unmarshal(status.Bytes(), &snapshot) == nil && snapshot.PID > 0 {
-				currentPID = snapshot.PID
-			}
+		if snapshot, err := auditSnapshot(cleanupCtx, m); err == nil && snapshot.PID > 0 {
+			currentPID = snapshot.PID
 		}
 		process, err := os.FindProcess(currentPID)
 		if assert.NoError(t, err) {
@@ -586,9 +580,7 @@ func auditRealGoplsHotRestart(t *testing.T, original, crash string) {
 		require.NoError(t, <-ownerDone)
 	}
 	if crash != "" {
-		hit, err := os.ReadFile(marker)
-		require.NoError(t, err)
-		require.Equal(t, crash, string(hit))
+		require.Equal(t, crash, mustReadString(t, marker))
 	}
 	if crash == "after-successor-commit" {
 		readCtx, stop := context.WithTimeout(ctx, 5*time.Second)
@@ -599,7 +591,6 @@ func auditRealGoplsHotRestart(t *testing.T, original, crash string) {
 		require.Eventually(t, func() bool {
 			return withSupervisorSingleton(ctx, m, func() error { return nil }) == nil
 		}, 2*time.Second, 20*time.Millisecond, "handoff left the singleton locked")
-		expectAuditCleanup(t, m)
 		startAuditOwner(t, ctx, updated, m)
 		require.NoError(t, auditEnsure(ctx, m, root))
 		return

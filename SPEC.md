@@ -807,7 +807,5 @@ lock waits. Boundary tests cover corrupt/nonregular input and uncertain process
 identity. See the [verification plan](README.md#verify-correctness) and
 [runtime conformance mapping](formal/README.md#runtime-conformance).
 
-Native checks cover registry and generation crash points, hot handoff process
-death, and FD, process and socket pressure. Record default-duration idle,
-Linux suspend and 24h/72h soak results against the source revision.
-[Native audit commands](README.md#native-runtime-audits)
+Record default-duration idle, Linux suspend and 24h/72h soak results by
+revision. See the [native audit commands](README.md#native-runtime-audits).

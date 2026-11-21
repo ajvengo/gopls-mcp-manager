@@ -22,7 +22,7 @@ import (
 )
 
 func TestAuditRealGoplsNativePressure(t *testing.T) {
-	binary := buildAuditManager(t)
+	binary := buildAuditManager(t, t.Context())
 	root, linked := auditWorktrees(t)
 	for _, tc := range []struct{ name, slots, files, reject string }{
 		{"FDs", "2", "760", "descriptor reservation exhausted"},
@@ -37,7 +37,6 @@ func TestAuditRealGoplsNativePressure(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
 			m := useAuditHome(t, t.TempDir())
-			expectAuditCleanup(t, m)
 			owner := startAuditOwner(t, ctx, binary, m)
 			require.NoError(t, auditTool(t, ctx, m, root))
 			before, err := auditSnapshot(ctx, m)
@@ -54,17 +53,21 @@ func TestAuditRealGoplsNativePressure(t *testing.T) {
 			path, err := supervisorSocket(m)
 			require.NoError(t, err)
 			var sockets []net.Conn
-			for range m.limits.HTTPConnections {
+			require.NoError(t, restartWait(ctx, func() (bool, error) {
 				conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
-				require.NoError(t, err)
-				defer func() { _ = conn.Close() }()
+				if err != nil {
+					return false, err
+				}
+				// Dial can succeed before the listener rejects an excess socket.
+				if err := httpAdmissionRoundTrip(conn); err != nil {
+					_ = conn.Close()
+					return false, nil
+				}
+				t.Cleanup(func() { _ = conn.Close() })
 				sockets = append(sockets, conn)
-			}
-			require.Eventually(t, func() bool {
-				attempt, stop := context.WithTimeout(ctx, 150*time.Millisecond)
-				defer stop()
-				return supervisorPing(attempt, m) != nil
-			}, 3*time.Second, 20*time.Millisecond, "native sockets did not exhaust the owner connection limit")
+				return len(sockets) == m.limits.HTTPConnections, nil
+			}))
+			require.Error(t, supervisorPing(ctx, m), "native sockets did not exhaust the owner connection limit")
 			sampleAuditProcesses(t, ctx, m, before)
 			for _, conn := range sockets {
 				require.NoError(t, conn.Close())
@@ -102,7 +105,7 @@ func TestAuditRealGoplsSoak(t *testing.T) {
 	if mode == "suspend" {
 		require.Equal(t, "linux", runtime.GOOS, "suspend evidence uses Linux boot uptime")
 	}
-	binary := buildAuditManager(t)
+	binary := buildAuditManager(t, t.Context())
 	root, linked := auditWorktrees(t)
 	idle, observe := time.Hour, 70*time.Minute
 	if mode == "idle-smoke" {
@@ -112,7 +115,6 @@ func TestAuditRealGoplsSoak(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), duration+2*time.Minute)
 	defer cancel()
 	m := useAuditHome(t, t.TempDir())
-	expectAuditCleanup(t, m)
 	startAuditOwner(t, ctx, binary, m)
 	if mode == "idle-smoke" || mode == "idle" || mode == "suspend" {
 		verifyAuditIdle(t, ctx, m, root, mode == "suspend", duration, interval, observe)
@@ -156,14 +158,15 @@ func verifyAuditIdle(t *testing.T, ctx context.Context, m *manager, root string,
 		snapshot, err := auditSnapshot(ctx, m)
 		require.NoError(t, err)
 		require.Zero(t, snapshot.Sessions, "idle trial requires zero attachments")
+		elapsed := time.Since(start)
 		if len(snapshot.Generations) == 0 {
-			require.GreaterOrEqual(t, time.Since(start), m.limits.Idle-interval, "retired early")
+			require.GreaterOrEqual(t, elapsed, m.limits.Idle-interval, "retired early")
 			retired = true
 		} else {
 			require.False(t, retired, "idle owner started a replacement without a client")
 			require.Len(t, snapshot.Generations, 1)
 		}
-		if retired && time.Since(start) >= observe {
+		if retired && elapsed >= observe {
 			break
 		}
 		require.NoError(t, waitContext(ctx, interval))
@@ -185,14 +188,6 @@ func auditBootUptime(t *testing.T) time.Duration {
 	seconds, err := strconv.ParseFloat(fields[0], 64)
 	require.NoError(t, err)
 	return time.Duration(seconds * float64(time.Second))
-}
-
-func buildAuditManager(t *testing.T) string {
-	t.Helper()
-	binary := filepath.Join(t.TempDir(), "manager")
-	out, err := exec.CommandContext(t.Context(), "go", "build", "-o", binary, ".").CombinedOutput()
-	require.NoError(t, err, "%s", out)
-	return binary
 }
 
 func auditWorktrees(t *testing.T) (string, string) {

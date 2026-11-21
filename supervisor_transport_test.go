@@ -342,7 +342,6 @@ func supervisorTransportFixture(t testing.TB, m *manager, configure ...func(*mcp
 		}
 		return &guardianChild{Process: &os.Process{Pid: os.Getpid()}, ConfirmedDone: done, Signal: stop, CloseOwner: func() error { return stop(syscall.SIGTERM) }}, nil
 	}
-
 	require.NoError(t, os.MkdirAll(filepath.Dir(m.mapPath), 0o700))
 	path, err := supervisorSocket(m)
 	require.NoError(t, err)
@@ -489,7 +488,6 @@ func TestSupervisorSocketUsesShortStablePrivateIdentity(t *testing.T) {
 func TestSupervisorProtocolAndConfigMismatchFailBeforeAllocation(t *testing.T) {
 	t.Parallel()
 	s := testSupervisor(t)
-
 	for _, version := range []string{"", "old"} {
 		req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1/mcp", strings.NewReader("{}"))
 		require.NoError(t, err)

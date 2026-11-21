@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -495,9 +496,7 @@ func (s *supervisor) restartAll(ctx context.Context, request restartRequest) (re
 	}
 	// Closed admission and zero in-flight admissions make every entry live.
 	s.frontends.mu.Lock()
-	for session := range s.frontends.sessions {
-		sessions = append(sessions, session)
-	}
+	sessions = slices.Collect(maps.Keys(s.frontends.sessions))
 	s.frontends.mu.Unlock()
 	quiet := func() error {
 		ready, err := s.restartQuiescent()

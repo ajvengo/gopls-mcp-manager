@@ -363,10 +363,9 @@ For worker, watch-plan and descriptor ceilings, see the [resource ledger](SPEC.m
 
 ### Native runtime audits
 
-Use an absolute path to a shipped manager binary to test an upgrade. The audit
-suite also covers process death during handoff, registry writes and generation
-startup/cleanup, and native FD, socket and process pressure. Fixtures use private
-homes, sockets and repositories.
+The audits use private homes, sockets and repositories to check handoff,
+registry and generation crashes, plus FD, socket and process pressure.
+Set an absolute path to a shipped manager binary to test an upgrade.
 
 ```sh
 GOPLS_MANAGER_RELEASE_BINARY=/absolute/path/to/released-manager \
